@@ -39,8 +39,8 @@ It has two parts:
    instead:
 
    ```
-   adb push QuestLHSync-magisk-v1.0.zip /sdcard/Download/
-   adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-magisk-v1.0.zip"
+   adb push QuestLHSync-magisk-v1.1.zip /sdcard/Download/
+   adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-magisk-v1.1.zip"
    ```
 
 3. **PC:** with SteamVR closed, move the `questlhsync` folder somewhere
@@ -79,9 +79,10 @@ alignment's median error. Recent log lines are at the bottom. The buttons:
 - **Headset.** `lhsyncd` answers discovery on UDP 47281 and serves one TCP
   stream per PC on port 47280. Only while a PC is connected, it runs a small
   Frida script inside the sensors HAL
-  (`vendor.oculus.hardware.sensors@1.0-service`). The script reads the four
+  (`vendor.oculus.hardware.sensors@1.0-service`). The script reads the two side
   tracking cameras' frame buffers, never writes to them, and reports saturated
-  spots in the short-exposure frames. It stops a few seconds after the last PC
+  spots in the short-exposure frames. The front cameras are skipped: they never
+  saw a base station in testing, only other lights. It stops a few seconds after the last PC
   leaves. Nothing on disk is patched and no partition is touched. The camera
   calibration is read from `/persist/calibration` and sent to the PC with the
   stream.
@@ -129,6 +130,10 @@ The PC side writes only to `%LOCALAPPDATA%\QuestLHSync`:
 Nothing is sent anywhere except between the PC and the headset. The PC only
 makes outgoing connections, so Windows Firewall needs no rule.
 
+While a PC is connected, scanning the cameras takes about 3% of one of the
+headset's CPU cores, and the stream is about 2.5 KB/s. On the PC, the solver uses
+about 0.2% of one core.
+
 On the headset, `lhsyncd` answers anyone on the local network. The stream has
 no authentication. It carries the spots' pixel positions (never images), the
 camera calibration, and the headset's serial number, model and firmware
@@ -155,8 +160,8 @@ folder, `/dev/.questlhsync`.
 
 ## Compatibility
 
-QuestLHSync finds the camera buffers by their sizes in the sensors HAL. It was
-developed on one Quest Pro and one OS build. Another OS build may lay them out
+QuestLHSync finds the camera buffers in the sensors HAL by their sizes and the
+order they were allocated in. It was developed on one Quest Pro and one OS build. Another OS build may lay them out
 differently. If it does, the page stays on "No camera frames" and nothing else
 on the headset is affected. Frida is pinned to 17.10.0, because 17.19.0
 crashed the sensors HAL on injection.

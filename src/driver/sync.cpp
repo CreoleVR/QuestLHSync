@@ -1042,14 +1042,24 @@ bool Timing::Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> 
     if (!poses.At(r.tg - lo, R, p) || !poses.At(r.tg - hi, R, p)) continue;
     fast.push_back(&r);
   }
-  n = (int)fast.size();
-  // the first (wide) estimate wants plenty of turning: from 1500 fast-head sightings on, replays land within 0.4 ms
-  // of each other from any start
-  if (n < (wide ? 1500 : 300)) return false;
   X4 xs = x;
   if (!RefitSlow(xs, S, Z, so, sd)) return false;
   std::vector<V3> P, Zq;
   Solver::Predict(xs, S, Z, P, Zq);
+  // only sightings of a base station count: other lights would pad n and flatten the error curve. kNearDeg is wide
+  // enough for any timing in the search at 150 deg/s
+  std::vector<const Rec *> near;
+  for (const Rec *r : fast) {
+    M3 R; V3 p;
+    if (!poses.At(r->tg - cur, R, p)) continue;
+    int k; double a;
+    Solver::Nearest(P, Zq, p + R * r->od, R * r->dd, k, a);
+    if (std::isfinite(a) && a < kNearDeg) near.push_back(r);
+  }
+  fast.swap(near);
+  n = (int)fast.size();
+  // the first (wide) estimate wants plenty of turning
+  if (n < (wide ? kTimingFirstN : kTimingNextN)) return false;
   std::vector<double> es, cs;
   const double s2 = 0.3 * 0.3;
   for (double e = lo; e <= hi + 1e-9; e += step) {
@@ -1415,8 +1425,8 @@ Transform Sync::Tick(double now) {
         ok = timing_.Estimate(poses_, x, S, Z, cur, !timing_learned_, best, n);
       }
       if (ok) {
-        // the step trusts the estimate by how much turning it saw (all of it from 2000 fast-head sightings on)
-        double e = timing_learned_ ? cur + std::min(1.0, n / 2000.0) * (best - cur) : best;
+        // the step trusts the estimate by how much turning it saw
+        double e = timing_learned_ ? cur + std::min(1.0, (double)n / kTimingFullN) * (best - cur) : best;
         e = std::max(-0.05, std::min(0.12, e));
         expo_ = e;
         if (std::fabs(e - cur) > 1e-4) {

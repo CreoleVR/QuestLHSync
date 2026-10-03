@@ -401,7 +401,7 @@ static QlhsStatus Sample(const char *kind) {
   strcpy(s.hmd_system, "creolecast");
   strcpy(s.headset, "Quest Pro");
   strcpy(s.headset_addr, "192.168.1.50:47280");
-  s.cam_fps = 150;
+  s.cam_fps = 75;
   s.rtt_ms = 4.2;
   s.expo_ms = 15.3;
   s.expo_learned = 1;

@@ -51,7 +51,7 @@ struct QlhsStatus {
   char headset[48];     // the headset's model ("Quest Pro"), never its serial
   char headset_addr[48];
   char headset_fw[48];
-  double cam_fps;       // camera frames/s, all four
+  double cam_fps;       // camera frames/s, both side cameras (all four from module v1.0)
   double sight_rate;    // base station sightings/s
   double rtt_ms;        // network round trip (clock sync)
   double expo_ms;       // frame grid -> pose time

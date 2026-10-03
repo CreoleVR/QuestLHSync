@@ -36,6 +36,10 @@ constexpr double kExpoDefault = 0.018;  // s, grid -> pose time with the round-t
                                         // (CreoleCast learns 18.5, a replayed streamer 20.8)
 constexpr double kWmax = 60.0;          // deg/s: sightings while the head turns faster are skipped
 constexpr double kWmaxUntimed = 20.0;   // ... until the timing is learned
+constexpr double kNearDeg = 5.0;        // deg: a fast-head sighting this close to a base station counts for timing
+constexpr int kTimingFirstN = 200;      // such sightings before the first (wide) timing estimate
+constexpr int kTimingNextN = 40;        // ... before each later one
+constexpr int kTimingFullN = 270;       // a later estimate moves the timing all the way from this many on
 constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a laser dot
 constexpr double kKeep = 600.0;         // s of rays kept
 constexpr double kMoved = 0.25;         // m: SteamVR has a measured station this far off: it was moved
