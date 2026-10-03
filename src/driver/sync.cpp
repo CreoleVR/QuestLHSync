@@ -78,7 +78,7 @@ void CamCal::Dist(double a, double b, double &u, double &v) const {
 
 // Newton on the forward model
 bool CamCal::Unproject(double px, double py, V3 &d) const {
-  double tu = (px - cx) / f, tv = (py - cy) / f;
+  double tu = (px - cx) / f, tv = (py - cy) / fy;
   double rd = std::hypot(tu, tv), th = std::min(std::max(rd, 0.0), 1.5);
   double s = rd > 1e-12 ? std::tan(th) / rd : 1.0, a = tu * s, b = tv * s;
   const double h = 1e-6;
@@ -102,6 +102,8 @@ bool CamCal::Unproject(double px, double py, V3 &d) const {
 bool Optics::Load(const std::string &json, std::string *err) {
   JVal root;
   if (!JParse(json, root)) { if (err) *err = "calibration isn't JSON"; return false; }
+  const JVal *kind = root.get("kind");
+  if (kind && kind->t == JVal::Str && kind->s == "steam_frame") return LoadFrame(root, err);
   const JVal *cams = root.get("CameraCalibration");
   if (!cams || cams->t != JVal::Arr) { if (err) *err = "no CameraCalibration"; return false; }
   CamCal out[4];
@@ -120,20 +122,85 @@ bool Optics::Load(const std::string &json, std::string *err) {
     for (int r = 0; r < 3; r++)
       for (int q = 0; q < 3; q++) k.R.m[r][q] = T[r * 4 + q];
     k.t = {T[3], T[7], T[11]};
-    k.f = pc[0]; k.cx = pc[1]; k.cy = pc[2];
+    k.f = k.fy = pc[0]; k.cx = pc[1]; k.cy = pc[2];
     for (int j = 0; j < 6; j++) k.k[j] = dc[j];
     k.p[0] = dc[6]; k.p[1] = dc[7];
+    k.ir = (i == 2 || i == 3) ? kIR : 1.0;
     k.valid = true;
   }
   if (!out[2].valid && !out[3].valid) { if (err) *err = "no side camera calibration (ids 2, 3)"; return false; }
   for (int i = 0; i < 4; i++) cams_[i] = out[i];
+  exact_time_ = false;
+  return true;
+}
+
+// a pose in the Frame's calibration files: the child frame's axes and origin, in its parent
+static bool FramePose(const JVal *j, double scale, M3 &R, V3 &t) {
+  if (!j) return false;
+  const JVal *px = j->get("plus_x"), *pz = j->get("plus_z"), *pos = j->get("position");
+  if (!px || !pz || !pos) return false;
+  auto x = px->nums(), z = pz->nums(), p = pos->nums();
+  if (x.size() != 3 || z.size() != 3 || p.size() != 3) return false;
+  V3 X{x[0], x[1], x[2]}, Z{z[0], z[1], z[2]}, Y = cross(Z, X);
+  for (int r = 0; r < 3; r++) { R.m[r][0] = X[r]; R.m[r][1] = Y[r]; R.m[r][2] = Z[r]; }
+  t = V3{p[0], p[1], p[2]} * scale;
+  return true;
+}
+
+// The Steam Frame's lhsyncd sends {"kind": "steam_frame", "xrservice": /persist/xrservice.json, "device_config":
+// /persist/device_config.json}. xrservice.json: each tracking camera's KB4 intrinsics (Kannala-Brandt: Fisheye62 with
+// only the 4 radial terms) and its pose against camera 0 (mm). device_config.json: camera 0's pose in the CAD frame
+// (cv.cad_from_cal) and the head's (head), the frame SteamVR's HMD pose is of (m). Camera i's ray:
+// head <- cad <- camera 0 <- camera i.
+bool Optics::LoadFrame(const JVal &root, std::string *err) {
+  const JVal *xr = root.get("xrservice"), *dc = root.get("device_config");
+  const JVal *cams = xr ? xr->get("cameras") : nullptr, *cv = dc ? dc->get("cv") : nullptr;
+  M3 Rcc, Rch;
+  V3 tcc, tch;
+  if (!cams || cams->t != JVal::Arr || !cv || !FramePose(cv->get("cad_from_cal"), 1.0, Rcc, tcc) ||
+      !FramePose(dc->get("head"), 1.0, Rch, tch)) {
+    if (err) *err = "not a Steam Frame calibration (xrservice.json cameras, device_config.json cv.cad_from_cal, head)";
+    return false;
+  }
+  M3 Rhc = T(Rch) * Rcc;  // head <- camera 0
+  V3 thc = T(Rch) * (tcc - tch);
+  CamCal out[4];
+  for (size_t i = 0; i < cams->a.size() && i < 4; i++) {
+    const JVal &c = cams->a[i];
+    const JVal *ex = c.get("extrinsics"), *in = c.get("intrinsics");
+    const JVal *units = ex ? ex->get("__units") : nullptr;
+    double scale = units && units->t == JVal::Str && units->s == "mm" ? 1e-3 : 1.0;
+    M3 Rk;
+    V3 tk;
+    if (!FramePose(ex, scale, Rk, tk) || !in || in->t != JVal::Arr) continue;
+    const JVal *kb = nullptr;
+    for (auto &m : in->a)
+      if (m.get("cameraModel") && m.get("cameraModel")->s == "kb") kb = &m;
+    if (!kb || !c.get("width") || !c.get("height")) continue;
+    auto num = [&](const char *k) { return kb->get(k) ? kb->get(k)->num(NAN) : NAN; };
+    CamCal &k = out[i];
+    k.w = (int)c.get("width")->num(); k.h = (int)c.get("height")->num();
+    k.f = num("fx"); k.fy = num("fy"); k.cx = num("cx"); k.cy = num("cy");
+    k.k[0] = num("k1"); k.k[1] = num("k2"); k.k[2] = num("k3"); k.k[3] = num("k4");
+    bool finite = std::isfinite(k.f + k.fy + k.cx + k.cy + k.k[0] + k.k[1] + k.k[2] + k.k[3]) && k.f > 0 && k.fy > 0;
+    if (!finite || k.w <= 0 || k.h <= 0) { k = CamCal(); continue; }
+    k.R = Rhc * Rk;
+    k.t = Rhc * tk + thc;
+    k.valid = true;
+  }
+  if (!out[0].valid && !out[1].valid && !out[2].valid && !out[3].valid) {
+    if (err) *err = "no usable camera in xrservice.json (KB4 intrinsics, extrinsics)";
+    return false;
+  }
+  for (int i = 0; i < 4; i++) cams_[i] = out[i];
+  exact_time_ = true;
   return true;
 }
 
 bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
   if (cam < 0 || cam > 3 || !cams_[cam].valid) return false;
   const CamCal &c = cams_[cam];
-  double k = (cam == 2 || cam == 3) ? kIR : 1.0;
+  double k = c.ir;
   V3 dc;
   if (!c.Unproject(c.cx + (x - c.cx) * k, c.cy + (y - c.cy) * k, dc)) return false;
   d = c.R * dc;
@@ -317,6 +384,7 @@ bool StationsFile::Load(const std::string &path) {
   anchor = a->s;
   anchor_p = {p[0], p[1], p[2]};
   anchor_R = ToM3(QuatFromJ(aq));
+  if (const JVal *lq = d.get("level")) level = ToM3(QuatFromJ(lq));
   if (const JVal *st = d.get("stations"))
     for (auto &kv : st->o)
       if (const JVal *pos = kv.second.get("pos")) {
@@ -330,12 +398,15 @@ bool StationsFile::Load(const std::string &path) {
 }
 
 bool StationsFile::SaveAuto(const std::string &path) const {
-  Quat q = ToQuat(anchor_R);
+  Quat q = ToQuat(anchor_R), l = ToQuat(level);
   std::string s = Fmt(
       "{\n \"auto\": true,\n \"note\": \"QuestLHSync's reference frame: %s's pose when it was first seen. SteamVR re-tilts "
-      "its lighthouse universe at every start; this pins it. Delete to start over.\",\n \"anchor\": \"%s\",\n"
-      " \"anchor_p\": [%.6f, %.6f, %.6f],\n \"anchor_q\": [%.6f, %.6f, %.6f, %.6f],\n \"stations\": {},\n \"saved\": \"%s\"\n}\n",
-      anchor.c_str(), anchor.c_str(), anchor_p.x, anchor_p.y, anchor_p.z, q.w, q.x, q.y, q.z, Now().c_str());
+      "its lighthouse universe at every start; this pins it. level: the turn that levels it with the headset's gravity, "
+      "found from the base stations' sightings. Delete to start over.\",\n \"anchor\": \"%s\",\n"
+      " \"anchor_p\": [%.6f, %.6f, %.6f],\n \"anchor_q\": [%.6f, %.6f, %.6f, %.6f],\n"
+      " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"stations\": {},\n \"saved\": \"%s\"\n}\n",
+      anchor.c_str(), anchor.c_str(), anchor_p.x, anchor_p.y, anchor_p.z, q.w, q.x, q.y, q.z, l.w, l.x, l.y, l.z,
+      Now().c_str());
   return WriteFileAtomic(path, s);
 }
 
@@ -343,16 +414,16 @@ void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
   if (!f_.loaded) return;
   auto it = raw.find(f_.anchor);
   if (it == raw.end()) return;
-  M3 C = f_.anchor_R * T(it->second.second);
-  double ang = RotDeg(C);
+  M3 Cs = f_.anchor_R * T(it->second.second);
+  double ang = RotDeg(Cs);
   int ok = ang < kMaxRot;
-  if (ok != ok_ || (ok && RotDeg(C * T(C_)) > 0.01))
+  if (ok != ok_ || (ok && RotDeg(Cs * T(Cs_)) > 0.01))
     log_(Fmt("lighthouse frame: SteamVR's is %.2f deg from the reference%s", ang,
              ok ? "" : " (over 3 deg: the anchor moved or a new universe; SteamVR's frame as it is)"));
   ok_ = ok;
   deg_ = ang;
-  if (ok) { C_ = C; o_ = it->second.first; oref_ = f_.anchor_p; }
-  else { C_ = M3(); o_ = {}; oref_ = {}; }
+  if (ok) { Cs_ = Cs; C_ = f_.level * Cs; o_ = it->second.first; oref_ = f_.anchor_p; }
+  else { Cs_ = C_ = M3(); o_ = {}; oref_ = {}; }
 }
 
 // ================================================================ solver
@@ -482,59 +553,64 @@ void Solver::Cells(const Rays &r, const std::vector<char> &use, std::vector<int>
     if (use[n]) cnt[n] = m[KeyOf(r.O[n], r.D[n])];
 }
 
-// symmetric 4x4: smallest eigenvalue (Jacobi)
-static double MinEig4(double A[4][4]) {
-  double a[4][4];
+constexpr int kMaxDof = 6;  // Fit's unknowns: yaw, translation and, when levelling, a tilt
+
+// symmetric n x n (n <= kMaxDof): smallest eigenvalue (Jacobi)
+static double MinEig(double A[kMaxDof][kMaxDof], int n) {
+  double a[kMaxDof][kMaxDof];
   memcpy(a, A, sizeof a);
   for (int sweep = 0; sweep < 50; sweep++) {
     double off = 0;
-    for (int i = 0; i < 4; i++)
-      for (int j = i + 1; j < 4; j++) off += a[i][j] * a[i][j];
+    for (int i = 0; i < n; i++)
+      for (int j = i + 1; j < n; j++) off += a[i][j] * a[i][j];
     if (off < 1e-30) break;
-    for (int p = 0; p < 4; p++)
-      for (int q = p + 1; q < 4; q++) {
+    for (int p = 0; p < n; p++)
+      for (int q = p + 1; q < n; q++) {
         if (std::fabs(a[p][q]) < 1e-300) continue;
         double th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
         double t = (th >= 0 ? 1 : -1) / (std::fabs(th) + std::sqrt(th * th + 1));
         double c = 1 / std::sqrt(t * t + 1), s = t * c;
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < n; k++) {
           double akp = a[k][p], akq = a[k][q];
           a[k][p] = c * akp - s * akq;
           a[k][q] = s * akp + c * akq;
         }
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < n; k++) {
           double apk = a[p][k], aqk = a[q][k];
           a[p][k] = c * apk - s * aqk;
           a[q][k] = s * apk + c * aqk;
         }
       }
   }
-  return std::min(std::min(a[0][0], a[1][1]), std::min(a[2][2], a[3][3]));
+  double m = a[0][0];
+  for (int i = 1; i < n; i++) m = std::min(m, a[i][i]);
+  return m;
 }
 
-static bool Solve4(double A[4][4], const double b[4], double x[4]) {
-  double M[4][5];
-  for (int i = 0; i < 4; i++) { for (int j = 0; j < 4; j++) M[i][j] = A[i][j]; M[i][4] = b[i]; }
-  for (int c = 0; c < 4; c++) {
+static bool Solve(double A[kMaxDof][kMaxDof], const double *b, double *x, int n) {
+  double M[kMaxDof][kMaxDof + 1];
+  for (int i = 0; i < n; i++) { for (int j = 0; j < n; j++) M[i][j] = A[i][j]; M[i][n] = b[i]; }
+  for (int c = 0; c < n; c++) {
     int p = c;
-    for (int r = c + 1; r < 4; r++) if (std::fabs(M[r][c]) > std::fabs(M[p][c])) p = r;
+    for (int r = c + 1; r < n; r++) if (std::fabs(M[r][c]) > std::fabs(M[p][c])) p = r;
     if (std::fabs(M[p][c]) < 1e-300) return false;
-    if (p != c) for (int j = 0; j < 5; j++) std::swap(M[p][j], M[c][j]);
-    for (int r = 0; r < 4; r++) {
+    if (p != c) for (int j = 0; j <= n; j++) std::swap(M[p][j], M[c][j]);
+    for (int r = 0; r < n; r++) {
       if (r == c) continue;
       double f = M[r][c] / M[c][c];
-      for (int j = c; j < 5; j++) M[r][j] -= f * M[c][j];
+      for (int j = c; j <= n; j++) M[r][j] -= f * M[c][j];
     }
   }
-  for (int i = 0; i < 4; i++) x[i] = M[i][4] / M[i][i];
+  for (int i = 0; i < n; i++) x[i] = M[i][n] / M[i][i];
   return true;
 }
 
-// 4-DOF robust fit (soft_l1 on the sightings, quadratic prior rows), sightings assigned to the nearest station under
-// x0; yaw about the station centroid. A (head, direction) cell weighs one sighting however many it holds, so a still
-// head adds nothing by looking longer. xa: the prior's center (default x0). cond: the sightings alone pin all 4 DOF.
+// Robust fit (soft_l1 on the sightings, quadratic prior rows), sightings assigned to the nearest station under x0; yaw
+// about the station centroid. A (head, direction) cell weighs one sighting however many it holds, so a still head adds
+// nothing by looking longer. xa: the prior's center (default x0). cond: the sightings alone pin every DOF.
+// 4 DOF; with a pivot 6: the stations also tilt about it (Tilt(y[4], y[5])), and the prior holds only the tilt.
 Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now,
-                         double gate, const X4 *xa_in) {
+                         double gate, const X4 *xa_in, const V3 *pivot) {
   FitR out;
   std::vector<V3> P, Zq;
   Predict(x0, S, Z, P, Zq);
@@ -561,77 +637,86 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
   c = c * (1.0 / S.size());
   V3 cq = Ry(x0[0]) * c + V3{x0[1], x0[2], x0[3]};
   V3 cqa = Ry(xa[0]) * c + V3{xa[1], xa[2], xa[3]};
-  std::vector<V3> Sc(S.size());
-  for (size_t k = 0; k < S.size(); k++) Sc[k] = S[k] - c;
+  std::vector<V3> Sc(S.size());  // about the centroid; with a pivot, about the pivot (pc: the pivot about the centroid)
+  for (size_t k = 0; k < S.size(); k++) Sc[k] = S[k] - (pivot ? *pivot : c);
+  const V3 pc = pivot ? *pivot - c : V3{};
+  const int np = pivot ? 6 : 4;
   const double f = FSCALE;
-  const size_t nr = rows.size() * 3 + 4;
+  const size_t nrob = rows.size() * 3, nr = nrob + (pivot ? 2 : 4);
 
-  auto res = [&](const double y[4], std::vector<double> &rv) {
+  auto res = [&](const double *y, std::vector<double> &rv) {
     rv.resize(nr);
     double cy = std::cos(y[0]), sy = std::sin(y[0]);
     V3 sh = cq + V3{y[1], y[2], y[3]};
+    M3 Rt;
+    if (pivot) Rt = Tilt(y[4], y[5]);
     for (size_t i = 0; i < rows.size(); i++) {
       const Row &w = rows[i];
-      V3 U = RyMul(cy, sy, Sc[w.k]) + sh - w.o;
+      V3 U = RyMul(cy, sy, pivot ? pc + Rt * Sc[w.k] : Sc[w.k]) + sh - w.o;
       U = U * (1 / norm(U));
       V3 e = cross(U, w.d) * w.sw;
       rv[3 * i] = e.x; rv[3 * i + 1] = e.y; rv[3 * i + 2] = e.z;
     }
-    size_t b = rows.size() * 3;
-    rv[b] = f * Wrap(y[0] - xa[0]) / SIG_YAW;
-    rv[b + 1] = f * (sh.x - cqa.x) / SIG_T;
-    rv[b + 2] = f * (sh.y - cqa.y) / SIG_T;
-    rv[b + 3] = f * (sh.z - cqa.z) / SIG_T;
+    if (pivot) {
+      rv[nrob] = f * y[4] / SIG_LEVEL;
+      rv[nrob + 1] = f * y[5] / SIG_LEVEL;
+      return;
+    }
+    rv[nrob] = f * Wrap(y[0] - xa[0]) / SIG_YAW;
+    rv[nrob + 1] = f * (sh.x - cqa.x) / SIG_T;
+    rv[nrob + 2] = f * (sh.y - cqa.y) / SIG_T;
+    rv[nrob + 3] = f * (sh.z - cqa.z) / SIG_T;
   };
-  const size_t nrob = rows.size() * 3;
   auto cost = [&](const std::vector<double> &rv) {
     double s = 0;
     for (size_t i = 0; i < nrob; i++) { double z = rv[i] / f; s += 2 * f * f * (std::sqrt(1 + z * z) - 1); }
     for (size_t i = nrob; i < nr; i++) s += rv[i] * rv[i];
     return s;
   };
-  auto jac = [&](const double y[4], std::vector<double> &J) {  // central differences, row-major nr x 4
-    J.assign(nr * 4, 0);
+  auto jac = [&](const double *y, std::vector<double> &J) {  // central differences, row-major nr x np
+    J.assign(nr * np, 0);
     std::vector<double> rp, rm;
-    for (int j = 0; j < 4; j++) {
-      double h = 1e-7, yp[4], ym[4];
+    for (int j = 0; j < np; j++) {
+      double h = 1e-7, yp[kMaxDof], ym[kMaxDof];
       memcpy(yp, y, sizeof yp); memcpy(ym, y, sizeof ym);
       yp[j] += h; ym[j] -= h;
       res(yp, rp); res(ym, rm);
-      for (size_t i = 0; i < nr; i++) J[i * 4 + j] = (rp[i] - rm[i]) / (2 * h);
+      for (size_t i = 0; i < nr; i++) J[i * np + j] = (rp[i] - rm[i]) / (2 * h);
     }
   };
 
-  double y[4] = {x0[0], 0, 0, 0};
+  double y[kMaxDof] = {x0[0], 0, 0, 0, 0, 0};
   std::vector<double> rv, J, rn;
   res(y, rv);
   double cst = cost(rv), lam = 1e-3;
   for (int it = 0; it < 100; it++) {
     jac(y, J);
-    double A[4][4] = {}, g[4] = {};
+    double A[kMaxDof][kMaxDof] = {}, g[kMaxDof] = {};
     for (size_t i = 0; i < nr; i++) {
       double w = 1;
       if (i < nrob) { double z = rv[i] / f; w = 1 / std::sqrt(1 + z * z); }  // IRLS weight of soft_l1
-      const double *Ji = &J[i * 4];
-      for (int a = 0; a < 4; a++) {
+      const double *Ji = &J[i * np];
+      for (int a = 0; a < np; a++) {
         g[a] += w * Ji[a] * rv[i];
-        for (int b = 0; b < 4; b++) A[a][b] += w * Ji[a] * Ji[b];
+        for (int b = 0; b < np; b++) A[a][b] += w * Ji[a] * Ji[b];
       }
     }
     bool moved = false, done = false;
     for (int tries = 0; tries < 20; tries++) {
-      double Al[4][4], ng[4], d[4];
-      for (int a = 0; a < 4; a++) {
-        for (int b = 0; b < 4; b++) Al[a][b] = A[a][b];
+      double Al[kMaxDof][kMaxDof], ng[kMaxDof], d[kMaxDof];
+      for (int a = 0; a < np; a++) {
+        for (int b = 0; b < np; b++) Al[a][b] = A[a][b];
         Al[a][a] += lam * std::max(A[a][a], 1e-12);
         ng[a] = -g[a];
       }
-      if (!Solve4(Al, ng, d)) { lam *= 10; continue; }
-      double yn[4] = {y[0] + d[0], y[1] + d[1], y[2] + d[2], y[3] + d[3]};
+      if (!Solve(Al, ng, d, np)) { lam *= 10; continue; }
+      double yn[kMaxDof], step = 0;
+      memcpy(yn, y, sizeof yn);
+      for (int a = 0; a < np; a++) yn[a] += d[a];
       res(yn, rn);
       double cn = cost(rn);
       if (cn <= cst) {
-        double step = std::fabs(d[0]) + std::fabs(d[1]) + std::fabs(d[2]) + std::fabs(d[3]);
+        for (int a = 0; a < np; a++) step += std::fabs(d[a]);
         done = step < 1e-11 || cst - cn <= 1e-14 * std::max(cst, 1e-30);
         memcpy(y, yn, sizeof y);
         rv.swap(rn);
@@ -647,15 +732,16 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
   }
   // conditioning: scipy's loss-scaled Jacobian of the sighting rows ((1+z)^-3/2 for soft_l1), per-DOF scale / SIG_R
   jac(y, J);
-  double H[4][4] = {};
-  const double sc[4] = {COND_YAW, COND_T, COND_T, COND_T};
+  double H[kMaxDof][kMaxDof] = {};
+  const double sc[kMaxDof] = {COND_YAW, COND_T, COND_T, COND_T, COND_LEVEL, COND_LEVEL};
   for (size_t i = 0; i < nrob; i++) {
     double z = rv[i] / f, w = std::pow(1 + z * z, -1.5);
-    const double *Ji = &J[i * 4];
-    for (int a = 0; a < 4; a++)
-      for (int b = 0; b < 4; b++) H[a][b] += w * Ji[a] * Ji[b] * sc[a] * sc[b] / (SIG_R * SIG_R);
+    const double *Ji = &J[i * np];
+    for (int a = 0; a < np; a++)
+      for (int b = 0; b < np; b++) H[a][b] += w * Ji[a] * Ji[b] * sc[a] * sc[b] / (SIG_R * SIG_R);
   }
-  out.cond = MinEig4(H) >= 1.0;
+  out.cond = MinEig(H, np) >= 1.0;
+  if (pivot) out.tilt = Tilt(y[4], y[5]);
   double yaw = Wrap(y[0]);
   V3 t = cq + V3{y[1], y[2], y[3]} - Ry(yaw) * c;
   out.x = {yaw, t.x, t.y, t.z};
@@ -812,6 +898,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     if (sc > bs) { best = x; bs = sc; have = true; }
   }
   if (!have) return false;
+  CheckMirror(best, bs, S, Z, r, t, now);
   acq_x_ = best; has_acq_x_ = true;
   std::vector<int> c;
   Support(best, S, Z, t, TIGHT_DEG, c);
@@ -828,6 +915,76 @@ int Solver::ThinnedScore(const X4 &x, double now) {
   std::vector<int> c;
   Support(x, S, Z, t, INLIER, c);
   return Score(c);
+}
+
+// x turned 180 deg about the vertical through the midpoint of stations a and b (reference frame): their places swap
+static X4 Mirror(const X4 &x, V3 a, V3 b) {
+  V3 m = (a + b) * 0.5, d = RyMul(std::cos(x[0]), std::sin(x[0]), V3{2 * m.x, 0, 2 * m.z});
+  return {Wrap(x[0] + kPi), x[1] + d.x, x[2] + d.y, x[3] + d.z};
+}
+
+// how far apart two alignments put the stations (m, the farthest one)
+static double Apart(const X4 &a, const X4 &b, const std::vector<V3> &S) {
+  double ca = std::cos(a[0]), sa = std::sin(a[0]), cb = std::cos(b[0]), sb = std::sin(b[0]), far = 0;
+  for (const V3 &s : S)
+    far = std::max(far, norm(RyMul(ca, sa, s) + V3{a[1], a[2], a[3]} - RyMul(cb, sb, s) - V3{b[1], b[2], b[3]}));
+  return far;
+}
+
+static std::string Meters(double d) { return std::isfinite(d) ? Fmt("%.1f m", d) : std::string("none"); }
+
+// Two stations facing each other at about the same height look the same with their places swapped: the fit turned
+// 180 deg about their midpoint explains the sightings almost as well, and puts every other lighthouse device across the
+// room. So the mirror of the best fit is fitted too. When the two score about the same, the lighthouse devices worn or
+// held (they stay near the head) decide; without them the current fit stays.
+void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
+                         const Rays &t, double now) {
+  acq_forced_ = false;
+  std::vector<int> c;
+  Support(best, S, Z, t, INLIER, c);
+  size_t a = 0, b = 1;  // the two best-seen stations
+  if (c[b] > c[a]) std::swap(a, b);
+  for (size_t k = 2; k < c.size(); k++) {
+    if (c[k] > c[a]) { b = a; a = k; }
+    else if (c[k] > c[b]) b = k;
+  }
+  // the stations' own spacing and heights differ a little from where the cameras see their lasers: the exact mirror
+  // starts a few degrees off, so its refit starts wide
+  X4 m = Mirror(best, S[a], S[b]);
+  for (double gate : {2.0, 1.0, 0.6}) {
+    FitR f = Fit(m, S, Z, r, now, gate, nullptr);
+    if (!f.ok) break;
+    m = f.x;
+  }
+  if (Apart(m, best, S) < 0.3) return;  // the mirror slid back into the best fit
+  std::vector<int> cm;
+  Support(m, S, Z, t, INLIER, cm);
+  int sm = Score(cm);
+  // thinned support is a small, noisy count: within a factor 2 the two are a tie
+  if (sm * 2 < bs) { amb_state_ = 0; return; }  // clearly worse: not ambiguous
+  if (bs * 2 < sm) { amb_state_ = 0; best = m; bs = sm; return; }
+  double db = body_ ? body_(best) : NAN, dm = body_ ? body_(m) : NAN;
+  bool pick_m = false;
+  int state;
+  const char *why;
+  if (std::isfinite(db) && std::isfinite(dm) && std::min(db, dm) < 1.0 && std::fabs(db - dm) > 1.0) {
+    pick_m = dm < db;
+    state = pick_m ? 1 : 2;
+    why = "the lighthouse devices near the head decide";
+  } else if (has_x_) {
+    pick_m = Apart(m, x_, S) < Apart(best, x_, S);
+    state = 3;
+    why = "no lighthouse device near the head tells them apart: the current fit stays";
+  } else {
+    state = 4;
+    why = "no lighthouse device near the head tells them apart: wear or hold one";
+  }
+  if (state != amb_state_)
+    log_(Fmt("mirror check: yaw %+.1f (support %d, devices %s from the head) and its mirror yaw %+.1f (support %d, %s) "
+             "fit about as well: %s", best[0] * kDeg, bs, Meters(db).c_str(), m[0] * kDeg, sm, Meters(dm).c_str(), why));
+  amb_state_ = state;
+  if (pick_m) { best = m; bs = sm; }
+  acq_forced_ = (state == 1 || state == 2) && has_x_ && Apart(best, x_, S) > 0.3;
 }
 
 // the HMD pose stream broke: the Quest's space may have changed under the older sightings (boundary reset)
@@ -912,9 +1069,11 @@ StepStat Solver::Step(double /*now*/) {
     if (Acquire(now, xa, sa, tight)) {
       int cur = has_x_ ? ThinnedScore(x_, now) : 0;
       st.has_acq = true; st.acq_sa = sa; st.acq_cur = cur; st.acq_tight = tight;
-      if ((sa >= ACQ || tight >= TIGHT_N) && sa > 2 * cur + 5) {
-        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)", xa[0] * kDeg, xa[1],
-                 xa[2], xa[3], sa, tight, TIGHT_DEG, cur));
+      // the mirror check's flip has the worn devices for evidence as well: half the support will do
+      bool enough = sa >= ACQ || tight >= TIGHT_N || (acq_forced_ && sa >= ACQ / 2);
+      if (enough && (sa > 2 * cur + 5 || acq_forced_)) {
+        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s", xa[0] * kDeg, xa[1],
+                 xa[2], xa[3], sa, tight, TIGHT_DEG, cur, acq_forced_ ? ", by the mirror check" : ""));
         Reset(xa);
         since_ = brk_;
       }
@@ -922,6 +1081,61 @@ StepStat Solver::Step(double /*now*/) {
   }
   stat_ = st; has_stat_ = true;
   return st;
+}
+
+// The 4-DOF fit's stations tilted about pivot as well, on the same sightings. Its first gate is wide: with the frame
+// 1.5 deg off level the fit of two stations puts the third 4 deg away from where the cameras see it. Kept only if the
+// tilt is pinned (cond) by enough stations, each seen from several (head, direction) cells within INLIER.
+bool Solver::Level(V3 pivot, LevelR &out) {
+  if (!has_x_) return false;
+  std::vector<std::string> keys;
+  std::vector<V3> S0, Z0;
+  Stations(keys, S0, Z0);
+  if ((int)S0.size() < LEVEL_STATIONS) return false;
+  const double now = seen_;
+  Rays r = GetRays(std::max(now - WIN, since_));
+  X4 x = x_;
+  M3 L;
+  std::vector<V3> S(S0.size()), Z(Z0.size());
+  auto level = [&] {
+    for (size_t k = 0; k < S0.size(); k++) { S[k] = pivot + L * (S0[k] - pivot); Z[k] = L * Z0[k]; }
+  };
+  FitR f;
+  for (double gate : {6.0, GATE, 0.6}) {
+    level();
+    f = Fit(x, S, Z, r, now, gate, nullptr, &pivot);
+    if (!f.ok) return false;
+    x = f.x;
+    L = f.tilt * L;
+  }
+  if (!f.cond) return false;
+  level();
+  std::vector<int> cells;
+  Support(x, S, Z, Thin(r), INLIER, cells);
+  int held = 0;
+  for (int c : cells) held += c >= LEVEL_CELLS;
+  std::vector<V3> P, Zq;
+  Predict(x, S, Z, P, Zq);
+  std::vector<double> in;
+  for (size_t n = 0; n < r.size(); n++) {
+    int k; double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < INLIER) in.push_back(a);
+  }
+  if (held < LEVEL_STATIONS || in.empty()) return false;
+  double med = Median(in);
+  if (med > LEVEL_MED) return false;
+  out.x = x;
+  out.tilt = L;
+  out.stations = held;
+  out.med = med;
+  return true;
+}
+
+void Solver::Relevel(const X4 &x) {
+  x_ = anchor_ = x;
+  has_x_ = has_anchor_ = true;
+  has_acq_x_ = false;  // found on the stations before the level
 }
 
 // ================================================================ timing
@@ -1120,6 +1334,7 @@ Sync::Sync(SyncConfig cfg, LogFn log)
     : cfg_(std::move(cfg)), log_(std::move(log)), sfile_(LoadStations(cfg_.dir)), frame_(sfile_, log_),
       solver_(log_, 1, sfile_.autogen ? std::map<std::string, V3>() : sfile_.fix) {
   if (cfg_.arrival_clock) expo_ = kExpoArrival;
+  solver_.SetBody([this](const X4 &x) { return BodyDist(x); });
   if (sfile_.loaded)
     log_(Fmt("reference frame: anchor %s%s, %d measured station(s)", sfile_.anchor.c_str(),
              sfile_.autogen ? " (automatic)" : "", (int)sfile_.fix.size()));
@@ -1238,6 +1453,44 @@ void Sync::OnHmdPose(double t, const Quat &q, V3 p) {
   }
 }
 
+void Sync::OnBodyPose(int dev, double t, V3 raw) {
+  std::lock_guard<std::mutex> g(body_m_);
+  double &last = body_last_[dev];
+  if (t - last < 0.1) return;  // 10 Hz is plenty
+  last = t;
+  body_.push_back({t, dev, raw});
+  if (recording_) body_new_.push_back({t, dev, raw});
+  while (!body_.empty() && body_.front().t < t - Solver::ACQ_WIN) body_.pop_front();
+}
+
+// the median, over 0.1 s steps, of the nearest worn or held lighthouse device's horizontal distance to the head, were x
+// the alignment (Tick's thread: frame_ is stable here)
+double Sync::BodyDist(const X4 &x) {
+  std::vector<BodyS> b;
+  {
+    std::lock_guard<std::mutex> g(body_m_);
+    b.assign(body_.begin(), body_.end());
+  }
+  M3 C;
+  V3 tc;
+  frame_.Rotation(C, tc);
+  double c = std::cos(x[0]), s = std::sin(x[0]);
+  std::map<long long, double> nearest;
+  for (const BodyS &e : b) {
+    M3 R;
+    V3 h;
+    if (!poses_.At(e.t, R, h)) continue;
+    V3 q = RyMul(c, s, C * e.p + tc) + V3{x[1], x[2], x[3]};
+    double d = std::hypot(q.x - h.x, q.z - h.z);
+    auto it = nearest.emplace((long long)std::floor(e.t * 10), d).first;
+    it->second = std::min(it->second, d);
+  }
+  if (nearest.size() < 20) return NAN;
+  std::vector<double> v;
+  for (auto &kv : nearest) v.push_back(kv.second);
+  return Median(v);
+}
+
 void Sync::SetRecord(FILE *f) {
   std::lock_guard<std::mutex> g(rec_m_);
   if (rec_) fclose(rec_);
@@ -1273,7 +1526,8 @@ void Sync::OnLine(double pc, const char *line) {
   double hs = tus / 1e6;
   if (cfg_.arrival_clock) clock_.AddArrival(pc, hs);
   double lag = 0;
-  bool have_lag = nb >= 0 && grid_.Lag(cam, hs, lag);
+  // the Frame stamps its frames itself; the Quest's are when lhsight found them, the grid takes the poll lag off
+  bool have_lag = nb >= 0 && (optics_.exact_time() || grid_.Lag(cam, hs, lag));
   if (nb <= 0 || !have_optics_) return;
   double grid_pc;
   if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) return;
@@ -1327,6 +1581,29 @@ void Sync::Reacquire() {
   log_("re-acquire asked for: older sightings dropped");
 }
 
+// An automatic reference frame is SteamVR's frame as it was when the anchor was first seen, tilt and all. The headset
+// knows gravity: level the frame by it whenever the sightings pin its tilt (Solver::Level), and keep the level in
+// stations.json. A measured frame is the user's own and stays as it is.
+void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw) {
+  if (!sfile_.autogen || frame_.ok() != 1) return;
+  Solver::LevelR lv;
+  if (!solver_.Level(sfile_.anchor_p, lv)) return;
+  double step = RotDeg(lv.tilt);
+  M3 L = lv.tilt * sfile_.level;
+  if (step < 0.05 || RotDeg(L) > kMaxRot) return;  // within the noise; or past what a level can be
+  sfile_.level = L;
+  sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
+  frame_.Update(raw);
+  for (auto &kv : raw) {
+    V3 p; M3 R;
+    frame_.Apply(kv.second.first, kv.second.second, p, R);
+    solver_.SetStation(kv.first, p, R);
+  }
+  solver_.Relevel(lv.x);
+  log_(Fmt("lighthouse frame levelled with the headset: tilted %.2f deg (%.2f deg in all), %d base stations within "
+           "%.2f deg", step, RotDeg(L), lv.stations, lv.med));
+}
+
 Transform Sync::Tick(double now) {
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
@@ -1356,6 +1633,7 @@ Transform Sync::Tick(double now) {
       if (RotDeg(sfile_.anchor_R * T(a.second)) > kMaxRot || norm(a.first - sfile_.anchor_p) > kMoved) {
         sfile_.anchor_p = a.first;
         sfile_.anchor_R = a.second;
+        sfile_.level = M3();  // SteamVR's frame as it is now: its level is found again
         sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
         log_("anchor " + sfile_.anchor + " moved: reference frame reset");
       }
@@ -1367,11 +1645,25 @@ Transform Sync::Tick(double now) {
       frame_.Apply(kv.second.first, kv.second.second, p, R);
       solver_.SetStation(kv.first, p, R);
       if (now - last_s_ >= 10) {
+        frame_.Unlevelled(kv.second.first, kv.second.second, p, R);
         Quat q = ToQuat(R);
         Rec(now, "S %s %.5f %.5f %.5f %.5f %.5f %.5f %.5f", kv.first.c_str(), p.x, p.y, p.z, q.w, q.x, q.y, q.z);
       }
     }
     if (now - last_s_ >= 10 && !raw.empty()) last_s_ = now;
+    if (recording_) {  // worn and held lighthouse devices, in the reference frame like the stations (before the level)
+      std::deque<BodyS> nb;
+      {
+        std::lock_guard<std::mutex> g(body_m_);
+        nb.swap(body_new_);
+      }
+      for (const BodyS &e : nb) {
+        V3 p;
+        M3 R;
+        frame_.Unlevelled(e.p, M3(), p, R);
+        Rec(e.t, "B %d %.4f %.4f %.4f", e.dev, p.x, p.y, p.z);
+      }
+    }
     {
       std::vector<std::string> keys;
       std::vector<V3> S, Z;
@@ -1446,6 +1738,10 @@ Transform Sync::Tick(double now) {
                    sys.c_str(), e * 1000, best * 1000, n));
         Rec(now, "I timing %.5f best %.5f n %d", e, best, n);
       }
+    }
+    if (now - last_level_ >= 10) {
+      last_level_ = now;
+      LevelStep(raw);
     }
   }
   // slew toward the solution, faster while the head turns or walks (kSlew*), jump if far (acquisition)

@@ -1,4 +1,5 @@
-// QuestLHSync's link to the headset's lhsyncd (Magisk module): UDP discovery, then one TCP stream per session.
+// QuestLHSync's link to the headset's lhsyncd (Quest: Magisk module, Frame: user service): UDP discovery, then one TCP
+// stream per session.
 //   discovery  UDP 47281: "QLHS?" (broadcast + configured hosts) -> "QLHS 1 <serial> <tcp port> <model>"
 //   stream     TCP 47280: "H ..." hello, "C <len> <name>" + the camera calibration, then lhsight's lines
 //              (F frames, T heartbeats, I/W/E messages); "P <seq> <pc_ns>" -> "Q <seq> <pc_ns> <mono_ns>" round trips

@@ -142,20 +142,20 @@ static void StateText(const QlhsStatus &s, bool stale, std::wstring &title, std:
   if (stale) { title = L"Driver not running"; sub = L"The QuestLHSync driver isn't updating. Restart SteamVR."; color = col::red; return; }
   switch (s.state) {
     case QLHS_NO_HMD:
-      title = L"Waiting for a Quest Pro";
-      sub = s.hmd[0] ? L"SteamVR's headset isn't a Quest Pro, so the lighthouse space is left alone."
-                     : L"Start your streaming app (Link, Air Link, Virtual Desktop, ALVR, Steam Link, ...).";
+      title = L"Waiting for a Quest Pro or Steam Frame";
+      sub = s.hmd[0] ? L"SteamVR's headset isn't a Quest Pro or Steam Frame, so the lighthouse space is left alone."
+                     : L"Start your streaming app (Steam Link, Link, Air Link, Virtual Desktop, ALVR, ...).";
       color = col::grey;
       break;
     case QLHS_SEARCHING:
       title = L"Looking for the headset";
-      sub = L"No Quest Pro with the QuestLHSync module answers on the network. Is it awake and on the same Wi-Fi?";
+      sub = L"No headset with QuestLHSync's lhsyncd answers on the network. Is it awake and on the same Wi-Fi?";
       color = col::amber;
       break;
     case QLHS_CONNECTING: title = L"Connecting"; sub = L"Found the headset, opening the camera stream."; color = col::amber; break;
     case QLHS_NO_CAMERAS:
       title = L"No camera frames";
-      sub = L"Connected, but the tracking cameras send nothing. Put the headset on (or wake it) and check the module.";
+      sub = L"Connected, but the tracking cameras send nothing. Put the headset on (or wake it) and check lhsyncd.";
       color = col::red;
       break;
     case QLHS_NO_STATIONS:
@@ -171,7 +171,7 @@ static void StateText(const QlhsStatus &s, bool stale, std::wstring &title, std:
     case QLHS_LOCKED:
       title = s.paused ? L"Locked, corrections paused" : L"Locked";
       sub = s.paused ? L"Lighthouse devices stay where they are until you resume."
-                     : L"Lighthouse devices follow the Quest's own tracking.";
+                     : L"Lighthouse devices follow the headset's own tracking.";
       color = s.paused ? col::amber : col::green;
       break;
     default: title = L"Starting"; sub = L""; color = col::grey;
@@ -188,7 +188,7 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
   // header
   int tw = p.Text(48, 34, L"QuestLHSync", h1, col::text);
   p.Text(48 + tw + 14, 50, L"by CreoleVR", h2, col::faint);
-  p.Text(50, 88, L"Lighthouse tracking aligned to your Quest Pro, from its own cameras", small, col::dim);
+  p.Text(50, 88, L"Lighthouse tracking aligned to your headset, from its own cameras", small, col::dim);
   std::wstring title, sub;
   uint32_t sc;
   StateText(s, stale, title, sub, sc);

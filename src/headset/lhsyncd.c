@@ -1,13 +1,13 @@
-// lhsyncd: QuestLHSync's headset daemon (started by the Magisk module's service.sh). Serves the tracking
-// cameras' view of lighthouse base station laser flashes to the QuestLHSync SteamVR driver on the LAN.
+// lhsyncd: QuestLHSync's headset daemon, shared by the Quest Pro (magisk/: the Magisk module's service.sh starts it)
+// and the Steam Frame (frame/: a systemd user service). Serves the tracking cameras' view of lighthouse base station
+// laser flashes to the QuestLHSync SteamVR driver on the LAN. The headset's own parts are behind headset.h.
 //   UDP 47281  discovery: "QLHS?" -> "QLHS 1 <serial> <tcp port> <model> <idle|capturing>"
 //   TCP 47280  per client: "H QuestLHSync 1 serial=.. model=.. fw=.. module=..", "C <len> <name>" + the camera
-//              calibration file (/persist/calibration, read-only), then lhsight's lines (F/T/I/W) as they come.
+//              calibration (read-only), then lhsight's lines (F/T/I/W/E) as they come.
 //              The client sends "P <seq> <pc_ns>"; the reply "Q <seq> <pc_ns> <mono_ns>" is its clock sync.
-// lhsight (frida-inject + lhsight.js inside the sensors HAL; reads the camera rings, writes nothing) runs only
-// while a client is connected, and is stopped a few seconds after the last one leaves.
+// lhsight (the headset's camera reader: reads the camera buffers, writes nothing) runs only while a client is connected,
+// and is stopped a few seconds after the last one leaves.
 #include <arpa/inet.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -19,32 +19,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/system_properties.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <android/log.h>
+#include "headset.h"
 
 #define TCP_PORT 47280
 #define UDP_PORT 47281
 #define MAXC 4
 #define OUTCAP (8 << 20)
-#define HAL "vendor.oculus.hardware.sensors@1.0-service"
-#define RUNDIR "/dev/.questlhsync"
-#ifndef MODULE_VERSION
-#define MODULE_VERSION "dev"
-#endif
-
-static const char *moddir = "/data/adb/modules/questlhsync";
 
 static void logi(const char *fmt, ...) {
+  char b[512];
   va_list ap;
   va_start(ap, fmt);
-  __android_log_vprint(ANDROID_LOG_INFO, "QuestLHSync", fmt, ap);
+  vsnprintf(b, sizeof b, fmt, ap);
   va_end(ap);
+  hs_log(b);
 }
 
 static double mono(void) {
@@ -116,7 +109,7 @@ static void say(const char *fmt, ...) {  // a message line to the log and every 
 }
 
 // ---------------------------------------------------------------- device info
-static char serial[PROP_VALUE_MAX], model[PROP_VALUE_MAX], fw[PROP_VALUE_MAX];
+static char serial[128], model[128], fw[128];
 
 static void underscores(char *s) {
   for (; *s; s++)
@@ -124,62 +117,31 @@ static void underscores(char *s) {
 }
 
 static void device_info(void) {
-  __system_property_get("ro.serialno", serial);
-  __system_property_get("ro.product.model", model);
-  __system_property_get("ro.build.version.incremental", fw);
+  hs_device_info(serial, model, fw, sizeof serial);
   if (!serial[0]) strcpy(serial, "unknown");
+  if (!model[0]) strcpy(model, "headset");
   underscores(serial);
   underscores(model);
   underscores(fw);
-}
-
-// the camera calibration: the newest online-refined file, else the factory one
-static int calibration(char *path, size_t n) {
-  const char *dir = "/persist/calibration/online";
-  DIR *d = opendir(dir);
-  time_t best = 0;
-  path[0] = 0;
-  if (d) {
-    struct dirent *e;
-    while ((e = readdir(d))) {
-      if (e->d_name[0] == '.') continue;
-      char p[512];
-      struct stat st;
-      snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
-      if (stat(p, &st) || !S_ISREG(st.st_mode) || st.st_size < 1000) continue;
-      if (st.st_mtime >= best) { best = st.st_mtime; snprintf(path, n, "%s", p); }
-    }
-    closedir(d);
-  }
-  if (!path[0]) snprintf(path, n, "/persist/calibration/camera_calibration.json");
-  return access(path, R_OK) == 0;
 }
 
 static int send_hello(struct client *c) {
   char h[512];
   int n = snprintf(h, sizeof h, "H QuestLHSync 1 serial=%s model=%s fw=%s module=%s\n", serial, model, fw, MODULE_VERSION);
   if (cl_queue(c, h, n)) return -1;
-  char path[512];
-  if (!calibration(path, sizeof path)) {
-    n = snprintf(h, sizeof h, "E no camera calibration in /persist/calibration\n");
+  char *buf = NULL, name[256] = "";
+  size_t got = 0;
+  if (hs_calibration(&buf, &got, name, sizeof name)) {
+    n = snprintf(h, sizeof h, "E %s\n", name);
     return cl_queue(c, h, n);
   }
-  FILE *f = fopen(path, "rb");
-  if (!f) return -1;
-  fseek(f, 0, SEEK_END);
-  long len = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = malloc(len > 0 ? len : 1);
-  size_t got = len > 0 ? fread(buf, 1, len, f) : 0;
-  fclose(f);
-  const char *name = strstr(path, "/calibration/") ? strstr(path, "/calibration/") + 13 : path;
   n = snprintf(h, sizeof h, "C %zu %s\n", got, name);
   int r = cl_queue(c, h, n) || cl_queue(c, buf, got);
   free(buf);
   return r ? -1 : 0;
 }
 
-// ---------------------------------------------------------------- lhsight (frida-inject in the sensors HAL)
+// ---------------------------------------------------------------- lhsight (the headset's camera reader)
 static pid_t child;
 static int child_fd = -1;
 static char cbuf[1 << 16];
@@ -187,105 +149,28 @@ static size_t clen;
 static double stop_at, kill_at, restart_at;
 static int failures;
 
-static pid_t hal_pid(void) {
-  DIR *d = opendir("/proc");
-  if (!d) return 0;
-  struct dirent *e;
-  pid_t found = 0;
-  while (!found && (e = readdir(d))) {
-    if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-    char p[64], cmd[256];
-    snprintf(p, sizeof p, "/proc/%s/cmdline", e->d_name);
-    int fd = open(p, O_RDONLY);
-    if (fd < 0) continue;
-    ssize_t n = read(fd, cmd, sizeof cmd - 1);
-    close(fd);
-    if (n <= 0) continue;
-    cmd[n] = 0;
-    const char *base = strrchr(cmd, '/') ? strrchr(cmd, '/') + 1 : cmd;
-    if (!strcmp(base, HAL)) found = atoi(e->d_name);
-  }
-  closedir(d);
-  return found;
-}
-
-// a frida-inject still running a lhsight.js (this daemon SIGKILLed, an old adb session) would make the next start a
-// second injection: stop those, and only those
-static int is_lhsight(const char *pid) {
-  char p[64], cmd[1024];
-  snprintf(p, sizeof p, "/proc/%s/cmdline", pid);
-  int fd = open(p, O_RDONLY);
-  if (fd < 0) return 0;
-  ssize_t len = read(fd, cmd, sizeof cmd - 1);
-  close(fd);
-  if (len <= 0) return 0;
-  cmd[len] = 0;
-  const char *base = strrchr(cmd, '/') ? strrchr(cmd, '/') + 1 : cmd;
-  if (strcmp(base, "frida-inject")) return 0;
-  for (ssize_t i = strlen(cmd) + 1; i < len; i += strlen(cmd + i) + 1) {
-    size_t l = strlen(cmd + i);
-    if (l >= 10 && !strcmp(cmd + i + l - 10, "lhsight.js")) return 1;
-  }
-  return 0;
-}
-
-static void kill_strays(void) {
-  DIR *d = opendir("/proc");
-  if (!d) return;
-  struct dirent *e;
-  char found[16][16];
-  int n = 0;
-  while (n < 16 && (e = readdir(d)))
-    if (e->d_name[0] >= '0' && e->d_name[0] <= '9' && is_lhsight(e->d_name)) snprintf(found[n++], 16, "%s", e->d_name);
-  closedir(d);
-  for (int i = 0; i < n; i++) logi("stopping a stray lhsight (frida-inject pid %s)", found[i]), kill(atoi(found[i]), SIGTERM);
-  for (int t = 0; n && t < 30; t++) {
-    usleep(100000);
-    int left = 0;
-    for (int i = 0; i < n; i++) left += is_lhsight(found[i]);
-    if (!left) return;
-  }
-  for (int i = 0; i < n; i++)
-    if (is_lhsight(found[i])) kill(atoi(found[i]), SIGKILL);
-}
-
 static void start_capture(void) {
-  pid_t hal = hal_pid();
-  if (!hal) { say("E sensors HAL not running"); restart_at = mono() + 5; return; }
   int p[2];
   if (pipe(p)) return;
-  char frida[512], script[512], pidstr[16];
-  snprintf(frida, sizeof frida, "%s/frida-inject", moddir);
-  snprintf(script, sizeof script, "%s/lhsight.js", moddir);
-  snprintf(pidstr, sizeof pidstr, "%d", hal);
-  mkdir(RUNDIR, 0755);
-  mkdir(RUNDIR "/tmp", 0755);
-  pid_t pid = fork();
-  if (pid == 0) {
-    setsid();
-    dup2(p[1], 1);
-    dup2(p[1], 2);
-    int nul = open("/dev/null", O_RDONLY);
-    dup2(nul, 0);
-    for (int fd = 3; fd < 1024; fd++) close(fd);
-    setenv("TMPDIR", RUNDIR "/tmp", 1);  // frida's scratch files: tmpfs, never /data/local/tmp
-    chdir(RUNDIR);
-    execl(frida, "frida-inject", "-p", pidstr, "-s", script, (char *)NULL);
-    _exit(127);
-  }
+  char msg[256] = "";
+  pid_t pid = hs_capture_start(p[1], msg, sizeof msg);
   close(p[1]);
-  if (pid < 0) { close(p[0]); return; }
+  if (pid <= 0) {
+    close(p[0]);
+    if (pid == 0) { say("E %s", msg); restart_at = mono() + 5; }
+    return;
+  }
   child = pid;
   child_fd = p[0];
   fcntl(child_fd, F_SETFL, O_NONBLOCK);
   clen = 0;
   stop_at = kill_at = 0;
-  say("I lhsyncd: lhsight started in the sensors HAL (pid %d)", hal);
+  say("I lhsyncd: %s", msg);
 }
 
 static void stop_capture(void) {
   if (child <= 0) return;
-  kill(child, SIGTERM);  // frida-inject detaches; the script unloads from the HAL
+  kill(child, SIGTERM);  // the reader lets go of the camera buffers
   kill_at = mono() + 3;
 }
 
@@ -311,7 +196,7 @@ static void reap(void) {
   }
 }
 
-// lhsight's output -> clients, whole lines; anything that isn't one of its records is frida talking
+// lhsight's output -> clients, whole lines; anything that isn't one of its records is the reader's runtime talking
 static void pump(void) {
   for (;;) {
     ssize_t n = read(child_fd, cbuf + clen, sizeof cbuf - clen - 1);
@@ -327,7 +212,7 @@ static void pump(void) {
         broadcast(ln, len);
       } else if (len > 1) {
         char m[300];
-        int k = snprintf(m, sizeof m, "E frida: %.*s", (int)(len - 1 > 250 ? 250 : len - 1), ln);
+        int k = snprintf(m, sizeof m, "E %s: %.*s", hs_capture_name, (int)(len - 1 > 250 ? 250 : len - 1), ln);
         logi("%s", m + 2);
         m[k++] = '\n';
         broadcast(m, k);
@@ -369,15 +254,14 @@ static int listen_udp(void) {
 }
 
 int main(int argc, char **argv) {
-  if (argc > 1) moddir = argv[1];
   signal(SIGPIPE, SIG_IGN);
   signal(SIGTERM, on_term);
   signal(SIGINT, on_term);
   device_info();
   int ts = listen_tcp(), us = listen_udp();
   if (ts < 0 || us < 0) { logi("ports %d/%d busy: already running?", TCP_PORT, UDP_PORT); return 3; }
-  kill_strays();
-  logi("lhsyncd %s up: serial %s, TCP %d, discovery UDP %d, module %s", MODULE_VERSION, serial, TCP_PORT, UDP_PORT, moddir);
+  hs_init(argc, argv);
+  logi("lhsyncd %s up: serial %s, TCP %d, discovery UDP %d", MODULE_VERSION, serial, TCP_PORT, UDP_PORT);
   double idle_since = 0;
   while (!quit) {
     struct pollfd pf[3 + MAXC];
@@ -397,8 +281,8 @@ int main(int argc, char **argv) {
       socklen_t fl = sizeof from;
       ssize_t n = recvfrom(us, b, sizeof b - 1, 0, (struct sockaddr *)&from, &fl);
       if (n >= 5 && !memcmp(b, "QLHS?", 5)) {
-        char r[256];
-        int k = snprintf(r, sizeof r, "QLHS 1 %s %d %s %s", serial, TCP_PORT, model[0] ? model : "Quest", child > 0 ? "capturing" : "idle");
+        char r[320];
+        int k = snprintf(r, sizeof r, "QLHS 1 %s %d %s %s", serial, TCP_PORT, model, child > 0 ? "capturing" : "idle");
         sendto(us, r, k, 0, (struct sockaddr *)&from, fl);
       }
     }

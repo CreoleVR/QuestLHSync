@@ -1,0 +1,11 @@
+[Unit]
+Description=QuestLHSync: the tracking cameras' view of the base stations, for a PC's SteamVR
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/questlhsync/lhsyncd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,8 +1,9 @@
-// QuestLHSync core: the lighthouse universe -> Quest space alignment (4 DOF: yaw + translation, both spaces are
-// gravity-aligned) from base station laser flashes seen by the Quest Pro's tracking cameras. Shared by the SteamVR
-// driver and the offline tools (qlhs_replay, qlhs_nettest).
-//   Optics    pixel -> ray in the headset's device frame (Fisheye62 calibration, from the headset itself)
-//   FrameGrid the cameras' exact frame grid: a detection's poll lag comes off its timestamp
+// QuestLHSync core: the lighthouse universe -> headset space alignment (4 DOF: yaw + translation, both spaces are
+// gravity-aligned) from base station laser flashes seen by the headset's tracking cameras (a Quest Pro's or a Steam
+// Frame's). Shared by the SteamVR driver and the offline tools (qlhs_replay, qlhs_nettest).
+//   Optics    pixel -> ray in the HMD pose's frame (the headset's own calibration: Meta's Fisheye62, or the Frame's KB4)
+//   FrameGrid the cameras' exact frame grid: a detection's poll lag comes off its timestamp (Quest; the Frame's
+//             timestamps are the frames' own)
 //   Clock     headset CLOCK_MONOTONIC -> PC clock (QPC seconds): round trips (live) or arrival envelope (old logs)
 //   PoseHist  HMD pose history (SteamVR raw = the Quest's STAGE space), interpolated at exposure time
 //   Frame     SteamVR's lighthouse frame of this run -> the reference frame (stations.json)
@@ -28,7 +29,7 @@
 using LogFn = std::function<void(const std::string &)>;
 using X4 = std::array<double, 4>;  // yaw, tx, ty, tz
 
-constexpr double kIR = 1 / 1.00434;  // side cameras: the near-IR laser images 0.434% further out than the
+constexpr double kIR = 1 / 1.00434;  // Quest side cameras: the near-IR laser images 0.434% further out than the
                                      // visible-light calibration predicts (lateral colour); measured on 4 sessions
 constexpr double kLagFallback = 0.005;  // s, typical poll lag while the frame grid isn't known yet
 constexpr double kExpoArrival = 0.020;  // s, grid -> exposure with the arrival-envelope clock (logs without round trips)
@@ -56,19 +57,25 @@ struct CamCal {
   int w = 0, h = 0;
   M3 R;  // device <- camera
   V3 t;
-  double f = 0, cx = 0, cy = 0, k[6] = {}, p[2] = {};
+  double f = 0, fy = 0, cx = 0, cy = 0, k[6] = {}, p[2] = {};
+  double ir = 1;  // near-IR laser image scale about the centre
   void Dist(double a, double b, double &u, double &v) const;
   bool Unproject(double px, double py, V3 &d) const;  // unit ray, camera frame
 };
+
+struct JVal;
 
 class Optics {
  public:
   bool Load(const std::string &json, std::string *err);
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
-  bool ok() const { return cams_[2].valid || cams_[3].valid; }
+  bool ok() const { return cams_[0].valid || cams_[1].valid || cams_[2].valid || cams_[3].valid; }
+  bool exact_time() const { return exact_time_; }  // frame times are the frames' own, no poll lag to take off
 
  private:
   CamCal cams_[4];
+  bool exact_time_ = false;
+  bool LoadFrame(const JVal &root, std::string *err);
 };
 
 // ---------------------------------------------------------------- timing helpers
@@ -130,6 +137,7 @@ struct StationsFile {
   std::string anchor;
   V3 anchor_p;
   M3 anchor_R;
+  M3 level;  // automatic frames: turns the frame level with the headset's gravity (Solver::Level)
   std::map<std::string, V3> fix;  // measured positions, reference frame
   bool Load(const std::string &path);
   bool SaveAuto(const std::string &path) const;
@@ -140,6 +148,8 @@ class Frame {
   explicit Frame(const StationsFile &f, LogFn log) : f_(f), log_(std::move(log)) {}
   void Update(const std::map<std::string, std::pair<V3, M3>> &raw);
   void Apply(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + C_ * (p - o_); Ro = C_ * R; }
+  // before the level: what recordings hold, so a replay with the same stations.json levels them once
+  void Unlevelled(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + Cs_ * (p - o_); Ro = Cs_ * R; }
   void Rotation(M3 &C, V3 &t) const { C = C_; t = oref_ - C_ * o_; }  // p_ref = C p_raw + t
   int ok() const { return ok_; }
   double deg() const { return deg_; }
@@ -147,7 +157,7 @@ class Frame {
  private:
   const StationsFile &f_;
   LogFn log_;
-  M3 C_;
+  M3 C_, Cs_;  // SteamVR's frame -> the reference frame, with and without the level
   V3 o_, oref_;
   int ok_ = -1;
   double deg_ = 0;
@@ -171,8 +181,17 @@ class Solver {
   static constexpr int ACQ = 12, TIGHT_N = 6;
   static constexpr double TIGHT_DEG = 0.2, FSCALE = 0.003;
   static constexpr double SIG_YAW = 0.5 / kDeg, SIG_T = 0.05, SIG_R = 0.1 / kDeg, COND_YAW = 0.1 / kDeg, COND_T = 0.01;
+  // the level: a tilt step of the reference frame is fitted with a weak prior (SIG_LEVEL) and kept only when the
+  // sightings pin it (COND_LEVEL, like COND_YAW) and at least LEVEL_STATIONS stations hold LEVEL_CELLS inlier cells
+  static constexpr double SIG_LEVEL = 1.0 / kDeg, COND_LEVEL = 0.1 / kDeg, LEVEL_MED = 0.3;
+  static constexpr int LEVEL_STATIONS = 3, LEVEL_CELLS = 3;
+  struct LevelR { X4 x{}; M3 tilt; int stations = 0; double med = 0; };  // tilt about the pivot, then x
 
   Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix);
+  // how far (m, horizontally, median) the lighthouse devices worn or held stay from the head if x were the alignment;
+  // NaN without enough of them
+  using BodyFn = std::function<double(const X4 &)>;
+  void SetBody(BodyFn f) { body_ = std::move(f); }
   void Reset(const X4 &x);
   void Add(double t, V3 o, V3 d);
   void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D);  // rays >= from
@@ -185,6 +204,11 @@ class Solver {
   // stations (sorted by serial) as the solver uses them
   void Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const;
   bool measured(const std::string &serial) const { return fix_.count(serial) && !stale_.count(serial); }
+  // Both spaces share gravity only if SteamVR's lighthouse frame is level: a tilt of it moves lighthouse devices far
+  // below the base stations sideways, and with two stations in view the 4-DOF fit can't see it. The third station's
+  // sightings can: refit with the stations tilted about pivot (reference frame). True if the sightings pin the tilt.
+  bool Level(V3 pivot, LevelR &out);
+  void Relevel(const X4 &x);  // the alignment for the stations as just levelled
 
   // geometry, also used by Timing
   static void Predict(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, std::vector<V3> &P, std::vector<V3> &Zq);
@@ -192,7 +216,7 @@ class Solver {
 
  private:
   struct Rays { std::vector<double> T; std::vector<V3> O, D; size_t size() const { return T.size(); } };
-  struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; };
+  struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; M3 tilt; };
 
   mutable std::mutex m_;
   std::vector<double> rt_;
@@ -208,18 +232,25 @@ class Solver {
   StepStat stat_;
   bool has_stat_ = false;
   int resets_ = 0;
+  BodyFn body_;
+  bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
+  int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
 
   Rays GetRays(double t0);
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
   static int Score(const std::vector<int> &c);
   static void Cells(const Rays &r, const std::vector<char> &use, std::vector<int> &cnt);
-  FitR Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now, double gate, const X4 *xa);
+  // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt
+  FitR Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now, double gate,
+           const X4 *xa, const V3 *pivot = nullptr);
   void Hypotheses(const Rays &r, const std::vector<V3> &S, std::vector<X4> &H, int M = 4000);
   void BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
                     const std::vector<int> &idx, double gate, std::vector<int> &out) const;
   static Rays Thin(const Rays &r);
   bool Acquire(double now, X4 &best, int &bs, int &tight);
   int ThinnedScore(const X4 &x, double now);
+  void CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, const Rays &t,
+                   double now);
 };
 
 // ---------------------------------------------------------------- timing
@@ -256,6 +287,7 @@ class Sync {
   void HeadsetReset();                                              // new connection: new clock, grid
   // SteamVR
   void OnHmdPose(double t, const Quat &q, V3 p);
+  void OnBodyPose(int dev, double t, V3 raw);  // lighthouse controllers and trackers (raw lighthouse universe)
   void SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw);
   void SetStreamer(const std::string &system);
   // 20 Hz; returns the transform for the lighthouse devices
@@ -309,7 +341,7 @@ class Sync {
   std::map<std::string, V3> quest_;  // saved station positions in Quest space
   bool seeded_ = false, have_applied_ = false, paused_ = false;
   X4 applied_{};
-  double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, lock_time_ = -1;
+  double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, last_level_ = 0, lock_time_ = -1;
   int brk_seen_ = 0, resets_seen_ = 0;
   double last_prec_ = -1e18;
   StepStat last_st_;
@@ -325,9 +357,15 @@ class Sync {
   std::map<std::string, double> saved_timings_;
   bool has_saved_ = false;
   std::mutex st_m_;
+  struct BodyS { double t; int dev; V3 p; };  // raw lighthouse universe
+  std::mutex body_m_;
+  std::deque<BodyS> body_, body_new_;  // the last ACQ_WIN s; new ones, for the recording
+  std::map<int, double> body_last_;
+  double BodyDist(const X4 &x);
 
   void LoadState();
   void Retime(double old_e, double new_e);
+  void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw);
   void SaveState(const X4 &x, const std::map<std::string, V3> &cs);
   bool Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss);
 };

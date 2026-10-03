@@ -78,7 +78,7 @@ void HeadsetLink::Loop() {
       if (!pref.empty() && f.serial == pref) pick = &f;
     if (!pick && !found.empty()) pick = &found[0];
     if (!pick) {
-      if (quiet++ % 30 == 0) log_("no QuestLHSync headset answers on the network (is it awake, with the Magisk module?)");
+      if (quiet++ % 30 == 0) log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
       // straight over TCP: manual hosts (a firewall eating UDP), then the last headset (a network dropping broadcasts)
       std::vector<std::string> direct;
       {

@@ -11,7 +11,7 @@
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
-  QLHS_NO_HMD,       // SteamVR's headset isn't a Quest Pro (or there's none yet)
+  QLHS_NO_HMD,       // SteamVR's headset isn't a Quest Pro or Steam Frame (or there's none yet)
   QLHS_SEARCHING,    // no QuestLHSync headset answers on the network
   QLHS_CONNECTING,
   QLHS_NO_CAMERAS,   // connected, but no camera frames come in
@@ -48,10 +48,10 @@ struct QlhsStatus {
   double updated;       // driver's clock (s); the overlay compares two reads for staleness
   char hmd[64];         // SteamVR's headset model
   char hmd_system[32];  // its tracking system (streamer)
-  char headset[48];     // the headset's model ("Quest Pro"), never its serial
+  char headset[48];     // the headset's model ("Quest Pro", "Steam Frame"), never its serial
   char headset_addr[48];
   char headset_fw[48];
-  double cam_fps;       // camera frames/s, both side cameras (all four from module v1.0)
+  double cam_fps;       // camera frames/s: the Quest's side cameras (all four from module v1.0), the Frame's four
   double sight_rate;    // base station sightings/s
   double rtt_ms;        // network round trip (clock sync)
   double expo_ms;       // frame grid -> pose time
