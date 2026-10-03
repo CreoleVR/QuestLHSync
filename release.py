@@ -2,7 +2,7 @@
 
   questlhsync/                         the SteamVR driver folder (driver, dashboard app, openvr_api.dll)
   QuestLHSync-magisk-<version>.zip     the Quest Pro's Magisk module
-  QuestLHSync-frame-<version>.tar.gz   the Steam Frame's package (built on the Frame: copy it into out\\)
+  QuestLHSync-frame-<version>.tar.gz   the Steam Frame's package
   README.md, LICENSE, THIRD_PARTY_NOTICES.md
 
 Refuses when a build is older than its sources, so a release never ships stale binaries.
@@ -35,7 +35,7 @@ def main():
         (os.path.join(BIN, "QuestLHSync.exe"), newest("src/overlay", "src/common", "third_party"), "build.bat"),
         (MODULE, newest("magisk/src", "magisk/module", "src/headset"), "python magisk\\build_module.py"),
         (FRAME, newest("frame/src", "frame/driver", "frame/package", "src/headset"),
-         "python3 frame/build.py on the Steam Frame, and copy it into out\\"),
+         "python frame\\build.py"),
     ]
     for path, src, how in checks:
         if not os.path.exists(path) or os.path.getmtime(path) < src:

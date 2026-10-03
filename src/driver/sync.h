@@ -57,6 +57,9 @@ constexpr double kLevelSettle = 5.0, kLevelBody = 1.0;  // s, m
 // channel check (Solver::CheckIdentity): every kIdEvery s; a pair is swapped when its sightings follow each other's
 // rotor periods better by kSwapGain, and switched if the swapped alignment keeps kSwapFit of the support
 constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kSwapFit = 0.7;
+// the lighthouse devices worn or held tell two alignments apart (Solver::BodyFavours) when one puts them within
+// kBodyNear of the head and the other kBodyGap further
+constexpr double kBodyNear = 1.0, kBodyGap = 1.0;  // m
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 
@@ -285,6 +288,8 @@ class Solver {
   static Rays Thin(const Rays &r);
   bool Acquire(double now, X4 &best, int &bs, int &tight);
   int ThinnedScore(const X4 &x, double now);
+  // 1: the lighthouse devices worn or held say a, 2: b, 0: they don't tell (da, db: their distance from the head, m)
+  int BodyFavours(const X4 &a, const X4 &b, double &da, double &db) const;
   void CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, const Rays &t,
                    double now);
   void CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);

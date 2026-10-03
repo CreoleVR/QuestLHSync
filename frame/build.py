@@ -5,11 +5,13 @@
   install.sh, uninstall.sh,   package/
   questlhsync.service
 
-Run on the Frame itself, or any arm64 Linux with glibc <= the Frame's: cc and c++ from PATH.
+Run on the Frame itself, or any arm64 Linux with glibc <= the Frame's: cc and c++ from PATH. Anywhere else (Windows,
+x86 Linux, macOS) Zig cross-compiles it, against glibc GLIBC: zig from PATH, or the ZIG environment variable.
 """
 import io
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -23,19 +25,29 @@ BUILD = os.path.join(HERE, "build")
 OUT = os.path.join(ROOT, "out")
 HEADSET = os.path.join(ROOT, "src", "headset")
 PACKAGE = os.path.join(OUT, f"QuestLHSync-frame-{VERSION}.tar.gz")
+GLIBC = "2.31"  # cross builds: runs on any SteamOS
+
+
+def compilers():
+    if platform.system() == "Linux" and platform.machine() in ("aarch64", "arm64"):
+        return ["cc", "-Wno-format-truncation"], ["c++"]
+    zig = os.environ.get("ZIG") or shutil.which("zig")
+    if not zig:
+        sys.exit("not an arm64 Linux: install Zig (https://ziglang.org) to cross-compile, or build this on the Frame")
+    target = ["-target", f"aarch64-linux-gnu.{GLIBC}"]
+    return [zig, "cc", *target], [zig, "c++", *target]
 
 
 def main():
-    if platform.machine() not in ("aarch64", "arm64"):
-        sys.exit("build this on the Steam Frame (or another arm64 Linux): it's an arm64 Linux build")
+    cc, cxx = compilers()
     os.makedirs(BUILD, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
     daemon = os.path.join(BUILD, "lhsyncd")
     driver = os.path.join(BUILD, "driver_questlhsync_frame.so")
-    subprocess.run(["cc", "-O2", "-Wall", "-Wno-format-truncation", f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}",
+    subprocess.run([*cc, "-O2", "-Wall", f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}",
                     os.path.join(HEADSET, "lhsyncd.c"), os.path.join(HERE, "src", "frame.c"),
                     os.path.join(HERE, "src", "lhsight.c"), "-s", "-o", daemon], check=True)
-    subprocess.run(["c++", "-std=c++17", "-O2", "-Wall", "-fPIC", "-shared", "-fvisibility=hidden",
+    subprocess.run([*cxx, "-std=c++17", "-O2", "-Wall", "-fPIC", "-shared", "-fvisibility=hidden",
                     f"-I{os.path.join(ROOT, 'third_party', 'openvr', 'headers')}", os.path.join(HERE, "driver", "xrfds.cpp"),
                     "-pthread", "-s", "-o", driver], check=True)
     with tarfile.open(PACKAGE, "w:gz") as t:

@@ -12,6 +12,8 @@ driver on a Steam Frame), and a **SteamVR driver** for the PC, which solves the
 alignment, applies it to every lighthouse device and adds a page to the SteamVR
 dashboard.
 
+Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
+
 ![The QuestLHSync dashboard page](docs/dashboard.png)
 
 ## Requirements
@@ -127,22 +129,21 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 
 ## Building
 
-Visual Studio 2022 with C++, the Android NDK and Python 3:
+Visual Studio 2022 with C++, the Android NDK, [Zig](https://ziglang.org) and
+Python 3:
 
 ```
 build.bat                        SteamVR driver + dashboard app (SteamVR closed)
 python magisk\build_module.py    Magisk module, into out\
-python release.py                out\QuestLHSync-<version>.zip (needs the Frame package in out\ too)
+python frame\build.py            Steam Frame package, into out\
+python release.py                out\QuestLHSync-<version>.zip
 python install.py                register driver\questlhsync with SteamVR
 python install.py headset        install the module over adb, no reboot
 ```
 
-The Steam Frame package builds on the Frame itself or on any arm64 Linux with
-Python 3, `cc` and `c++`:
-
-```
-python3 frame/build.py           out/QuestLHSync-frame-<version>.tar.gz
-```
+Zig cross-compiles the Steam Frame package (`zig` on PATH, or `ZIG` set to it).
+On the Frame itself or any arm64 Linux, `frame/build.py` uses `cc` and `c++`
+instead.
 
 `lhsyncd`'s core (`src/headset/lhsyncd.c`) is shared by both headsets; each adds
 its own side behind `src/headset/headset.h` (`magisk/src/quest.c`,

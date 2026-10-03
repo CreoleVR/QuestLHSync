@@ -1048,6 +1048,14 @@ static double Apart(const X4 &a, const X4 &b, const std::vector<V3> &S) {
 
 static std::string Meters(double d) { return std::isfinite(d) ? Fmt("%.1f m", d) : std::string("none"); }
 
+int Solver::BodyFavours(const X4 &a, const X4 &b, double &da, double &db) const {
+  da = body_ ? body_(a) : NAN;
+  db = body_ ? body_(b) : NAN;
+  if (!std::isfinite(da) || !std::isfinite(db) || std::min(da, db) >= kBodyNear || std::fabs(da - db) <= kBodyGap)
+    return 0;
+  return da < db ? 1 : 2;
+}
+
 // Two stations facing each other at about the same height look the same with their places swapped: the fit turned
 // 180 deg about their midpoint explains the sightings almost as well, and puts every other lighthouse device across the
 // room. So the mirror of the best fit is fitted too. When the two score about the same, the lighthouse devices worn or
@@ -1078,12 +1086,13 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
   // thinned support is a small, noisy count: within a factor 2 the two are a tie
   if (sm * 2 < bs) { amb_state_ = 0; return; }  // clearly worse: not ambiguous
   if (bs * 2 < sm) { amb_state_ = 0; best = m; bs = sm; return; }
-  double db = body_ ? body_(best) : NAN, dm = body_ ? body_(m) : NAN;
+  double db, dm;
+  int fav = BodyFavours(best, m, db, dm);
   bool pick_m = false;
   int state;
   const char *why;
-  if (std::isfinite(db) && std::isfinite(dm) && std::min(db, dm) < 1.0 && std::fabs(db - dm) > 1.0) {
-    pick_m = dm < db;
+  if (fav) {
+    pick_m = fav == 2;
     state = pick_m ? 1 : 2;
     why = "the lighthouse devices near the head decide";
   } else if (has_x_) {
@@ -1263,7 +1272,14 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
     }
     int cur = ThinnedScore(x_, now), sw = ThinnedScore(xs, now);
     std::string pair = keys[wa] + " and " + keys[wb];
-    if (cur > 0 && sw >= kSwapFit * cur) {
+    // the devices worn or held are the stronger evidence, and the mirror check goes by them: a switch against them
+    // would only be switched back
+    double dc, ds;
+    if (BodyFavours(x_, xs, dc, ds) == 1) {
+      say("body " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but the lighthouse devices near the "
+                              "head say they aren't (%s from it, %s that way round): kept as it is", pair.c_str(), worst,
+                              Meters(dc).c_str(), Meters(ds).c_str()));
+    } else if (cur > 0 && sw >= kSwapFit * cur) {
       log_(Fmt("channel check: %s were the wrong way round (by %.2f): yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)",
                pair.c_str(), worst, xs[0] * kDeg, xs[1], xs[2], xs[3], sw, cur));
       Reset(xs);
