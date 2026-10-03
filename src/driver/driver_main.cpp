@@ -1,4 +1,4 @@
-// QuestLHSync: keeps the lighthouse universe aligned to a rooted Quest Pro's own tracking, whatever streams the
+// QuestLHSync: keeps the lighthouse universe aligned to a rooted Quest's own tracking, whatever streams the
 // Quest to SteamVR. The headset's Magisk module (lhsyncd) serves base station laser flashes seen by the tracking
 // cameras; this driver solves the 4-DOF lighthouse -> Quest transform (sync.cpp) and applies it to every
 // lighthouse-tracked device (trackers, controllers, base stations).
@@ -225,13 +225,6 @@ static void Copy(char *dst, size_t n, const std::string &s) {
   dst[n - 1] = 0;
 }
 
-static std::string Lower(std::string s) {
-  std::string o;
-  for (char c : s)
-    if (isalnum((unsigned char)c)) o += (char)tolower((unsigned char)c);
-  return o;
-}
-
 static std::string GetStr(vr::PropertyContainerHandle_t c, vr::ETrackedDeviceProperty p) {
   char buf[256] = "";
   vr::ETrackedPropertyError e = vr::TrackedProp_Success;
@@ -312,25 +305,27 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         continue;
       }
       if (cls == vr::TrackedDeviceClass_HMD && g_hmd.load() < 0) {
-        // a Quest Pro, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link, CreoleCast, ...
-        std::string all = Lower(model + " " + GetStr(c, vr::Prop_RenderModelName_String) + " " + serial + " " +
-                                GetStr(c, vr::Prop_ManufacturerName_String));
-        bool quest_pro = all.find("questpro") != std::string::npos || all.find("seacliff") != std::string::npos;
-        if (quest_pro || any_hmd_) {
+        // a Quest Pro, 3 or 3S, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link, CreoleCast, ...
+        std::string family;
+        for (const std::string &p : {model, GetStr(c, vr::Prop_RenderModelName_String), serial,
+                                     GetStr(c, vr::Prop_ManufacturerName_String)})
+          if (family.empty()) family = QuestFamily(p);
+        if (!family.empty() || any_hmd_) {
           g_hmd = (int)i;
           g_kind[i] = kHmd;
+          link_->SetFamily(family);
           std::lock_guard<std::mutex> g(hmd_m_);
           hmd_model_ = model.empty() ? "headset" : model;
           hmd_system_ = sys;
           g_sync->SetStreamer(sys);
           Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), sys.c_str(),
-                  quest_pro ? "" : " - not named a Quest Pro, used because anyHmd is set"));
+                  !family.empty() ? "" : " - not named a Quest Pro, 3 or 3S, used because anyHmd is set"));
           continue;
         }
         std::lock_guard<std::mutex> g(hmd_m_);
         hmd_model_ = model.empty() ? "headset" : model;
         hmd_system_ = sys;
-        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro: idle", i, hmd_model_.c_str(), sys.c_str()));
+        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3 or 3S: idle", i, hmd_model_.c_str(), sys.c_str()));
       }
       g_kind[i] = kOther;
     }

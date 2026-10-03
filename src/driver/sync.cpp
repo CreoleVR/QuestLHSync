@@ -1,6 +1,7 @@
 #include "sync.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -104,13 +105,17 @@ bool Optics::Load(const std::string &json, std::string *err) {
   if (!JParse(json, root)) { if (err) *err = "calibration isn't JSON"; return false; }
   const JVal *cams = root.get("CameraCalibration");
   if (!cams || cams->t != JVal::Arr) { if (err) *err = "no CameraCalibration"; return false; }
-  CamCal out[4];
+  CamCal out[kMaxCam];
+  int n = 0;
   for (auto &c : cams->a) {
     const JVal *id = c.get("Id"), *size = c.get("ImageSize"), *dfc = c.get("DeviceFromCamera");
-    const JVal *proj = c.get("Projection"), *dist = c.get("Distortion");
+    const JVal *proj = c.get("Projection"), *dist = c.get("Distortion"), *shutter = c.get("Shutter");
+    const JVal *sensor = c.get("SensorType");
     if (!id || !size || !dfc || !proj || !dist) continue;
     int i = id->t == JVal::Str ? atoi(id->s.c_str()) : (int)id->num(-1);  // "Id": "2" in Meta's files
-    if (i < 0 || i > 3) continue;
+    if (i < 0 || i >= kMaxCam) continue;
+    const JVal *type = shutter ? shutter->get("Type") : nullptr;
+    if (type && type->t == JVal::Str && type->s == "Rolling") continue;  // the colour cameras: not tracking ones
     auto sz = size->nums(), T = dfc->nums();
     auto pc = proj->get("Coefficients") ? proj->get("Coefficients")->nums() : std::vector<double>();
     auto dc = dist->get("Coefficients") ? dist->get("Coefficients")->nums() : std::vector<double>();
@@ -123,17 +128,21 @@ bool Optics::Load(const std::string &json, std::string *err) {
     k.f = pc[0]; k.cx = pc[1]; k.cy = pc[2];
     for (int j = 0; j < 6; j++) k.k[j] = dc[j];
     k.p[0] = dc[6]; k.p[1] = dc[7];
+    k.ir = sensor && sensor->t == JVal::Str && sensor->s == "OV7251" ? kIR : 1.0;
     k.valid = true;
+    n++;
   }
-  if (!out[2].valid && !out[3].valid) { if (err) *err = "no side camera calibration (ids 2, 3)"; return false; }
-  for (int i = 0; i < 4; i++) cams_[i] = out[i];
+  if (!n) { if (err) *err = "no tracking camera calibration"; return false; }
+  for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
+  const JVal *dev = root.get("Device"), *type = dev ? dev->get("DeviceType") : nullptr;
+  device_ = type && type->t == JVal::Str ? type->s : "";
   return true;
 }
 
 bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
-  if (cam < 0 || cam > 3 || !cams_[cam].valid) return false;
+  if (cam < 0 || cam >= kMaxCam || !cams_[cam].valid) return false;
   const CamCal &c = cams_[cam];
-  double k = (cam == 2 || cam == 3) ? kIR : 1.0;
+  double k = c.ir;
   V3 dc;
   if (!c.Unproject(c.cx + (x - c.cx) * k, c.cy + (y - c.cy) * k, dc)) return false;
   d = c.R * dc;
@@ -150,11 +159,8 @@ static double PyMod(double a, double m) {
   return r < 0 ? r + m : r;
 }
 
-bool FrameGrid::Lag(int cam, double t, double &lag) {
-  auto &h = h_[cam];
-  h.push_back(t);
-  while (!h.empty() && h.front() < t - WIN) h.pop_front();
-  if (h.size() < 40) return false;
+// the widest empty stretch of the detection times folded at P: the poll lags fill the rest, so it ends at the grid
+static double FoldGap(const std::deque<double> &h, double P, double *grid) {
   std::vector<double> ph;
   ph.reserve(h.size());
   for (double v : h) ph.push_back(PyMod(v, P));
@@ -165,8 +171,79 @@ bool FrameGrid::Lag(int cam, double t, double &lag) {
     double g = (i + 1 < n ? ph[i + 1] : ph[0] + P) - ph[i];
     if (g > bg) { bg = g; best = i; }
   }
-  double l = PyMod(t - ph[(best + 1) % n], P);
-  lag = l > P - 0.01 ? l - P : l;
+  if (grid) *grid = ph[(best + 1) % n];
+  return bg;
+}
+
+// how tightly the detection times fold at P: the narrowest phase band holding 90% of them (stragglers, a log flush
+// tens of ms late, don't count)
+static double FoldSpread(const std::deque<double> &h, double P) {
+  std::vector<double> ph;
+  ph.reserve(h.size() * 2);
+  for (double v : h) ph.push_back(PyMod(v, P));
+  std::sort(ph.begin(), ph.end());
+  size_t n = ph.size(), m = (n * 9 + 9) / 10;
+  for (size_t i = 0; i < n; i++) ph.push_back(ph[i] + P);
+  double w = P;
+  for (size_t i = 0; i < n; i++) w = std::min(w, ph[i + m - 1] - ph[i]);
+  return w;
+}
+
+// the short frames' period from their detection times (each a few ms after its frame): near the median gap (or the
+// period found before), the one they fold at most tightly. 0 if none folds cleanly (frame times too irregular to use)
+double FrameGrid::Learn(const std::deque<double> &h, double prev) {
+  std::vector<double> d;
+  for (size_t i = 1; i < h.size(); i++)
+    if (h[i] - h[i - 1] > 0.005 && h[i] - h[i - 1] < 0.5) d.push_back(h[i] - h[i - 1]);
+  if (d.size() < 20) return 0;
+  double p0 = Median(d), span = h.back() - h.front();
+  if (span < 20 * p0) return 0;
+  // a step of the period moves the window's far end span/P times as much: steps of 2 ms there, then of 0.05 ms
+  double best = p0, bw = kInf, coarse = 0.002 * p0 / span, fine = 0.00005 * p0 / span;
+  auto check = [&](double p) {
+    double w = FoldSpread(h, p);
+    if (w < bw) { bw = w; best = p; }
+  };
+  double lo = prev > 0 ? 0.995 * prev : 0.9 * p0, hi = prev > 0 ? 1.005 * prev : 1.1 * p0;
+  for (double p = lo; p <= hi; p += coarse) check(p);
+  double c = best;
+  for (double p = c - coarse; p <= c + coarse; p += fine) check(p);
+  return bw <= 0.5 * best ? best : 0;
+}
+
+double FrameGrid::period(int cam) const {
+  if (fixed_ > 0) return fixed_;
+  auto it = c_.find(cam);
+  return it == c_.end() ? 0 : it->second.p;
+}
+
+bool FrameGrid::Lag(int cam, double t, double &lag) {
+  auto &c = c_[cam];
+  auto &h = c.h;
+  h.push_back(t);
+  while (!h.empty() && h.front() < t - WIN) h.pop_front();
+  auto &lh = c.longer;
+  if (!fixed_) {
+    lh.push_back(t);
+    while (!lh.empty() && lh.front() < t - LEARN_WIN) lh.pop_front();
+  }
+  if (h.size() < 40) return false;
+  // learned: from the frames so far once the grid's window is full, then refined every WIN over up to LEARN_WIN (a
+  // longer stretch pins the period closer). A camera's rate doesn't change, so a stretch too messy to fold (frames
+  // misread as short ones) keeps the period found before
+  if (!fixed_) {
+    if (t >= c.next && h.back() - h.front() >= 0.9 * WIN) {
+      double p = Learn(lh, c.p);
+      if (p > 0) c.p = p;
+      c.next = t + WIN;
+    }
+  }
+  double P = fixed_ ? fixed_ : c.p;
+  if (P <= 0) return false;
+  double grid;
+  FoldGap(h, P, &grid);
+  double l = PyMod(t - grid, P);
+  lag = l > P - std::min(0.01, P / 8) ? l - P : l;
   return true;
 }
 
@@ -1207,13 +1284,21 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
+  // the Quest Pro's frame period is known; another headset's is learned from its frames (a few seconds more before
+  // a sighting's poll lag comes off)
+  std::string dev = optics_.device();
+  for (auto &ch : dev) ch = (char)tolower((unsigned char)ch);
+  grid_period_ = (dev.empty() || dev == "seacliff") && !cfg_.learn_grid ? FrameGrid::kQuestPro : 0.0;
+  grid_ = FrameGrid(grid_period_);
+  grid_logged_.clear();
   return true;
 }
 
 void Sync::HeadsetReset() {
   std::lock_guard<std::mutex> g(net_);
   clock_.Clear();
-  grid_ = FrameGrid();
+  grid_ = FrameGrid(grid_period_);
+  grid_logged_.clear();
 }
 
 void Sync::SetStreamer(const std::string &system) {
@@ -1274,6 +1359,13 @@ void Sync::OnLine(double pc, const char *line) {
   if (cfg_.arrival_clock) clock_.AddArrival(pc, hs);
   double lag = 0;
   bool have_lag = nb >= 0 && grid_.Lag(cam, hs, lag);
+  if (nb >= 0 && !grid_period_) {  // a learned frame period: log it when it's found or moves
+    double p = grid_.period(cam), &was = grid_logged_[cam];
+    if (p > 0 && std::fabs(p - was) > 0.0001) {
+      log_(Fmt("camera %d: short frames every %.3f ms", cam, p * 1000));
+      was = p;
+    }
+  }
   if (nb <= 0 || !have_optics_) return;
   double grid_pc;
   if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) return;

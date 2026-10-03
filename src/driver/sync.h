@@ -1,5 +1,5 @@
 // QuestLHSync core: the lighthouse universe -> Quest space alignment (4 DOF: yaw + translation, both spaces are
-// gravity-aligned) from base station laser flashes seen by the Quest Pro's tracking cameras. Shared by the SteamVR
+// gravity-aligned) from base station laser flashes seen by a Quest's tracking cameras. Shared by the SteamVR
 // driver and the offline tools (qlhs_replay, qlhs_nettest).
 //   Optics    pixel -> ray in the headset's device frame (Fisheye62 calibration, from the headset itself)
 //   FrameGrid the cameras' exact frame grid: a detection's poll lag comes off its timestamp
@@ -28,8 +28,10 @@
 using LogFn = std::function<void(const std::string &)>;
 using X4 = std::array<double, 4>;  // yaw, tx, ty, tz
 
-constexpr double kIR = 1 / 1.00434;  // side cameras: the near-IR laser images 0.434% further out than the
-                                     // visible-light calibration predicts (lateral colour); measured on 4 sessions
+constexpr double kIR = 1 / 1.00434;  // side cameras (OV7251): the near-IR laser images 0.434% further out than the
+                                     // visible-light calibration predicts (lateral colour); measured on 4 Quest Pro
+                                     // sessions, and assumed for the Quest 3's (the same sensor)
+constexpr int kMaxCam = 16;             // camera ids 0..15
 constexpr double kLagFallback = 0.005;  // s, typical poll lag while the frame grid isn't known yet
 constexpr double kExpoArrival = 0.020;  // s, grid -> exposure with the arrival-envelope clock (logs without round trips)
 constexpr double kExpoDefault = 0.018;  // s, grid -> pose time with the round-trip clock, before it's learned
@@ -54,6 +56,7 @@ constexpr double kJumpApply = 0.25;     // m: bigger corrections apply at once
 struct CamCal {
   bool valid = false;
   int w = 0, h = 0;
+  double ir = 1.0;  // kIR for the side cameras
   M3 R;  // device <- camera
   V3 t;
   double f = 0, cx = 0, cy = 0, k[6] = {}, p[2] = {};
@@ -65,20 +68,27 @@ class Optics {
  public:
   bool Load(const std::string &json, std::string *err);
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
-  bool ok() const { return cams_[2].valid || cams_[3].valid; }
+  const std::string &device() const { return device_; }       // "Seacliff" (Quest Pro), "Eureka" (Quest 3), ...
 
  private:
-  CamCal cams_[4];
+  CamCal cams_[kMaxCam];
+  std::string device_;
 };
 
 // ---------------------------------------------------------------- timing helpers
 class FrameGrid {
  public:
-  static constexpr double P = 3 / 37.5, WIN = 10.0;
+  static constexpr double kQuestPro = 3 / 37.5;  // s: the Quest Pro's short frames, every third at 37.5 fps
+  static constexpr double WIN = 10.0, LEARN_WIN = 30.0;  // s: the grid's window, the period's
+  explicit FrameGrid(double period = kQuestPro) : fixed_(period) {}  // 0: learn the period (other headsets)
   bool Lag(int cam, double t, double &lag);  // t: a short frame's detection time (headset s), call for all
+  double period(int cam) const;              // s, 0 while unknown
 
  private:
-  std::map<int, std::deque<double>> h_;
+  struct Cam { std::deque<double> h, longer; double p = 0, next = 0; };
+  double fixed_;
+  std::map<int, Cam> c_;
+  static double Learn(const std::deque<double> &h, double prev);
 };
 
 class Clock {
@@ -241,6 +251,7 @@ struct SyncConfig {
   std::string dir;         // state files (stations.json, state.json)
   bool arrival_clock = false;  // old logs: no round trips, fixed EXPO
   bool learn_timing = true;
+  bool learn_grid = false;     // tools: learn the frame period even on a Quest Pro
 };
 
 struct Transform { bool active = false; Quat q; V3 t; };  // raw lighthouse -> Quest
@@ -294,6 +305,8 @@ class Sync {
   bool have_optics_ = false;
   Clock clock_;
   FrameGrid grid_;
+  double grid_period_ = FrameGrid::kQuestPro;  // 0: learned (not a Quest Pro)
+  std::map<int, double> grid_logged_;           // learned periods as last logged, per camera
   PoseHist poses_;
   StationsFile sfile_;
   Frame frame_;

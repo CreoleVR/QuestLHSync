@@ -1,7 +1,9 @@
 // qlhs_replay: run a QuestLHSync recording through the driver's Sync, as if live.
 //   qlhs_replay <log> --calib <camera calibration json> --dir <state dir> [--out file] [--learn] [--expo s]
+//               [--learn-grid]
 // Logs without clock round trips use the arrival envelope clock and EXPO 0.020.
 // --learn: round-trip-less logs still learn the timing (starting from --expo), to test the estimator.
+// --learn-grid: learn the cameras' frame period as for headsets other than the Quest Pro, to test that.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +16,7 @@
 
 int main(int argc, char **argv) {
   std::string log, calib, dir, outp;
-  bool learn = false;
+  bool learn = false, learn_grid = false;
   double expo = -1;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -24,6 +26,7 @@ int main(int argc, char **argv) {
     else if (a == "--rays" && i + 1 < argc) g_ray_dump = fopen(argv[++i], "w");  // every sighting + the stations
     else if (a == "--expo" && i + 1 < argc) expo = atof(argv[++i]);
     else if (a == "--learn") learn = true;
+    else if (a == "--learn-grid") learn_grid = true;
     else log = a;
   }
   if (log.empty() || calib.empty()) { fprintf(stderr, "usage: qlhs_replay <log> --calib file --dir statedir [--out f] [--learn] [--expo s]\n"); return 2; }
@@ -36,6 +39,7 @@ int main(int argc, char **argv) {
   cfg.dir = dir;
   cfg.arrival_clock = true;
   cfg.learn_timing = learn;
+  cfg.learn_grid = learn_grid;
   Sync sync(cfg, logfn);
   if (expo >= 0) sync.ForceExpo(expo);
   sync.SetStreamer("replay");

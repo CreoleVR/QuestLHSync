@@ -1,4 +1,4 @@
-// lhsight: streaming bright-spot detector for the four tracking cameras, run as a Frida CModule
+// lhsight: streaming bright-spot detector for the tracking cameras, run as a Frida CModule
 // inside the sensors HAL. Read-only on the dmabuf rings. For every new frame: a sampled mean
 // (exposure class), and on short-exposure frames the saturated blobs (centroid, size, peak).
 // Output is text lines in a ring the JS side drains:
@@ -8,20 +8,26 @@ struct ts { long s; long ns; };
 extern int clock_gettime(int, struct ts *);
 extern void *memcpy(void *, const void *, unsigned long);
 extern int snprintf(char *, unsigned long, const char *, ...);
-#define MAXS 64
+#define MAXS 128
+#define MAXC 16                                // camera ids 0..15
 #define MAXB 24
 #define OUTCAP (1 << 20)
-// A camera's next frame comes 26.7 ms after its last (37.5 fps): polling sleeps until shortly before it is due.
-// Reading the camera buffers is slow, so checking all of them every millisecond cost far more than the scans.
-#define QUIET_NS 22000000ull
+// Polling sleeps until shortly before a camera's next frame is due. Reading the camera buffers is slow, so checking
+// all of them every millisecond cost far more than the scans. Frames don't come evenly: the Quest Pro's come 20, 21
+// and 39 ms apart (long-short, short-long, long-long), so the next one is predicted from the frames a cycle before.
+#define EARLY_US 3000                          // wake this long before the predicted frame
+#define HIST 32                                // frame times kept per camera
 struct st {
   u8 *slot[MAXS]; int sw[MAXS], sh[MAXS], cam[MAXS], pend[MAXS]; u32 shash[MAXS]; int nslots;
-  u32 k[8]; int m1[8], m2[8];                  // per-camera frame counter, previous two means
+  u32 k[MAXC]; int m1[MAXC], m2[MAXC];         // per camera: frame counter, previous two means
+  int nostrict[MAXC], nalt[MAXC];              // frames since the last strict short one, alternating ones since
   int thr;
   u8 *scratch; u16 *cells; int *lab;
   char *out; u32 head, tail, ndrop;
   u64 scan_ns; u32 nscan;
-  u64 last_t[8]; u32 npoll;                    // per camera: when its last frame was found
+  u64 last_t[MAXC], due[MAXC]; u32 npoll;      // per camera: when its last frame was found, when to look for the next
+  u64 ft[MAXC][HIST]; u32 nft[MAXC];           // its last frame times (ns)
+  int adj[MAXC], late[MAXC], slept;            // how much earlier to wake for it (us), its frame waited for us
 };
 extern struct st S;
 static u64 now(void) { struct ts t; clock_gettime(1, &t); return (u64)t.s * 1000000000ull + (u64)t.ns; }
@@ -61,8 +67,47 @@ int drain(char *dst, int cap) {
   return n;
 }
 static int find(int x) { while (S.lab[x] != x) { S.lab[x] = S.lab[S.lab[x]]; x = S.lab[x]; } return x; }
+static int rel_us(int c, u32 i, u64 t) { return (int)((long long)(S.ft[c][i % HIST] - t) / 1000); }  // frame i, us from t
+// when camera c's next frame is due, now that one was found at t. The cycle: the 1-4 frame shift the recent gaps
+// repeat best at. The cycle's length: the median of the last 12 frame-to-same-frame spans. The next frame: one cycle
+// after each of the last 3 cycles' frames at its place, the earliest of those (a frame found late doesn't push the
+// prediction late)
+static void predict(int c, u64 t) {
+  if (S.nft[c] && t - S.ft[c][(S.nft[c] - 1) % HIST] >= 200000000ull) S.nft[c] = 0;  // the camera paused: start over
+  u32 n = S.nft[c]++, k = n;
+  S.ft[c][n % HIST] = t;
+  S.due[c] = 0;
+  if (n < 24) return;
+  u32 best = 1; int be = 0x7fffffff;
+  for (u32 sh = 1; sh <= 4; sh++) {
+    int e = 0;
+    for (u32 i = k - 5; i <= k; i++) {
+      int g1 = rel_us(c, i, t) - rel_us(c, i - 1, t), g2 = rel_us(c, i - sh, t) - rel_us(c, i - sh - 1, t);
+      e += g1 > g2 ? g1 - g2 : g2 - g1;
+    }
+    if (e < be) { be = e; best = sh; }
+  }
+  int v[12];
+  for (u32 j = 0; j < 12; j++) {
+    int x = rel_us(c, k - j, t) - rel_us(c, k - j - best, t), b = (int)j;
+    for (; b > 0 && v[b - 1] > x; b--) v[b] = v[b - 1];
+    v[b] = x;
+  }
+  int C = (v[5] + v[6]) / 2, lo = 0x7fffffff;
+  for (u32 j = 1; j <= 3; j++) {
+    int p = rel_us(c, k + 1 - best * j, t) + (int)j * C;  // us after this frame
+    if (p < lo) lo = p;
+  }
+  if (lo > 0) S.due[c] = t + (u64)lo * 1000ull;
+  // found times lag the frames, so a prediction made from them can stay late: a frame that was already there when
+  // polling woke up wakes it a millisecond earlier for this camera next time, and that eases off while frames are
+  // caught arriving
+  if (S.late[c]) { S.late[c] = 0; if (S.adj[c] < 8000) S.adj[c] += 1000; }
+  else if (S.adj[c] >= 250) S.adj[c] -= 250;
+}
 static void frame(int i, u64 t) {
   int w = S.sw[i], h = S.sh[i], c = S.cam[i];
+  predict(c, t);
   S.last_t[c] = t;
   u32 n = (u32)(w * h);
   int mean = smean(S.slot[i], n);
@@ -70,7 +115,13 @@ static void frame(int i, u64 t) {
   int a = S.m1[c], b = S.m2[c];
   S.m2[c] = a; S.m1[c] = mean;
   int lo = a < b ? a : b;
-  int is_short = (k >= 2) && mean * 10 < lo * 6;  // short exposure: well under both previous frames
+  // short exposure: well under both previous frames (long-short-long, the Quest Pro). A camera alternating long and
+  // short frames never passes that (one of the two is short too): after 60 frames without a short one while every
+  // fourth or more is well under the frame before, it is judged against the frame before alone
+  int strict = k >= 2 && mean * 10 < lo * 6, alt = k >= 1 && mean * 10 < a * 6;
+  if (strict) S.nostrict[c] = S.nalt[c] = 0;
+  else if (S.nostrict[c] < 100000) { S.nostrict[c]++; S.nalt[c] += alt; }
+  int is_short = strict || (alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
   char line[1200]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);
@@ -89,6 +140,7 @@ static void frame(int i, u64 t) {
     for (int bb = 0; bb < 8; bb++) {
       if ((int)((x >> (8 * bb)) & 0xFF) < T) continue;
       u32 px = (j << 3) + bb; int y = (int)(px / (u32)w), xx = (int)(px - (u32)y * (u32)w);
+      if ((y >> 4) >= ch || (xx >> 4) >= cw) continue;  // the edge strip of a size that isn't a multiple of 16
       u16 *cc = &S.cells[(y >> 4) * cw + (xx >> 4)];
       if (*cc < 65535) (*cc)++;
     }
@@ -128,11 +180,12 @@ static void frame(int i, u64 t) {
   put(line, L);
 }
 int poll(void) {
-  int got = 0;
+  int got = 0, first = S.slept;  // the first poll after a sleep until a predicted frame
   S.npoll++;
+  S.slept = 0;
   for (int i = 0; i < S.nslots; i++) {
     u32 hh = hash(i);
-    if (hh != S.shash[i]) { S.shash[i] = hh; S.pend[i] = 1; continue; }
+    if (hh != S.shash[i]) { S.shash[i] = hh; S.pend[i] = 1; if (first) S.late[S.cam[i]] = 1; continue; }
     if (S.pend[i]) { S.pend[i] = 0; frame(i, now()); got++; }
   }
   return got;
@@ -141,8 +194,15 @@ int poll(void) {
 int idle_us(void) {
   u64 t = now(), due = ~0ull;
   for (int i = 0; i < S.nslots; i++) if (S.pend[i]) return 0;
-  for (int c = 0; c < 8; c++) if (S.last_t[c] && S.last_t[c] + QUIET_NS < due) due = S.last_t[c] + QUIET_NS;
+  for (int c = 0; c < MAXC; c++) {
+    if (!S.last_t[c]) continue;
+    if (!S.due[c]) return 0;  // no prediction yet: poll every millisecond
+    u64 d = S.due[c] - (u64)(EARLY_US + S.adj[c]) * 1000ull;
+    if (d < due) due = d;
+  }
   if (due == ~0ull || due <= t) return 0;
   u64 us = (due - t) / 1000;
-  return us > 22000 ? 22000 : (int)us;
+  if (us > 50000) us = 50000;
+  S.slept = us > 1500;
+  return (int)us;
 }

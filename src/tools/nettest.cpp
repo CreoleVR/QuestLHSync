@@ -1,6 +1,7 @@
 // qlhs_nettest: the driver's HeadsetLink + Sync against fake_lhsyncd.py, in real time. HMD poses come from the same
 // log, placed on this PC's clock where the fake headset's clock puts the camera frames.
-//   qlhs_nettest <log> --dir <state dir> [--start s] [--dur s] [--mem <headset.txt>]
+//   qlhs_nettest <log> --dir <state dir> [--start s] [--dur s] [--mem <headset.txt>] [--family "Quest 3"]
+// --family: SteamVR's HMD kind (default Quest Pro), to test that headsets of another kind are skipped
 #include <winsock2.h>
 #include <windows.h>
 
@@ -17,7 +18,7 @@
 #include "../driver/sync.h"
 
 int main(int argc, char **argv) {
-  std::string log, dir, mem;
+  std::string log, dir, mem, family = "Quest Pro";
   double start = 0, dur = 240;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -25,6 +26,7 @@ int main(int argc, char **argv) {
     else if (a == "--mem" && i + 1 < argc) mem = argv[++i];  // no manual host: only the remembered address
     else if (a == "--start" && i + 1 < argc) start = atof(argv[++i]);
     else if (a == "--dur" && i + 1 < argc) dur = atof(argv[++i]);
+    else if (a == "--family" && i + 1 < argc) family = argv[++i];
     else log = a;
   }
   struct P { double t; Quat q; V3 p; };
@@ -75,7 +77,8 @@ int main(int argc, char **argv) {
   sync.SetStreamer("nettest");
   sync.SetStationsRaw(raw);
   HeadsetLink link(&sync, logfn, [](double, const std::string &) {});
-  link.SetPreferred("FAKE0001");  // a real headset on the network answers discovery too
+  link.SetPreferred("FAKE0001");
+  link.SetFamily(family);  // a real headset on the network answers discovery too
   if (mem.empty()) link.SetHosts({"127.0.0.1"});
   else link.SetMemory(mem);
   link.SetWanted(true);
