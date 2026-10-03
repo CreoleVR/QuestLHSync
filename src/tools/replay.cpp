@@ -96,6 +96,10 @@ int main(int argc, char **argv) {
       }
     } else if (kind == 'F') {
       sync.OnLine(pc, sp + 1);
+    } else if (kind == 'B') {  // worn and held lighthouse devices (reference frame)
+      int dev;
+      double v[3];
+      if (sscanf(rest, "%d %lf %lf %lf", &dev, &v[0], &v[1], &v[2]) == 4) sync.OnBodyPose(dev, pc, V3{v[0], v[1], v[2]});
     } else if (kind == 'Q') {  // QuestLHSync recordings: clock round trips "Q pc_send pc_recv hs"
       double a, b, h;
       if (sscanf(rest, "%lf %lf %lf", &a, &b, &h) == 3) sync.OnPing(a, b, h);

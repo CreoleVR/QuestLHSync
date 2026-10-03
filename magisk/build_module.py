@@ -1,6 +1,6 @@
 """Builds the QuestLHSync Magisk module: out/QuestLHSync-magisk-<version>.zip
 
-  lhsyncd       src/lhsyncd.c, NDK clang for arm64 (Android 10+)
+  lhsyncd       ../src/headset/lhsyncd.c (shared with the Steam Frame) + src/quest.c, NDK clang for arm64 (Android 10+)
   lhsight.js    src/lhsight.js with src/lhsight.c inlined (Frida CModule), no time limit
   frida-inject  Frida 17.10.0 android-arm64, downloaded once from Frida's GitHub release into frida/ (checked by hash)
 
@@ -19,6 +19,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(os.path.dirname(HERE), "out")
+HEADSET = os.path.join(os.path.dirname(HERE), "src", "headset")
 with open(os.path.join(os.path.dirname(HERE), "src", "common", "qlhs_status.h"), encoding="utf-8") as _h:
     VERSION = "v" + re.search(r'#define QLHS_RELEASE "([^"]+)"', _h.read()).group(1)  # the driver's
 CODE = 5
@@ -64,7 +65,8 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     daemon = os.path.join(HERE, "build", "lhsyncd")
     subprocess.run([clang(), "--target=aarch64-linux-android29", "-O2", "-Wall", "-Wno-unused-result", "-fPIE", "-pie",
-                    f'-DMODULE_VERSION="{VERSION}"', os.path.join(HERE, "src", "lhsyncd.c"), "-llog", "-s", "-o", daemon],
+                    f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}", os.path.join(HEADSET, "lhsyncd.c"),
+                    os.path.join(HERE, "src", "quest.c"), "-llog", "-s", "-o", daemon],
                    check=True)
     js = open(os.path.join(HERE, "src", "lhsight.js"), encoding="utf-8").read()
     c = open(os.path.join(HERE, "src", "lhsight.c"), encoding="utf-8").read()

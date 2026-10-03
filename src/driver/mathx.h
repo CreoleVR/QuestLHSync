@@ -46,6 +46,17 @@ inline M3 Ry(double a) {
   return r;
 }
 inline V3 RyMul(double c, double s, V3 v) { return {c * v.x + s * v.z, v.y, -s * v.x + c * v.z}; }
+// rotation by |(ax, 0, az)| rad about the horizontal axis along (ax, 0, az): a tilt, no turn about the vertical
+inline M3 Tilt(double ax, double az) {
+  double th = std::hypot(ax, az);
+  M3 r;
+  if (th < 1e-15) return r;
+  double x = ax / th, z = az / th, c = std::cos(th), s = std::sin(th), k = 1 - c;
+  r.m[0][0] = c + k * x * x; r.m[0][1] = -s * z;  r.m[0][2] = k * x * z;
+  r.m[1][0] = s * z;         r.m[1][1] = c;       r.m[1][2] = -s * x;
+  r.m[2][0] = k * x * z;     r.m[2][1] = s * x;   r.m[2][2] = c + k * z * z;
+  return r;
+}
 // angle of a rotation matrix (deg)
 inline double RotDeg(const M3 &R) {  // atan2 form: acos loses small angles
   double c = (R.m[0][0] + R.m[1][1] + R.m[2][2] - 1) / 2;

@@ -1,7 +1,7 @@
-// QuestLHSync: keeps the lighthouse universe aligned to a rooted Quest's own tracking, whatever streams the
-// Quest to SteamVR. The headset's Magisk module (lhsyncd) serves base station laser flashes seen by the tracking
-// cameras; this driver solves the 4-DOF lighthouse -> Quest transform (sync.cpp) and applies it to every
-// lighthouse-tracked device (trackers, controllers, base stations).
+// QuestLHSync: keeps the lighthouse universe aligned to a headset's own tracking, a rooted Quest's or a Steam Frame's,
+// whatever streams it to SteamVR. The headset's lhsyncd (Magisk module / Frame package) serves base station laser
+// flashes seen by the tracking cameras; this driver solves the 4-DOF lighthouse -> headset transform (sync.cpp) and
+// applies it to every lighthouse-tracked device (trackers, controllers, base stations).
 //
 // Hooks IVRServerDriverHost::TrackedDevicePoseUpdated (MinHook on the function, so every driver's calls go
 // through it): lighthouse devices get the transform prepended to their WorldFromDriver, and the HMD's own poses
@@ -173,6 +173,15 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
       d.seq.fetch_add(1, std::memory_order_acq_rel);
     }
   }
+  // controllers and trackers: worn or held, they stay near the head, which tells a fit from its mirror (sync.cpp)
+  if (d.cls != vr::TrackedDeviceClass_TrackingReference && p.poseIsValid && p.result == vr::TrackingResult_Running_OK &&
+      g_sync) {
+    double pos[3];
+    vr::HmdQuaternion_t q;
+    RawPose(p, pos, q);
+    if (std::isfinite(pos[0] + pos[1] + pos[2]))
+      g_sync->OnBodyPose((int)id, QpcNow() + p.poseTimeOffset, V3{pos[0], pos[1], pos[2]});
+  }
   Xf x;
   if (!ReadXf(x)) return false;
   vr::HmdQuaternion_t xq{x.q.w, x.q.x, x.q.y, x.q.z};
@@ -325,7 +334,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         continue;
       }
       if (cls == vr::TrackedDeviceClass_HMD && g_hmd.load() < 0) {
-        // a Quest Pro, 3 or 3S, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link, CreoleCast, ...
+        // a Quest Pro, 3, 3S or a Steam Frame, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link,
+        // CreoleCast, ...
         std::string family;
         for (const std::string &p : {model, GetStr(c, vr::Prop_RenderModelName_String), serial,
                                      GetStr(c, vr::Prop_ManufacturerName_String)})
@@ -343,13 +353,14 @@ class Provider : public vr::IServerTrackedDeviceProvider {
           hmd_system_ = StreamerName(sys);
           g_sync->SetStreamer(sys);
           Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), hmd_system_.c_str(),
-                  !family.empty() ? "" : " - not named a Quest Pro, 3 or 3S, used because anyHmd is set"));
+                  !family.empty() ? "" : " - not named a Quest Pro, 3, 3S or Steam Frame, used because anyHmd is set"));
           continue;
         }
         std::lock_guard<std::mutex> g(hmd_m_);
         hmd_model_ = model.empty() ? "headset" : model;
         hmd_system_ = StreamerName(sys);
-        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3 or 3S: idle", i, hmd_model_.c_str(), hmd_system_.c_str()));
+        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3, 3S or Steam Frame: idle", i, hmd_model_.c_str(),
+                hmd_system_.c_str()));
       }
       g_kind[i] = kOther;
     }

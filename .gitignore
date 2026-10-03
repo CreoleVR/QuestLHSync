@@ -3,4 +3,5 @@ out/
 driver/questlhsync/bin/
 magisk/build/
 magisk/frida/
+frame/build/
 __pycache__/

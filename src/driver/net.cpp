@@ -58,6 +58,7 @@ std::string QuestFamily(const std::string &text) {
   auto has = [&](const char *k) { return s.find(k) != std::string::npos; };
   if (has("questpro") || has("seacliff")) return "Quest Pro";
   if (has("quest3") || has("eureka") || has("panther")) return "Quest 3";
+  if (has("steamframe") || has("deckard")) return "Steam Frame";
   return "";
 }
 
@@ -117,7 +118,7 @@ void HeadsetLink::Loop() {
     }
     if (!pick) {
       if (found.empty() && quiet++ % 30 == 0)
-        log_("no QuestLHSync headset answers on the network (is it awake, with the Magisk module?)");
+        log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
       // straight over TCP: manual hosts (a firewall eating UDP), then the last headset (a network dropping broadcasts)
       std::vector<std::string> direct;
       {
