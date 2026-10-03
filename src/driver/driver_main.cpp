@@ -1,7 +1,7 @@
-// QuestLHSync: keeps the lighthouse universe aligned to a headset's own tracking, a rooted Quest Pro's or a Steam
-// Frame's, whatever streams it to SteamVR. The headset's lhsyncd (Magisk module / Frame package) serves base station
-// laser flashes seen by the tracking cameras; this driver solves the 4-DOF lighthouse -> headset transform (sync.cpp)
-// and applies it to every lighthouse-tracked device (trackers, controllers, base stations).
+// QuestLHSync: keeps the lighthouse universe aligned to a headset's own tracking, a rooted Quest's or a Steam Frame's,
+// whatever streams it to SteamVR. The headset's lhsyncd (Magisk module / Frame package) serves base station laser
+// flashes seen by the tracking cameras; this driver solves the 4-DOF lighthouse -> headset transform (sync.cpp) and
+// applies it to every lighthouse-tracked device (trackers, controllers, base stations).
 //
 // Hooks IVRServerDriverHost::TrackedDevicePoseUpdated (MinHook on the function, so every driver's calls go
 // through it): lighthouse devices get the transform prepended to their WorldFromDriver, and the HMD's own poses
@@ -108,7 +108,14 @@ static bool ReadXf(Xf &x) {
 enum Kind { kUnknown = 0, kLighthouse = 1, kOther = 2, kHmd = 3 };
 static std::atomic<int> g_kind[vr::k_unMaxTrackedDeviceCount];
 static std::atomic<int> g_hmd{-1};             // the eligible HMD's index
-struct StationPose { char serial[32]; int cls; std::atomic<uint32_t> seq; double p[3]; double q[4]; };
+struct StationPose {
+  char serial[32];
+  int cls;
+  std::atomic<int> channel;  // 0 unknown
+  std::atomic<uint32_t> seq;
+  double p[3];
+  double q[4];
+};
 static StationPose g_dev[vr::k_unMaxTrackedDeviceCount];
 static std::atomic<long long> g_hooked{0}, g_moved{0};
 
@@ -234,18 +241,21 @@ static void Copy(char *dst, size_t n, const std::string &s) {
   dst[n - 1] = 0;
 }
 
-static std::string Lower(std::string s) {
-  std::string o;
-  for (char c : s)
-    if (isalnum((unsigned char)c)) o += (char)tolower((unsigned char)c);
-  return o;
-}
-
 static std::string GetStr(vr::PropertyContainerHandle_t c, vr::ETrackedDeviceProperty p) {
   char buf[256] = "";
   vr::ETrackedPropertyError e = vr::TrackedProp_Success;
   vr::VRProperties()->GetStringProperty(c, p, buf, sizeof buf, &e);
   return e == vr::TrackedProp_Success ? buf : "";
+}
+
+// the streamer's name for people, from its driver's
+static std::string StreamerName(const std::string &driver) {
+  static const char *const names[][2] = {{"oculus_virtualdesktop", "Virtual Desktop"}, {"oculus", "Quest Link"},
+                                         {"creolecast", "CreoleCast"}, {"vrlink", "Steam Link"},
+                                         {"alvr_server", "ALVR"}};
+  for (auto &n : names)
+    if (driver == n[0]) return n[1];
+  return driver;
 }
 
 // ---------------------------------------------------------------- provider
@@ -268,7 +278,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       g_st->version = QLHS_VERSION;
       g_st->magic = QLHS_MAGIC;
     }
-    Log("QuestLHSync driver starting, data in " + dir_);
+    Log("QuestLHSync " QLHS_RELEASE " driver starting, data in %LOCALAPPDATA%\\QuestLHSync");
     SyncConfig cfg;
     cfg.dir = dir_;
     g_sync = std::make_unique<Sync>(cfg, [](const std::string &s) { Log(s); });
@@ -305,7 +315,9 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (++tick_ % 45) return;  // classify devices about twice a second
     auto *props = vr::VRProperties();
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
-      if (g_kind[i].load() != kUnknown) continue;
+      int kind = g_kind[i].load();
+      if (kind == kLighthouse && g_dev[i].cls == vr::TrackedDeviceClass_TrackingReference) ReadChannel(i);
+      if (kind != kUnknown) continue;
       auto c = props->TrackedDeviceToPropertyContainer(i);
       if (c == vr::k_ulInvalidPropertyContainer) continue;
       std::string sys = GetStr(c, vr::Prop_TrackingSystemName_String);
@@ -318,32 +330,53 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         g_dev[i].cls = cls;
         g_kind[i] = kLighthouse;
         Log(Fmt("device %u: %s %s (%s) -> moved", i, sys.c_str(), serial.c_str(), model.c_str()));
+        if (cls == vr::TrackedDeviceClass_TrackingReference) ReadChannel(i);
         continue;
       }
       if (cls == vr::TrackedDeviceClass_HMD && g_hmd.load() < 0) {
-        // a Quest Pro or a Steam Frame, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link, ...
-        std::string all = Lower(model + " " + GetStr(c, vr::Prop_RenderModelName_String) + " " + serial + " " +
-                                GetStr(c, vr::Prop_ManufacturerName_String));
-        bool known = all.find("questpro") != std::string::npos || all.find("seacliff") != std::string::npos ||
-                     all.find("steamframe") != std::string::npos || all.find("deckard") != std::string::npos;
-        if (known || any_hmd_) {
+        // a Quest Pro, 3, 3S or a Steam Frame, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link,
+        // CreoleCast, ...
+        std::string family;
+        for (const std::string &p : {model, GetStr(c, vr::Prop_RenderModelName_String), serial,
+                                     GetStr(c, vr::Prop_ManufacturerName_String)})
+          if (family.empty()) family = QuestFamily(p);
+        // Virtual Desktop goes through SteamVR's oculus driver like Link does, but times its poses its own way: the
+        // actual driver name tells them apart ("oculus_virtualdesktop")
+        std::string actual = GetStr(c, vr::Prop_ActualTrackingSystemName_String);
+        if (!actual.empty()) sys = actual;
+        if (!family.empty() || any_hmd_) {
           g_hmd = (int)i;
           g_kind[i] = kHmd;
+          link_->SetFamily(family);
           std::lock_guard<std::mutex> g(hmd_m_);
           hmd_model_ = model.empty() ? "headset" : model;
-          hmd_system_ = sys;
+          hmd_system_ = StreamerName(sys);
           g_sync->SetStreamer(sys);
-          Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), sys.c_str(),
-                  known ? "" : " - not named a Quest Pro or Steam Frame, used because anyHmd is set"));
+          Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), hmd_system_.c_str(),
+                  !family.empty() ? "" : " - not named a Quest Pro, 3, 3S or Steam Frame, used because anyHmd is set"));
           continue;
         }
         std::lock_guard<std::mutex> g(hmd_m_);
         hmd_model_ = model.empty() ? "headset" : model;
-        hmd_system_ = sys;
-        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro or Steam Frame: idle", i, hmd_model_.c_str(), sys.c_str()));
+        hmd_system_ = StreamerName(sys);
+        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3, 3S or Steam Frame: idle", i, hmd_model_.c_str(),
+                hmd_system_.c_str()));
       }
       g_kind[i] = kOther;
     }
+  }
+
+  // a 2.0 base station's mode label is its channel, "1".."16"
+  void ReadChannel(uint32_t i) {
+    auto c = vr::VRProperties()->TrackedDeviceToPropertyContainer(i);
+    if (c == vr::k_ulInvalidPropertyContainer) return;
+    std::string label = GetStr(c, vr::Prop_ModeLabel_String);
+    int ch = 0;
+    if (!label.empty() && std::all_of(label.begin(), label.end(), [](char x) { return isdigit((unsigned char)x); }))
+      ch = atoi(label.c_str());
+    if (ch < 1 || ch > 16) ch = 0;
+    if (ch != g_dev[i].channel.exchange(ch) && !label.empty())
+      Log(Fmt("base station %s: channel %s", g_dev[i].serial, label.c_str()));
   }
 
   bool ShouldBlockStandbyMode() override { return false; }
@@ -362,6 +395,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   bool any_hmd_ = false, recording_ = false, overlay_started_ = false;
   int cmd_seen_ = 0;
   double started_ = 0, last_status_ = 0;
+  Sync::Spots rec_spots_;  // when the recording started
 
   void ReadSettings() {
     auto *s = vr::VRSettings();
@@ -389,7 +423,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   void SetRecording(bool on) {
     if (on == recording_) return;
     recording_ = on;
-    if (!on) { g_sync->SetRecord(nullptr); Log("recording off"); return; }
+    if (!on) {
+      g_sync->SetRecord(nullptr);
+      Log("recording off: " + Sync::Describe(rec_spots_, g_sync->spots()));
+      return;
+    }
     namespace fs = std::filesystem;
     fs::path rd = fs::path(dir_) / "recordings";
     std::vector<fs::path> old;  // keep the newest 9 + this one
@@ -408,6 +446,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (!f) { Log("can't open a recording file"); recording_ = false; return; }
     setvbuf(f, nullptr, _IOFBF, 1 << 16);
     g_sync->SetRecord(f);
+    rec_spots_ = g_sync->spots();
     g_sync->Rec(QpcNow(), "I QuestLHSync recording (qlhs_replay reads it)");
     Log(std::string("recording to recordings\\") + b);
   }
@@ -421,7 +460,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(mod, path, MAX_PATH);
     std::filesystem::path exe = std::filesystem::path(path).parent_path() / L"QuestLHSync.exe";
-    if (!std::filesystem::exists(exe)) { Log("dashboard app missing: " + exe.string()); return; }
+    if (!std::filesystem::exists(exe)) { Log("dashboard app missing: no QuestLHSync.exe next to the driver"); return; }
     std::wstring cmd = L"\"" + exe.wstring() + L"\"";
     STARTUPINFOW si{};
     si.cb = sizeof si;
@@ -440,9 +479,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
 
   void Stations() {
     std::map<std::string, std::pair<V3, M3>> raw;
+    std::map<std::string, int> chans;
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
       if (g_kind[i].load() != kLighthouse || g_dev[i].cls != vr::TrackedDeviceClass_TrackingReference) continue;
       StationPose &d = g_dev[i];
+      if (int ch = d.channel.load()) chans[d.serial] = ch;
       for (int tries = 0; tries < 8; tries++) {
         uint32_t s = d.seq.load(std::memory_order_acquire);
         if (s == 0 || (s & 1)) { Sleep(0); continue; }
@@ -456,6 +497,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       }
     }
     g_sync->SetStationsRaw(raw);
+    g_sync->SetChannels(chans);
   }
 
   void Commands() {
@@ -503,6 +545,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     Copy(t->headset_fw, sizeof t->headset_fw, link_->fw());
     t->cam_fps = s.cam_fps;
     t->sight_rate = s.sight_rate;
+    t->spot_rate = s.spot_rate;
+    t->head_still = s.head_still;
     t->rtt_ms = s.rtt * 1000;
     t->expo_ms = s.expo * 1000;
     t->expo_learned = s.timing_learned;

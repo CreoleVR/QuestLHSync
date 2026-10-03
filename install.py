@@ -1,7 +1,7 @@
 """QuestLHSync installer for a source checkout (the release zip needs no Python: see README.md).
 
   python install.py          PC (SteamVR closed): register driver\\questlhsync with SteamVR, in place
-  python install.py headset  Quest Pro over adb: install the Magisk module and start lhsyncd now (no reboot)
+  python install.py headset  Quest Pro, 3 or 3S over adb: install the Magisk module and start lhsyncd now (no reboot)
   python install.py remove   PC (SteamVR closed): unregister the driver (%LOCALAPPDATA%\\QuestLHSync is kept)
 """
 import json
@@ -71,14 +71,18 @@ def headset():
         return subprocess.run([adb_path, *args], capture_output=True, text=True, check=check, **kw)
 
     devs = [l.split()[0] for l in adb("devices").stdout.splitlines()[1:] if l.strip().endswith("device")]
-    quest = [d for d in devs if adb("-s", d, "shell", "getprop ro.product.device", check=False).stdout.strip().startswith("seacliff")]
+    names = {"seacliff": "Quest Pro", "eureka": "Quest 3", "panther": "Quest 3S"}
+    quest = []
+    for dev in devs:
+        code = adb("-s", dev, "shell", "getprop ro.product.device", check=False).stdout.strip()
+        quest += [(dev, names[k]) for k in names if code.startswith(k)]
     if not quest:
-        sys.exit(f"no Quest Pro on adb ({len(devs)} other device(s))")
-    d = quest[0]
+        sys.exit(f"no Quest Pro, 3 or 3S on adb ({len(devs)} other device(s))")
+    d, name = quest[0]
     if "uid=0" not in adb("-s", d, "shell", "su -c id", check=False).stdout:
         sys.exit("su doesn't work on the headset (Magisk root needed; allow Shell in Magisk's superuser list)")
     dst = "/sdcard/Download/QuestLHSync-magisk.zip"
-    print("Quest Pro: pushing the module")
+    print(f"{name}: pushing the module")
     adb("-s", d, "push", MODULE, dst)
     r = adb("-s", d, "shell", f"su -c 'magisk --install-module {dst}'", check=False)
     print(r.stdout.strip())

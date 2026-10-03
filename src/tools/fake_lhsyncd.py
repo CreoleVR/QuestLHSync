@@ -4,6 +4,7 @@ headset<->PC mapping (arrival envelope, like qlhs_replay's), so a client's round
 old pipeline's did and the learned pose timing should come out near EXPO (0.020 s).
 
   python fake_lhsyncd.py <log> <calibration json> [start_s] [duration_s]
+QLHS_MODEL=Quest_3 names it another headset (default Quest_Pro).
 """
 import os
 import socket
@@ -14,6 +15,7 @@ import time
 import numpy as np
 
 log, calib = sys.argv[1], sys.argv[2]
+MODEL = os.environ.get("QLHS_MODEL", "Quest_Pro").encode()
 start = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
 dur = float(sys.argv[4]) if len(sys.argv) > 4 else 1e9
 
@@ -50,7 +52,7 @@ def udp():
     while True:
         d, addr = u.recvfrom(64)
         if d.startswith(b"QLHS?"):
-            u.sendto(b"QLHS 1 FAKE0001 47280 Quest_Pro idle", addr)
+            u.sendto(b"QLHS 1 FAKE0001 47280 " + MODEL + b" idle", addr)
 
 
 if not os.environ.get("QLHS_NO_UDP"):  # QLHS_NO_UDP=1: a network that drops broadcasts (tests the TCP fallback)
@@ -75,7 +77,7 @@ def send(b):
         c.sendall(b)
 
 
-send(b"H QuestLHSync 1 serial=FAKE0001 model=Quest_Pro fw=replay module=fake\n")
+send(b"H QuestLHSync 1 serial=FAKE0001 model=" + MODEL + b" fw=replay module=fake\n")
 send(b"C %d online/fake\n" % len(cal) + cal)
 send(b"I fake qpc0 %.9f\n" % t_start)   # for nettest: where the log's time 0 sits on this PC's clock
 

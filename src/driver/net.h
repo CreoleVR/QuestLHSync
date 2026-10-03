@@ -7,6 +7,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,6 +27,7 @@ class HeadsetLink {
   void SetWanted(bool w) { wanted_ = w; }             // an eligible HMD is in SteamVR
   void SetHosts(const std::vector<std::string> &h);   // manual addresses (settings), tried first
   void SetPreferred(const std::string &serial);       // pick this headset when several answer
+  void SetFamily(const std::string &family);          // SteamVR's HMD (QuestFamily): skip other kinds of headset
   void SetMemory(const std::string &path);            // the last headset's address, kept there: tried over TCP
                                                       // when nothing answers discovery (networks that drop broadcasts)
   State state() const { return state_; }
@@ -47,7 +49,8 @@ class HeadsetLink {
   std::atomic<double> last_frame_{0}, connected_at_{0};
   mutable std::mutex m_;
   std::vector<std::string> hosts_;
-  std::string preferred_, serial_, model_, addr_, fw_, mem_path_, last_ip_, failed_ip_;
+  std::string preferred_, serial_, model_, addr_, fw_, mem_path_, last_ip_, failed_ip_, family_, skipped_;
+  std::set<std::string> wrong_ips_;  // addresses of headsets of another kind than SteamVR's (until that changes)
 
   void Loop();
   bool Discover(std::vector<Found> &out);
@@ -55,3 +58,7 @@ class HeadsetLink {
 };
 
 double QpcNow();  // seconds, QueryPerformanceCounter
+
+// "Quest Pro", "Quest 3" (the 3S too) or "Steam Frame" from a model name, device codename or serial, whatever spells
+// it ("Meta Quest Pro", "Oculus Quest 3", "CREOLECAST-QUEST3S", "eureka", "Deckard MP", ...); "" for anything else
+std::string QuestFamily(const std::string &text);

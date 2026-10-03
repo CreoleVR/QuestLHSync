@@ -1,5 +1,5 @@
 // QuestLHSync core: the lighthouse universe -> headset space alignment (4 DOF: yaw + translation, both spaces are
-// gravity-aligned) from base station laser flashes seen by the headset's tracking cameras (a Quest Pro's or a Steam
+// gravity-aligned) from base station laser flashes seen by the headset's tracking cameras (a Quest's or a Steam
 // Frame's). Shared by the SteamVR driver and the offline tools (qlhs_replay, qlhs_nettest).
 //   Optics    pixel -> ray in the HMD pose's frame (the headset's own calibration: Meta's Fisheye62, or the Frame's KB4)
 //   FrameGrid the cameras' exact frame grid: a detection's poll lag comes off its timestamp (Quest; the Frame's
@@ -29,8 +29,10 @@
 using LogFn = std::function<void(const std::string &)>;
 using X4 = std::array<double, 4>;  // yaw, tx, ty, tz
 
-constexpr double kIR = 1 / 1.00434;  // Quest side cameras: the near-IR laser images 0.434% further out than the
-                                     // visible-light calibration predicts (lateral colour); measured on 4 sessions
+constexpr double kIR = 1 / 1.00434;  // side cameras (OV7251): the near-IR laser images 0.434% further out than the
+                                     // visible-light calibration predicts (lateral colour); measured on 4 Quest Pro
+                                     // sessions, and assumed for the Quest 3's (the same sensor)
+constexpr int kMaxCam = 16;             // camera ids 0..15
 constexpr double kLagFallback = 0.005;  // s, typical poll lag while the frame grid isn't known yet
 constexpr double kExpoArrival = 0.020;  // s, grid -> exposure with the arrival-envelope clock (logs without round trips)
 constexpr double kExpoDefault = 0.018;  // s, grid -> pose time with the round-trip clock, before it's learned
@@ -50,15 +52,22 @@ constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much agai
 // itself moves, and plain to see on a controller held in front of a still head
 constexpr double kSlewStill = 0.005, kSlewTurn = 0.0005, kSlewWalk = 0.05;
 constexpr double kJumpApply = 0.25;     // m: bigger corrections apply at once
+// levelling (Sync::LevelStep) waits this long after an acquisition, and wants the worn or held devices this close
+constexpr double kLevelSettle = 5.0, kLevelBody = 1.0;  // s, m
+// channel check (Solver::CheckIdentity): every kIdEvery s; a pair is swapped when its sightings follow each other's
+// rotor periods better by kSwapGain, and switched if the swapped alignment keeps kSwapFit of the support
+constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kSwapFit = 0.7;
+
+double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 
 // ---------------------------------------------------------------- optics
 struct CamCal {
   bool valid = false;
   int w = 0, h = 0;
+  double ir = 1.0;  // near-IR laser image scale about the centre: kIR for the Quest side cameras
   M3 R;  // device <- camera
   V3 t;
   double f = 0, fy = 0, cx = 0, cy = 0, k[6] = {}, p[2] = {};
-  double ir = 1;  // near-IR laser image scale about the centre
   void Dist(double a, double b, double &u, double &v) const;
   bool Unproject(double px, double py, V3 &d) const;  // unit ray, camera frame
 };
@@ -69,11 +78,14 @@ class Optics {
  public:
   bool Load(const std::string &json, std::string *err);
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
-  bool ok() const { return cams_[0].valid || cams_[1].valid || cams_[2].valid || cams_[3].valid; }
+  bool Pose(int cam, M3 &R, V3 &t) const;                     // device <- camera
+  bool InImage(int cam, V3 dc, double margin) const;          // a camera-frame direction lands on the image
+  const std::string &device() const { return device_; }       // "Seacliff" (Quest Pro), "Eureka" (Quest 3), ...
   bool exact_time() const { return exact_time_; }  // frame times are the frames' own, no poll lag to take off
 
  private:
-  CamCal cams_[4];
+  CamCal cams_[kMaxCam];
+  std::string device_;
   bool exact_time_ = false;
   bool LoadFrame(const JVal &root, std::string *err);
 };
@@ -81,11 +93,17 @@ class Optics {
 // ---------------------------------------------------------------- timing helpers
 class FrameGrid {
  public:
-  static constexpr double P = 3 / 37.5, WIN = 10.0;
+  static constexpr double kQuestPro = 3 / 37.5;  // s: the Quest Pro's short frames, every third at 37.5 fps
+  static constexpr double WIN = 10.0, LEARN_WIN = 30.0;  // s: the grid's window, the period's
+  explicit FrameGrid(double period = kQuestPro) : fixed_(period) {}  // 0: learn the period (other headsets)
   bool Lag(int cam, double t, double &lag);  // t: a short frame's detection time (headset s), call for all
+  double period(int cam) const;              // s, 0 while unknown
 
  private:
-  std::map<int, std::deque<double>> h_;
+  struct Cam { std::deque<double> h, longer; double p = 0, next = 0; };
+  double fixed_;
+  std::map<int, Cam> c_;
+  static double Learn(const std::deque<double> &h, double prev);
 };
 
 class Clock {
@@ -193,9 +211,15 @@ class Solver {
   using BodyFn = std::function<double(const X4 &)>;
   void SetBody(BodyFn f) { body_ = std::move(f); }
   void Reset(const X4 &x);
-  void Add(double t, V3 o, V3 d);
-  void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D);  // rays >= from
+  // g: the frame's time on the headset's clock (NaN until the frame grid is known)
+  void Add(double t, V3 o, V3 d, double g, int cam);
+  void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
+               const std::vector<double> &G, const std::vector<int> &C);  // rays >= from
   void SetStation(const std::string &serial, V3 p, const M3 &R);
+  void SetChannel(const std::string &serial, int channel);
+  void SetFramePeriod(double p) { frame_p_ = p; }  // s between short frames
+  void AddFrame(double t, double g, int cam, V3 o, const M3 &R);  // every short frame; camera pose in Quest space
+  void SetInImage(std::function<bool(int cam, V3 d)> f) { in_image_ = std::move(f); }
   void PoseBreak(double t);
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
@@ -215,18 +239,30 @@ class Solver {
   static void Nearest(const std::vector<V3> &P, const std::vector<V3> &Zq, V3 o, V3 d, int &k, double &a);
 
  private:
-  struct Rays { std::vector<double> T; std::vector<V3> O, D; size_t size() const { return T.size(); } };
+  struct Rays {
+    std::vector<double> T, G;
+    std::vector<V3> O, D;
+    std::vector<int> C;
+    size_t size() const { return T.size(); }
+  };
   struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; M3 tilt; };
 
   mutable std::mutex m_;
-  std::vector<double> rt_;
+  std::vector<double> rt_, rg_;
   std::vector<V3> ro_, rd_;
+  std::vector<int> rc_;
   std::map<std::string, std::pair<V3, M3>> S_;
+  std::map<std::string, int> ch_;
   std::map<std::string, V3> fix_;
   std::set<std::string> stale_;
   bool has_x_ = false, has_anchor_ = false, has_acq_x_ = false;
   X4 x_{}, anchor_{}, acq_x_{};
-  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18;
+  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18, last_id_ = -1e18;
+  std::atomic<double> frame_p_{0};
+  struct CamFrame { double t, g; int cam; V3 o; M3 R; };
+  std::deque<CamFrame> frames_;
+  std::function<bool(int, V3)> in_image_;
+  std::string id_said_;
   LogFn log_;
   std::mt19937_64 rng_;
   StepStat stat_;
@@ -251,13 +287,14 @@ class Solver {
   int ThinnedScore(const X4 &x, double now);
   void CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, const Rays &t,
                    double now);
+  void CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
 };
 
 // ---------------------------------------------------------------- timing
 class Timing {
  public:
-  struct Rec { double tg; V3 od, dd; };  // grid time (PC s), device-frame origin and ray
-  void Record(double tg, V3 od, V3 dd);
+  struct Rec { double tg; V3 od, dd; double hg; int cam; };  // grid time (PC s), device-frame ray, headset grid time
+  void Record(double tg, V3 od, V3 dd, double hg, int cam);
   const std::deque<Rec> &recs() const { return rec_; }
   // grid search of the offset on fast-head sightings against the current alignment: true if it found one
   bool Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
@@ -272,6 +309,7 @@ struct SyncConfig {
   std::string dir;         // state files (stations.json, state.json)
   bool arrival_clock = false;  // old logs: no round trips, fixed EXPO
   bool learn_timing = true;
+  bool learn_grid = false;     // tools: learn the frame period even on a Quest Pro
 };
 
 struct Transform { bool active = false; Quat q; V3 t; };  // raw lighthouse -> Quest
@@ -289,6 +327,7 @@ class Sync {
   void OnHmdPose(double t, const Quat &q, V3 p);
   void OnBodyPose(int dev, double t, V3 raw);  // lighthouse controllers and trackers (raw lighthouse universe)
   void SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw);
+  void SetChannels(const std::map<std::string, int> &ch);
   void SetStreamer(const std::string &system);
   // 20 Hz; returns the transform for the lighthouse devices
   Transform Tick(double now);
@@ -302,12 +341,17 @@ class Sync {
   struct Status {
     bool has_x = false, locked = false, cond = false, timing_learned = false;
     X4 x{};
-    double med = -1, expo = 0, rtt = 0, cam_fps = 0, sight_rate = 0, lag_cm = 0, locked_for = -1;
+    double med = -1, expo = 0, rtt = 0, cam_fps = 0, spot_rate = 0, sight_rate = 0, lag_cm = 0, locked_for = -1;
+    bool head_still = false;
     int n = 0, nstations = 0;
     struct St { std::string serial; int support = 0; bool anchor = false, measured = false; double last_seen = -1, dist = 0; };
     std::vector<St> st;
   };
   Status GetStatus(double now);
+  // the cameras' bright spots so far, and what became of them
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0; };
+  Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
+  static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
     std::vector<V3> Z;
     solver_.Stations(keys, S, Z);
@@ -326,6 +370,8 @@ class Sync {
   bool have_optics_ = false;
   Clock clock_;
   FrameGrid grid_;
+  double grid_period_ = FrameGrid::kQuestPro;  // 0: learned (not a Quest Pro)
+  std::map<int, double> grid_logged_;           // learned periods as last logged, per camera
   PoseHist poses_;
   StationsFile sfile_;
   Frame frame_;
@@ -338,6 +384,7 @@ class Sync {
 
   std::mutex raw_m_;
   std::map<std::string, std::pair<V3, M3>> raw_;
+  std::map<std::string, int> channels_;
   std::map<std::string, V3> quest_;  // saved station positions in Quest space
   bool seeded_ = false, have_applied_ = false, paused_ = false;
   X4 applied_{};
@@ -346,9 +393,14 @@ class Sync {
   double last_prec_ = -1e18;
   StepStat last_st_;
   bool has_last_st_ = false;
-  std::atomic<long> nframes_{0}, nsight_{0};
-  double rate_t_ = 0, cam_fps_ = 0, sight_rate_ = 0;
-  long rate_f_ = 0, rate_s_ = 0;
+  std::atomic<long> nframes_{0};
+  Spots spots_;  // under net_
+  double rate_t_ = 0, cam_fps_ = 0, spot_rate_ = 0, sight_rate_ = 0;
+  long rate_f_ = 0;
+  Spots rate_sp_;
+  double sum_t_ = -1;  // not acquired: since then (< 0: acquired), and the spots then
+  Spots sum_sp_;
+  int sum_n_ = 0;
   std::mutex rec_m_;
   FILE *rec_ = nullptr;
   std::atomic<bool> recording_{false};
@@ -365,7 +417,7 @@ class Sync {
 
   void LoadState();
   void Retime(double old_e, double new_e);
-  void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw);
+  void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   void SaveState(const X4 &x, const std::map<std::string, V3> &cs);
   bool Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss);
 };

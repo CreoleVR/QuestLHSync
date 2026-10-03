@@ -1,7 +1,10 @@
 // qlhs_replay: run a QuestLHSync recording through the driver's Sync, as if live.
 //   qlhs_replay <log> --calib <camera calibration json> --dir <state dir> [--out file] [--learn] [--expo s]
+//               [--learn-grid]
 // Logs without clock round trips use the arrival envelope clock and EXPO 0.020.
 // --learn: round-trip-less logs still learn the timing (starting from --expo), to test the estimator.
+// --learn-grid: learn the cameras' frame period as for headsets other than the Quest Pro, to test that.
+// --channel SERIAL=N: a base station's channel, for older logs.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -14,16 +17,22 @@
 
 int main(int argc, char **argv) {
   std::string log, calib, dir, outp;
-  bool learn = false;
+  bool learn = false, learn_grid = false;
   double expo = -1;
+  std::map<std::string, int> chans;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "--calib" && i + 1 < argc) calib = argv[++i];
+    if (a == "--channel" && i + 1 < argc) {
+      std::string v = argv[++i];
+      size_t eq = v.find('=');
+      if (eq != std::string::npos) chans[v.substr(0, eq)] = atoi(v.c_str() + eq + 1);
+    } else if (a == "--calib" && i + 1 < argc) calib = argv[++i];
     else if (a == "--dir" && i + 1 < argc) dir = argv[++i];
     else if (a == "--out" && i + 1 < argc) outp = argv[++i];
     else if (a == "--rays" && i + 1 < argc) g_ray_dump = fopen(argv[++i], "w");  // every sighting + the stations
     else if (a == "--expo" && i + 1 < argc) expo = atof(argv[++i]);
     else if (a == "--learn") learn = true;
+    else if (a == "--learn-grid") learn_grid = true;
     else log = a;
   }
   if (log.empty() || calib.empty()) { fprintf(stderr, "usage: qlhs_replay <log> --calib file --dir statedir [--out f] [--learn] [--expo s]\n"); return 2; }
@@ -36,9 +45,11 @@ int main(int argc, char **argv) {
   cfg.dir = dir;
   cfg.arrival_clock = true;
   cfg.learn_timing = learn;
+  cfg.learn_grid = learn_grid;
   Sync sync(cfg, logfn);
   if (expo >= 0) sync.ForceExpo(expo);
   sync.SetStreamer("replay");
+  sync.SetChannels(chans);
   std::string err;
   if (!sync.SetCalibration(ss.str(), &err)) { fprintf(stderr, "calibration: %s\n", err.c_str()); return 1; }
   FILE *out = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
@@ -73,9 +84,15 @@ int main(int argc, char **argv) {
     } else if (kind == 'S') {
       char serial[64];
       double v[7];
-      if (sscanf(rest, "%63s %lf %lf %lf %lf %lf %lf %lf", serial, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) == 8) {
+      int ch = 0;
+      int got = sscanf(rest, "%63s %lf %lf %lf %lf %lf %lf %lf %d", serial, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &ch);
+      if (got >= 8) {
         raw[serial] = {V3{v[0], v[1], v[2]}, ToM3(Quat{v[3], v[4], v[5], v[6]})};
         sync.SetStationsRaw(raw);
+        if (got == 9 && ch > 0 && !chans.count(serial)) {  // recorded channels; --channel wins
+          chans[serial] = ch;
+          sync.SetChannels(chans);
+        }
       }
     } else if (kind == 'F') {
       sync.OnLine(pc, sp + 1);
@@ -113,6 +130,7 @@ int main(int argc, char **argv) {
   double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall).count();
   printf("replayed %ld lines (%.0f s of log) in %.1f s; expo %.1f ms%s\n", nl, tnow - t0, secs, st.expo * 1000,
          st.timing_learned ? " (learned)" : "");
+  printf("%s\n", Sync::Describe({}, sync.spots()).c_str());
   if (out) fclose(out);
   if (g_ray_dump) {
     std::vector<std::string> keys;

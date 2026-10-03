@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -44,14 +45,46 @@ void HeadsetLink::SetPreferred(const std::string &serial) {
   preferred_ = serial;
 }
 
+void HeadsetLink::SetFamily(const std::string &family) {
+  std::lock_guard<std::mutex> g(m_);
+  if (family != family_) wrong_ips_.clear();
+  family_ = family;
+}
+
+std::string QuestFamily(const std::string &text) {
+  std::string s;
+  for (char c : text)
+    if (isalnum((unsigned char)c)) s += (char)tolower((unsigned char)c);
+  auto has = [&](const char *k) { return s.find(k) != std::string::npos; };
+  if (has("questpro") || has("seacliff")) return "Quest Pro";
+  if (has("quest3") || has("eureka") || has("panther")) return "Quest 3";
+  if (has("steamframe") || has("deckard")) return "Steam Frame";
+  return "";
+}
+
+// a headset of this model can be SteamVR's HMD (family "" or an unnamed model: can't tell, so yes)
+static bool Fits(const std::string &family, const std::string &model) {
+  std::string f = QuestFamily(model);
+  return family.empty() || f.empty() || f == family;
+}
+
+static void WriteMemory(const std::string &path, const std::string &ip) {
+  if (FILE *f = fopen(path.c_str(), "w")) {
+    fprintf(f, "%s\n", ip.c_str());
+    fclose(f);
+  }
+}
+
 void HeadsetLink::SetMemory(const std::string &path) {
   std::lock_guard<std::mutex> g(m_);
   mem_path_ = path;
   last_ip_.clear();
   if (FILE *f = fopen(path.c_str(), "r")) {
-    char ip[64];
-    if (fscanf(f, "%63s", ip) == 1) last_ip_ = ip;
+    char ip[64], more[8];
+    int n = fscanf(f, "%63s %7s", ip, more);
     fclose(f);
+    if (n >= 1) last_ip_ = ip;
+    if (n == 2) WriteMemory(path, last_ip_);  // up to 1.3 the headset's serial was kept there too
   }
 }
 
@@ -68,17 +101,24 @@ void HeadsetLink::Loop() {
     state_ = kSearching;
     std::vector<Found> found;
     Discover(found);
-    std::string pref;
+    std::string pref, fam;
     {
       std::lock_guard<std::mutex> g(m_);
       pref = preferred_;
+      fam = family_;
     }
     const Found *pick = nullptr;
     for (auto &f : found)
-      if (!pref.empty() && f.serial == pref) pick = &f;
-    if (!pick && !found.empty()) pick = &found[0];
+      if (!pref.empty() && f.serial == pref && Fits(fam, f.model)) pick = &f;
+    for (auto &f : found)
+      if (!pick && Fits(fam, f.model)) pick = &f;
+    if (!pick && !found.empty() && skipped_ != found[0].serial) {  // once per headset, not every round
+      skipped_ = found[0].serial;
+      log_(found[0].model + " at " + found[0].ip + " answers, but SteamVR's headset is a " + fam + ": not used");
+    }
     if (!pick) {
-      if (quiet++ % 30 == 0) log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
+      if (found.empty() && quiet++ % 30 == 0)
+        log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
       // straight over TCP: manual hosts (a firewall eating UDP), then the last headset (a network dropping broadcasts)
       std::vector<std::string> direct;
       {
@@ -86,6 +126,8 @@ void HeadsetLink::Loop() {
         direct = hosts_;
         if (!last_ip_.empty() && std::find(direct.begin(), direct.end(), last_ip_) == direct.end())
           direct.push_back(last_ip_);
+        direct.erase(std::remove_if(direct.begin(), direct.end(), [&](const std::string &h) { return wrong_ips_.count(h) > 0; }),
+                     direct.end());
       }
       bool talked = false;
       for (auto &h : direct)
@@ -250,7 +292,7 @@ bool HeadsetLink::Session(const Found &f) {
   connected_at_ = start;
   state_ = kConnected;
   log_((f.model.empty() ? std::string("headset") : f.model) + " at " + f.ip + ": connected");
-  bool ok = true;
+  bool ok = true, wrong = false;
   char buf[65536];
   while (run_ && wanted_ && ok) {
     double now = QpcNow();
@@ -322,20 +364,31 @@ bool HeadsetLink::Session(const Found &f) {
             for (auto &c : v) if (c == '_') c = ' ';
             return v;
           };
+          std::string fam;
+          bool fits;
           {
             std::lock_guard<std::mutex> g(m_);
             serial_ = field("serial");
             if (!field("model").empty()) model_ = field("model");
             fw_ = field("fw");
-            if (!mem_path_.empty() && last_ip_ != f.ip && h.rfind("H QuestLHSync ", 0) == 0) {
+            fam = family_;
+            fits = Fits(fam, model_);
+            if (fits && !mem_path_.empty() && last_ip_ != f.ip && h.rfind("H QuestLHSync ", 0) == 0) {
               last_ip_ = f.ip;
-              if (FILE *mf = fopen(mem_path_.c_str(), "w")) {
-                fprintf(mf, "%s %s\n", f.ip.c_str(), serial_.c_str());
-                fclose(mf);
-              }
+              WriteMemory(mem_path_, f.ip);
             }
           }
           log_(model() + ": firmware " + fw() + ", module " + field("module"));
+          if (!fits) {  // reached straight over TCP (no discovery): the address of another headset
+            if (skipped_ != serial()) log_(model() + " at " + f.ip + " isn't SteamVR's headset (a " + fam + "): not used");
+            skipped_ = serial();
+            {
+              std::lock_guard<std::mutex> g(m_);
+              wrong_ips_.insert(f.ip);
+            }
+            wrong = true;
+            ok = false;
+          }
           break;
         }
         case 'C': {
@@ -362,5 +415,5 @@ bool HeadsetLink::Session(const Found &f) {
   }
   closesocket(s);
   state_ = kSearching;
-  return true;
+  return !wrong;
 }

@@ -1,12 +1,21 @@
 'use strict';
-// lhsight: stream bright spots from the two side tracking cameras (see lhsight.c). Runs inside the
+// lhsight: stream bright spots from the side tracking cameras (see lhsight.c). Runs inside the
 // sensors HAL; reads only. Lines go to stdout via console.log:  F ... (frames)  T ... (heartbeat)
 // QuestLHSync: lhsyncd runs this with frida-inject while a PC listens, and stops it after (MAX_MS 0: no limit)
 var MAX_MS = parseInt("@DUR@");
-var RING_CAM = [3, 2, 1, 0];   // rings sorted by address -> calibration camera id
-// Only the side cameras (2, 3; 640x480) are read: the front pair (0, 1; 1280x1024) never caught a base station, only
-// other lights, and cost three quarters of the scan time.
-var SIDE = function (cam) { return cam === 2 || cam === 3; };
+// The headset's global-shutter cameras from its calibration file, "id:width:height:scan,..." (lhsyncd fills it in).
+// scan 1: read this one. lhsyncd picks the side cameras (OV7251, 640x480): on the Quest Pro the front pair (OG01A,
+// 1280x1024) never caught a base station, only other lights, and cost three quarters of the scan time. The Quest 3
+// has the same four sensors. Left unfilled (a hand run): the Quest Pro's.
+var CAMS_SPEC = "@CAMS@";
+var CAMS = (CAMS_SPEC.charAt(0) === "@" ? "0:1280:1024:0,1:1280:1024:0,2:640:480:1,3:640:480:1" : CAMS_SPEC)
+  .split(",").filter(function (e) { return e.length; }).map(function (e) {
+    var f = e.split(":").map(function (v) { return parseInt(v, 10); });
+    return { id: f[0], w: f[1], h: f[2], scan: f[3] === 1 };
+  }).filter(function (c) { return c.id >= 0 && c.id < 16 && c.w > 0 && c.h > 0; });
+var SCAN = CAMS.filter(function (c) { return c.scan; });
+var MAXW = Math.max.apply(null, SCAN.map(function (c) { return c.w; }).concat([16]));
+var MAXH = Math.max.apply(null, SCAN.map(function (c) { return c.h; }).concat([16]));
 var l = Process.getModuleByName("libc.so"), g = function (n) { return l.getExportByName(n); };
 var fopen = new NativeFunction(g("fopen"), "pointer", ["pointer", "pointer"]);
 var fgets = new NativeFunction(g("fgets"), "pointer", ["pointer", "int", "pointer"]);
@@ -23,39 +32,56 @@ var prime = F("prime", "void", []), poll = F("poll", "int", []), reset_slots = F
 var drain = F("drain", "int", ["pointer", "int"]);
 var n_drop = F("n_drop", "uint", []), scan_ns = F("scan_ns", "uint64", []), n_scan = F("n_scan", "uint", []);
 var n_poll = F("n_poll", "uint", []), idle_us = F("idle_us", "int", []);
-var scratchBuf = Memory.alloc(640 * 480), cellBuf = Memory.alloc(40 * 30 * 2), labBuf = Memory.alloc(40 * 30 * 4);
+var scratchBuf = Memory.alloc(MAXW * MAXH), cellBuf = Memory.alloc((MAXW >> 4) * (MAXH >> 4) * 2);
+var labBuf = Memory.alloc((MAXW >> 4) * (MAXH >> 4) * 4);
 var outBuf = Memory.alloc(1 << 20), drainBuf = Memory.alloc(1 << 16), tsBuf = Memory.alloc(16);
 set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 250);
+var PAGE = 4096;
+function bufSize(c) { return Math.ceil(c.w * c.h / PAGE) * PAGE; }  // one 8-bit frame, whole pages
 function discover() {
   reset_slots();
-  var fp = fopen(Memory.allocUtf8String("/proc/self/maps"), Memory.allocUtf8String("r")), buf = Memory.alloc(512), regs = [];
+  var fp = fopen(Memory.allocUtf8String("/proc/self/maps"), Memory.allocUtf8String("r")), buf = Memory.alloc(512), all = [];
   while (!fgets(buf, 512, fp).isNull()) {
     var m = /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*\/dmabuf(?::dmabuf(\d+))?/.exec(buf.readCString());
     if (!m) continue;
-    var a = parseInt(m[1], 16), b = parseInt(m[2], 16), id = m[3] === undefined ? -1 : parseInt(m[3], 10);
-    if (b - a === 0x140000) regs.push([a, 1280, 1024, id]);
-    else if (b - a === 0x4b000) regs.push([a, 640, 480, id]);
+    var a = parseInt(m[1], 16), b = parseInt(m[2], 16);
+    all.push({ a: a, size: b - a, id: m[3] === undefined ? -1 : parseInt(m[3], 10) });
   }
   fclose(fp);
-  if (regs.length !== 40) console.log("W unexpected slot count " + regs.length);
-  // The HAL allocates each camera's ring of 10 in turn, camera 0 first: the dmabuf names count up in that order.
-  // Their addresses usually run the other way, but not always (one boot had two of camera 2's buffers mapped above
-  // the front cameras'), so addresses are only the fallback.
-  var cams = null;
-  if (regs.length === 40 && regs.every(function (r) { return r[3] >= 0; })) {
-    regs.sort(function (x, y) { return x[3] - y[3]; });
-    cams = regs.map(function (r, k) { return Math.floor(k / 10); });
-    if (!regs.every(function (r, k) { return r[1] === (cams[k] < 2 ? 1280 : 640); })) cams = null;
-  }
-  if (!cams) {
-    console.log("W camera buffers not in allocation order: mapping them by address");
-    regs.sort(function (x, y) { return x[0] - y[0]; });
-    cams = regs.map(function (r, k) { return RING_CAM[Math.floor(k / 10)]; });
-  }
-  var n = 0;
-  regs.forEach(function (r, k) {
-    if (SIDE(cams[k]) && r[1] === 640) { add_slot(ptr(r[0]), r[1], r[2], cams[k]); n++; }
+  // Each camera has a ring of frame buffers. The HAL allocates the rings in turn, lowest camera id first: the dmabuf
+  // names count up in that order. Their addresses usually run the other way, but not always (one Quest Pro boot had
+  // two of camera 2's buffers mapped above the front cameras'), so addresses are only the fallback. Cameras of the
+  // same size share the buffers of that size equally (the Quest Pro: 10 each).
+  var sizes = {}, n = 0, got = [];
+  CAMS.forEach(function (c) { (sizes[bufSize(c)] = sizes[bufSize(c)] || []).push(c); });
+  Object.keys(sizes).forEach(function (sz) {
+    var cams = sizes[sz].sort(function (x, y) { return x.id - y.id; });
+    var regs = all.filter(function (r) { return r.size === +sz; });
+    var ids = cams.map(function (c) { return c.id; }).join("+");
+    if (!regs.length || regs.length % cams.length) {
+      console.log("W cameras " + ids + " (" + cams[0].w + "x" + cams[0].h + "): " + regs.length + " buffers, not " +
+                  cams.length + " equal rings");
+      return;
+    }
+    var per = regs.length / cams.length, byName = regs.every(function (r) { return r.id >= 0; });
+    if (byName) regs.sort(function (x, y) { return x.id - y.id; });
+    else {
+      console.log("W cameras " + ids + ": buffers not named in allocation order, mapping them by address");
+      regs.sort(function (x, y) { return y.a - x.a; });
+    }
+    regs.forEach(function (r, k) {
+      var c = cams[Math.floor(k / per)];
+      if (c.scan) { add_slot(ptr(r.a), c.w, c.h, c.id); n++; }
+    });
+    cams.forEach(function (c) { if (c.scan) got.push(c.id + ":" + per); });
   });
+  if (!n) {  // what the HAL has instead: what a new headset or OS build needs looked at
+    var hist = {};
+    all.forEach(function (r) { hist[r.size] = (hist[r.size] || 0) + 1; });
+    console.log("W no camera buffers found; dmabuf sizes here: " + (Object.keys(hist).map(function (s) {
+      return "0x" + (+s).toString(16) + "x" + hist[s];
+    }).join(" ") || "none"));
+  } else console.log("I cameras " + got.join(" "));
   prime();
   return n;
 }

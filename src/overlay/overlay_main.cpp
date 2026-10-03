@@ -1,7 +1,7 @@
 // QuestLHSync.exe: the SteamVR dashboard page. Started by the driver each session, exits with SteamVR.
 // Reads the driver's status from the shared memory (qlhs_status.h), draws it with GDI at 2x and downsamples
 // (anti-aliased shapes and text), and sends the buttons back as commands.
-//   QuestLHSync.exe --preview out.png [locked|acquiring|searching|nohmd]   renders a sample page, no VR
+//   QuestLHSync.exe --preview out.png [locked|acquiring|still|searching|nohmd]   renders a sample page, no VR
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -142,8 +142,8 @@ static void StateText(const QlhsStatus &s, bool stale, std::wstring &title, std:
   if (stale) { title = L"Driver not running"; sub = L"The QuestLHSync driver isn't updating. Restart SteamVR."; color = col::red; return; }
   switch (s.state) {
     case QLHS_NO_HMD:
-      title = L"Waiting for a Quest Pro or Steam Frame";
-      sub = s.hmd[0] ? L"SteamVR's headset isn't a Quest Pro or Steam Frame, so the lighthouse space is left alone."
+      title = L"Waiting for a Quest or Steam Frame";
+      sub = s.hmd[0] ? L"SteamVR's headset isn't a Quest Pro, 3, 3S or Steam Frame, so the lighthouse space is left alone."
                      : L"Start your streaming app (Steam Link, Link, Air Link, Virtual Desktop, ALVR, ...).";
       color = col::grey;
       break;
@@ -165,7 +165,8 @@ static void StateText(const QlhsStatus &s, bool stale, std::wstring &title, std:
       break;
     case QLHS_ACQUIRING:
       title = L"Finding the base stations";
-      sub = L"Look around the room so the cameras catch both base stations' flashes.";
+      sub = s.head_still ? L"The headset isn't moving, so its camera frames wait. Put it on and look around the room."
+                         : L"Look around the room so the cameras catch both base stations' flashes.";
       color = col::amber;
       break;
     case QLHS_LOCKED:
@@ -230,8 +231,11 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
   row(x1, top + 236, L"Pose timing",
       s.headset_addr[0] ? F(L"%.1f ms %s", s.expo_ms, s.expo_learned ? L"(learned)" : L"(learning)") : L"—",
       s.expo_learned || !s.headset_addr[0] ? col::text : col::amber);
+  row(x1, top + 270, L"Bright spots", s.cam_fps > 0.5 ? F(L"%.0f/s, %.0f/s used", s.spot_rate, s.sight_rate) : L"—",
+      s.state == QLHS_ACQUIRING && s.sight_rate < 0.5 ? col::amber : col::text);
 
   // base stations card
+  bool has = s.locked || s.nfit > 0 || s.yaw_deg != 0;  // an alignment: sightings belong to a station
   p.Text(x2 + 22, top + 18, L"BASE STATIONS", label, col::faint);
   if (s.nst == 0) {
     p.Text(x2 + 22, top + 52, L"None in SteamVR yet", body, col::dim);
@@ -246,14 +250,14 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
     p.Text(x2 + 46, y, Wide(st.serial), body, col::text, 0, cw - 150);
     std::wstring role = st.anchor ? L"anchor" : st.measured ? L"measured" : L"";
     if (!role.empty()) p.Text(x2 + cw - 22, y + 3, role, small, col::blue, 2);
-    std::wstring info = L"seen " + Ago(st.last_seen) + F(L"  ·  %d sightings", st.support);
+    std::wstring info = L"seen " + Ago(st.last_seen);
+    if (has) info += F(L"  ·  %d sightings", st.support);
     if (st.dist > 0) info += F(L"  ·  %.1f m", st.dist);
     p.Text(x2 + 46, y + 28, info, small, col::dim, 0, cw - 68);
   }
 
   // alignment card
   p.Text(x3 + 22, top + 18, L"ALIGNMENT", label, col::faint);
-  bool has = s.locked || s.nfit > 0 || s.yaw_deg != 0;
   p.Text(x3 + 22, top + 44, has ? F(L"%.2f°", s.med_deg >= 0 ? s.med_deg : 0.0) : L"—", big,
          s.med_deg >= 0 && s.med_deg < 0.3 ? col::green : col::text);
   if (has) p.Text(x3 + 22 + 110, top + 56, L"median sighting error", small, col::dim);
@@ -398,10 +402,12 @@ static QlhsStatus Sample(const char *kind) {
   s.magic = QLHS_MAGIC;
   s.version = QLHS_VERSION;
   strcpy(s.hmd, "Quest Pro (CreoleCast)");
-  strcpy(s.hmd_system, "creolecast");
+  strcpy(s.hmd_system, "CreoleCast");
   strcpy(s.headset, "Quest Pro");
   strcpy(s.headset_addr, "192.168.1.50:47280");
   s.cam_fps = 75;
+  s.spot_rate = 41;
+  s.sight_rate = 38;
   s.rtt_ms = 4.2;
   s.expo_ms = 15.3;
   s.expo_learned = 1;
@@ -420,6 +426,7 @@ static QlhsStatus Sample(const char *kind) {
                         "04:53:41  timing for creolecast: 15.3 ms (best fit 15.3 ms on 212 fast-head sightings)",
                         "04:55:02  lighthouse frame: SteamVR's is 0.75 deg from the reference"};
   for (auto l : logs) { strcpy(s.log[s.nlog % 8], l); s.nlog++; }
+  if (!strcmp(kind, "still")) { s.head_still = 1; s.sight_rate = 0; s.spot_rate = 12; kind = "acquiring"; }
   if (!strcmp(kind, "acquiring")) { s.state = QLHS_ACQUIRING; s.locked = 0; s.med_deg = -1; s.nfit = 0; s.yaw_deg = 0; s.locked_for = -1; s.st[1].last_seen = -1; s.st[1].support = 0; s.expo_learned = 0; s.expo_ms = 15; }
   if (!strcmp(kind, "searching")) { s.state = QLHS_SEARCHING; s.headset_addr[0] = 0; s.cam_fps = 0; s.rtt_ms = 0; s.locked = 0; s.nfit = 0; s.med_deg = -1; s.yaw_deg = 0; s.locked_for = -1; }
   if (!strcmp(kind, "nohmd")) { s.state = QLHS_NO_HMD; strcpy(s.hmd, "PlayStation VR2"); }

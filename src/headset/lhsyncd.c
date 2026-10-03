@@ -152,7 +152,7 @@ static int failures;
 static void start_capture(void) {
   int p[2];
   if (pipe(p)) return;
-  char msg[256] = "";
+  char msg[480] = "";
   pid_t pid = hs_capture_start(p[1], msg, sizeof msg);
   close(p[1]);
   if (pid <= 0) {

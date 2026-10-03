@@ -1,6 +1,7 @@
 #include "sync.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
@@ -106,13 +107,17 @@ bool Optics::Load(const std::string &json, std::string *err) {
   if (kind && kind->t == JVal::Str && kind->s == "steam_frame") return LoadFrame(root, err);
   const JVal *cams = root.get("CameraCalibration");
   if (!cams || cams->t != JVal::Arr) { if (err) *err = "no CameraCalibration"; return false; }
-  CamCal out[4];
+  CamCal out[kMaxCam];
+  int n = 0;
   for (auto &c : cams->a) {
     const JVal *id = c.get("Id"), *size = c.get("ImageSize"), *dfc = c.get("DeviceFromCamera");
-    const JVal *proj = c.get("Projection"), *dist = c.get("Distortion");
+    const JVal *proj = c.get("Projection"), *dist = c.get("Distortion"), *shutter = c.get("Shutter");
+    const JVal *sensor = c.get("SensorType");
     if (!id || !size || !dfc || !proj || !dist) continue;
     int i = id->t == JVal::Str ? atoi(id->s.c_str()) : (int)id->num(-1);  // "Id": "2" in Meta's files
-    if (i < 0 || i > 3) continue;
+    if (i < 0 || i >= kMaxCam) continue;
+    const JVal *type = shutter ? shutter->get("Type") : nullptr;
+    if (type && type->t == JVal::Str && type->s == "Rolling") continue;  // the colour cameras: not tracking ones
     auto sz = size->nums(), T = dfc->nums();
     auto pc = proj->get("Coefficients") ? proj->get("Coefficients")->nums() : std::vector<double>();
     auto dc = dist->get("Coefficients") ? dist->get("Coefficients")->nums() : std::vector<double>();
@@ -125,11 +130,14 @@ bool Optics::Load(const std::string &json, std::string *err) {
     k.f = k.fy = pc[0]; k.cx = pc[1]; k.cy = pc[2];
     for (int j = 0; j < 6; j++) k.k[j] = dc[j];
     k.p[0] = dc[6]; k.p[1] = dc[7];
-    k.ir = (i == 2 || i == 3) ? kIR : 1.0;
+    k.ir = sensor && sensor->t == JVal::Str && sensor->s == "OV7251" ? kIR : 1.0;
     k.valid = true;
+    n++;
   }
-  if (!out[2].valid && !out[3].valid) { if (err) *err = "no side camera calibration (ids 2, 3)"; return false; }
-  for (int i = 0; i < 4; i++) cams_[i] = out[i];
+  if (!n) { if (err) *err = "no tracking camera calibration"; return false; }
+  for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
+  const JVal *dev = root.get("Device"), *type = dev ? dev->get("DeviceType") : nullptr;
+  device_ = type && type->t == JVal::Str ? type->s : "";
   exact_time_ = false;
   return true;
 }
@@ -164,8 +172,9 @@ bool Optics::LoadFrame(const JVal &root, std::string *err) {
   }
   M3 Rhc = T(Rch) * Rcc;  // head <- camera 0
   V3 thc = T(Rch) * (tcc - tch);
-  CamCal out[4];
-  for (size_t i = 0; i < cams->a.size() && i < 4; i++) {
+  CamCal out[kMaxCam];
+  int n = 0;
+  for (size_t i = 0; i < cams->a.size() && i < (size_t)kMaxCam; i++) {
     const JVal &c = cams->a[i];
     const JVal *ex = c.get("extrinsics"), *in = c.get("intrinsics");
     const JVal *units = ex ? ex->get("__units") : nullptr;
@@ -187,18 +196,21 @@ bool Optics::LoadFrame(const JVal &root, std::string *err) {
     k.R = Rhc * Rk;
     k.t = Rhc * tk + thc;
     k.valid = true;
+    n++;
   }
-  if (!out[0].valid && !out[1].valid && !out[2].valid && !out[3].valid) {
+  if (!n) {
     if (err) *err = "no usable camera in xrservice.json (KB4 intrinsics, extrinsics)";
     return false;
   }
-  for (int i = 0; i < 4; i++) cams_[i] = out[i];
+  for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
+  const JVal *model = dc->get("model_number");
+  device_ = model && model->t == JVal::Str ? model->s : "Steam Frame";
   exact_time_ = true;
   return true;
 }
 
 bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
-  if (cam < 0 || cam > 3 || !cams_[cam].valid) return false;
+  if (cam < 0 || cam >= kMaxCam || !cams_[cam].valid) return false;
   const CamCal &c = cams_[cam];
   double k = c.ir;
   V3 dc;
@@ -211,17 +223,30 @@ bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
   return true;
 }
 
+bool Optics::Pose(int cam, M3 &R, V3 &t) const {
+  if (cam < 0 || cam >= kMaxCam || !cams_[cam].valid) return false;
+  R = cams_[cam].R;
+  t = cams_[cam].t;
+  return true;
+}
+
+bool Optics::InImage(int cam, V3 dc, double margin) const {
+  if (cam < 0 || cam >= kMaxCam || !cams_[cam].valid || !(dc.z > 0.05)) return false;
+  const CamCal &c = cams_[cam];
+  double u, v;
+  c.Dist(dc.x / dc.z, dc.y / dc.z, u, v);
+  double x = c.cx + c.f * u / c.ir, y = c.cy + c.fy * v / c.ir;
+  return x >= margin && y >= margin && x <= c.w - margin && y <= c.h - margin;
+}
+
 // ================================================================ frame grid, clock
 static double PyMod(double a, double m) {
   double r = std::fmod(a, m);
   return r < 0 ? r + m : r;
 }
 
-bool FrameGrid::Lag(int cam, double t, double &lag) {
-  auto &h = h_[cam];
-  h.push_back(t);
-  while (!h.empty() && h.front() < t - WIN) h.pop_front();
-  if (h.size() < 40) return false;
+// the widest empty stretch of the detection times folded at P: the poll lags fill the rest, so it ends at the grid
+static double FoldGap(const std::deque<double> &h, double P, double *grid) {
   std::vector<double> ph;
   ph.reserve(h.size());
   for (double v : h) ph.push_back(PyMod(v, P));
@@ -232,8 +257,79 @@ bool FrameGrid::Lag(int cam, double t, double &lag) {
     double g = (i + 1 < n ? ph[i + 1] : ph[0] + P) - ph[i];
     if (g > bg) { bg = g; best = i; }
   }
-  double l = PyMod(t - ph[(best + 1) % n], P);
-  lag = l > P - 0.01 ? l - P : l;
+  if (grid) *grid = ph[(best + 1) % n];
+  return bg;
+}
+
+// how tightly the detection times fold at P: the narrowest phase band holding 90% of them (stragglers, a log flush
+// tens of ms late, don't count)
+static double FoldSpread(const std::deque<double> &h, double P) {
+  std::vector<double> ph;
+  ph.reserve(h.size() * 2);
+  for (double v : h) ph.push_back(PyMod(v, P));
+  std::sort(ph.begin(), ph.end());
+  size_t n = ph.size(), m = (n * 9 + 9) / 10;
+  for (size_t i = 0; i < n; i++) ph.push_back(ph[i] + P);
+  double w = P;
+  for (size_t i = 0; i < n; i++) w = std::min(w, ph[i + m - 1] - ph[i]);
+  return w;
+}
+
+// the short frames' period from their detection times (each a few ms after its frame): near the median gap (or the
+// period found before), the one they fold at most tightly. 0 if none folds cleanly (frame times too irregular to use)
+double FrameGrid::Learn(const std::deque<double> &h, double prev) {
+  std::vector<double> d;
+  for (size_t i = 1; i < h.size(); i++)
+    if (h[i] - h[i - 1] > 0.005 && h[i] - h[i - 1] < 0.5) d.push_back(h[i] - h[i - 1]);
+  if (d.size() < 20) return 0;
+  double p0 = Median(d), span = h.back() - h.front();
+  if (span < 20 * p0) return 0;
+  // a step of the period moves the window's far end span/P times as much: steps of 2 ms there, then of 0.05 ms
+  double best = p0, bw = kInf, coarse = 0.002 * p0 / span, fine = 0.00005 * p0 / span;
+  auto check = [&](double p) {
+    double w = FoldSpread(h, p);
+    if (w < bw) { bw = w; best = p; }
+  };
+  double lo = prev > 0 ? 0.995 * prev : 0.9 * p0, hi = prev > 0 ? 1.005 * prev : 1.1 * p0;
+  for (double p = lo; p <= hi; p += coarse) check(p);
+  double c = best;
+  for (double p = c - coarse; p <= c + coarse; p += fine) check(p);
+  return bw <= 0.5 * best ? best : 0;
+}
+
+double FrameGrid::period(int cam) const {
+  if (fixed_ > 0) return fixed_;
+  auto it = c_.find(cam);
+  return it == c_.end() ? 0 : it->second.p;
+}
+
+bool FrameGrid::Lag(int cam, double t, double &lag) {
+  auto &c = c_[cam];
+  auto &h = c.h;
+  h.push_back(t);
+  while (!h.empty() && h.front() < t - WIN) h.pop_front();
+  auto &lh = c.longer;
+  if (!fixed_) {
+    lh.push_back(t);
+    while (!lh.empty() && lh.front() < t - LEARN_WIN) lh.pop_front();
+  }
+  if (h.size() < 40) return false;
+  // learned: from the frames so far once the grid's window is full, then refined every WIN over up to LEARN_WIN (a
+  // longer stretch pins the period closer). A camera's rate doesn't change, so a stretch too messy to fold (frames
+  // misread as short ones) keeps the period found before
+  if (!fixed_) {
+    if (t >= c.next && h.back() - h.front() >= 0.9 * WIN) {
+      double p = Learn(lh, c.p);
+      if (p > 0) c.p = p;
+      c.next = t + WIN;
+    }
+  }
+  double P = fixed_ ? fixed_ : c.p;
+  if (P <= 0) return false;
+  double grid;
+  FoldGap(h, P, &grid);
+  double l = PyMod(t - grid, P);
+  lag = l > P - std::min(0.01, P / 8) ? l - P : l;
   return true;
 }
 
@@ -434,20 +530,35 @@ void Solver::Reset(const X4 &x) {
   x_ = x; has_x_ = true;
   resets_++;
   anchor_ = x; has_anchor_ = true;
+  id_said_.clear();
 }
 
-void Solver::Add(double t, V3 o, V3 d) {
+void Solver::Add(double t, V3 o, V3 d, double gt, int cam) {
   std::lock_guard<std::mutex> g(m_);
-  rt_.push_back(t); ro_.push_back(o); rd_.push_back(d);
+  rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam);
 }
 
-void Solver::Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D) {
+void Solver::Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
+                     const std::vector<double> &G, const std::vector<int> &C) {
   std::lock_guard<std::mutex> g(m_);
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), from) - rt_.begin();
-  rt_.resize(j); ro_.resize(j); rd_.resize(j);
+  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j);
   rt_.insert(rt_.end(), T.begin(), T.end());
   ro_.insert(ro_.end(), O.begin(), O.end());
   rd_.insert(rd_.end(), D.begin(), D.end());
+  rg_.insert(rg_.end(), G.begin(), G.end());
+  rc_.insert(rc_.end(), C.begin(), C.end());
+}
+
+void Solver::SetChannel(const std::string &serial, int channel) {
+  std::lock_guard<std::mutex> g(m_);
+  ch_[serial] = channel;
+}
+
+void Solver::AddFrame(double t, double gt, int cam, V3 o, const M3 &R) {
+  std::lock_guard<std::mutex> g(m_);
+  frames_.push_back({t, gt, cam, o, R});
+  while (frames_.front().t < t - kKeep) frames_.pop_front();
 }
 
 void Solver::SetStation(const std::string &serial, V3 p, const M3 &R) {
@@ -471,12 +582,16 @@ Solver::Rays Solver::GetRays(double t0) {
     rt_.erase(rt_.begin(), rt_.begin() + j);
     ro_.erase(ro_.begin(), ro_.begin() + j);
     rd_.erase(rd_.begin(), rd_.begin() + j);
+    rg_.erase(rg_.begin(), rg_.begin() + j);
+    rc_.erase(rc_.begin(), rc_.begin() + j);
   }
   Rays r;
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), t0) - rt_.begin();
   r.T.assign(rt_.begin() + j, rt_.end());
   r.O.assign(ro_.begin() + j, ro_.end());
   r.D.assign(rd_.begin() + j, rd_.end());
+  r.G.assign(rg_.begin() + j, rg_.end());
+  r.C.assign(rc_.begin() + j, rc_.end());
   return r;
 }
 
@@ -994,6 +1109,175 @@ void Solver::PoseBreak(double t) {
   has_acq_x_ = false;
 }
 
+// ================================================================ station identity
+// A 2.0 base station's rotor period is set by its channel (ticks of 48 MHz). A short frame sees a station only in
+// part of its rotor turn, so which frames see it tells the stations apart where the geometry can't.
+static const int kRotorTicks[16] = {959000, 957000, 953000, 949000, 947000, 943000, 941000, 939000,
+                                    937000, 929000, 919000, 911000, 907000, 901000, 893000, 887000};
+
+double RotorPeriod(int channel) { return channel >= 1 && channel <= 16 ? kRotorTicks[channel - 1] / 48e6 : 0; }
+
+struct InView { int cam; double g; bool seen; };  // a short frame a station was in view of
+
+// turns/s the phase at period tau moves from one short frame to the next
+static double Drift(double tau, double P) {
+  double f = std::fmod(P / tau, 1.0);
+  return std::min(f, 1 - f) / P;
+}
+
+// How much seeing a station (in the frames it was in view of, sorted by camera, time) follows the phase at each
+// period, over fake periods near it. Both on the same per-camera windows of whole turns of the slower drift. False if
+// too few frames.
+static bool SeenScores(const std::vector<InView> &s, double tau1, double tau2, double P, double &s1, double &s2) {
+  const double kTurns = 2, kEps[] = {0.0015, 0.0025, 0.0035, 0.0045, 0.0055, 0.0065, 0.0075, 0.0085};
+  const int kMinN = 60, kMinSeen = 20;
+  s1 = s2 = 0;
+  double rate = std::min(Drift(tau1, P), Drift(tau2, P));
+  if (!(rate > 0)) return false;
+  double W = std::max(20.0, (kTurns + 1) / rate);
+  struct Win { size_t a, b; double p; };  // frames [a, b), share seen
+  std::vector<Win> win;
+  int n = 0, ns = 0;
+  for (size_t i = 0; i < s.size();) {
+    size_t j = i;
+    while (j < s.size() && s[j].cam == s[i].cam && s[j].g < s[i].g + W) j++;
+    double turns = std::floor((s[j - 1].g - s[i].g) * rate);
+    if (turns >= kTurns) {
+      size_t k = i;
+      int seen = 0;
+      for (; k < j && s[k].g < s[i].g + turns / rate; k++) seen += s[k].seen;
+      if (seen > 0 && seen < (int)(k - i)) {
+        win.push_back({i, k, seen / (double)(k - i)});
+        n += (int)(k - i);
+        ns += seen;
+      }
+    }
+    i = j;
+  }
+  if (n < kMinN || ns < kMinSeen) return false;
+  auto R = [&](double T) {
+    double tot = 0;
+    for (auto &w : win) {
+      double c = 0, sn = 0, g0 = s[w.a].g;
+      for (size_t k = w.a; k < w.b; k++) {
+        double a = 2 * kPi * (s[k].g - g0) / T, e = s[k].seen - w.p;
+        c += e * std::cos(a);
+        sn += e * std::sin(a);
+      }
+      tot += std::hypot(c, sn);
+    }
+    return tot / n;
+  };
+  auto score = [&](double tau) {
+    double null = 0;
+    for (double e : kEps) null += R(tau * (1 + e)) + R(tau * (1 - e));
+    return std::max(0.0, R(tau) - null / (2 * (sizeof kEps / sizeof kEps[0])));
+  };
+  s1 = score(tau1);
+  s2 = score(tau2);
+  return true;
+}
+
+// yaw + translation taking points S onto Q, least squares
+static X4 YawFit(const std::vector<V3> &S, const std::vector<V3> &Q) {
+  V3 ms, mq;
+  for (size_t i = 0; i < S.size(); i++) { ms += S[i]; mq += Q[i]; }
+  ms = ms * (1.0 / S.size()); mq = mq * (1.0 / S.size());
+  double sn = 0, cs = 0;
+  for (size_t i = 0; i < S.size(); i++) {
+    V3 a = S[i] - ms, b = Q[i] - mq;
+    sn += a.z * b.x - a.x * b.z;
+    cs += a.z * b.z + a.x * b.x;
+  }
+  double yaw = std::atan2(sn, cs);
+  V3 t = mq - Ry(yaw) * ms;
+  return {yaw, t.x, t.y, t.z};
+}
+
+// A pair of stations whose sightings follow each other's rotor periods better than their own is swapped: switch to
+// the alignment with the two exchanged if it fits the rays about as well.
+void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S,
+                           const std::vector<V3> &Z) {
+  double P = frame_p_;
+  if (!(P > 0) || keys.size() < 2) return;
+  std::vector<double> tau(keys.size(), 0.0);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (size_t k = 0; k < keys.size(); k++) {
+      auto it = ch_.find(keys[k]);
+      if (it != ch_.end()) tau[k] = RotorPeriod(it->second);
+    }
+  }
+  if (!in_image_) return;
+  Rays r = GetRays(since_);
+  std::vector<CamFrame> fr;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &f : frames_)
+      if (f.t >= since_) fr.push_back(f);
+  }
+  std::vector<V3> Pq, Zq;
+  Predict(x_, S, Z, Pq, Zq);
+  std::vector<std::set<std::pair<int, double>>> saw(keys.size());  // (camera, frame) with a sighting within 1 deg
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!std::isfinite(r.G[n])) continue;
+    int k;
+    double a;
+    Nearest(Pq, Zq, r.O[n], r.D[n], k, a);
+    if (a < 1.0) saw[k].insert({r.C[n], r.G[n]});
+  }
+  std::vector<std::vector<InView>> in(keys.size());
+  for (auto &f : fr)
+    for (size_t k = 0; k < keys.size(); k++) {
+      V3 U = Pq[k] - f.o;
+      double d = norm(U);
+      if (!(dot(U, Zq[k]) >= 0.2 * d) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
+      in[k].push_back({f.cam, f.g, saw[k].count({f.cam, f.g}) > 0});
+    }
+  for (auto &v : in)
+    std::sort(v.begin(), v.end(), [](const InView &a, const InView &b) { return a.cam != b.cam ? a.cam < b.cam : a.g < b.g; });
+  double worst = 0, best = 0;
+  size_t wa = 0, wb = 0, ba = 0, bb = 0;
+  for (size_t a = 0; a < keys.size(); a++)
+    for (size_t b = a + 1; b < keys.size(); b++) {
+      if (!tau[a] || !tau[b] || tau[a] == tau[b]) continue;
+      double aa, ab, bb_, ba_;
+      if (!SeenScores(in[a], tau[a], tau[b], P, aa, ab) || !SeenScores(in[b], tau[b], tau[a], P, bb_, ba_)) continue;
+      double gain = ab + ba_ - aa - bb_;
+      if (gain > worst) { worst = gain; wa = a; wb = b; }
+      if (gain < best) { best = gain; ba = a; bb = b; }
+    }
+  auto say = [&](const std::string &key, const std::string &s) {  // once per alignment
+    if (key == id_said_) return;
+    id_said_ = key;
+    log_(s);
+  };
+  if (worst > kSwapGain) {
+    std::vector<V3> Q = Pq;
+    std::swap(Q[wa], Q[wb]);
+    X4 xs = YawFit(S, Q);
+    for (double gate : {1.5, 0.6}) {
+      FitR f = Fit(xs, S, Z, r, now, gate, nullptr);
+      if (!f.ok) break;
+      xs = f.x;
+    }
+    int cur = ThinnedScore(x_, now), sw = ThinnedScore(xs, now);
+    std::string pair = keys[wa] + " and " + keys[wb];
+    if (cur > 0 && sw >= kSwapFit * cur) {
+      log_(Fmt("channel check: %s were the wrong way round (by %.2f): yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)",
+               pair.c_str(), worst, xs[0] * kDeg, xs[1], xs[2], xs[3], sw, cur));
+      Reset(xs);
+      has_acq_x_ = false;
+    } else {
+      say("kept " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but the rays fit that way worse "
+                              "(support %d vs %d): kept as it is", pair.c_str(), worst, sw, cur));
+    }
+  } else if (best < -kSwapGain) {
+    say("ok " + keys[ba] + keys[bb], Fmt("channel check: %s are the right way round (by %.2f)",
+                                         (keys[ba] + " and " + keys[bb]).c_str(), -best));
+  }
+}
+
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
 StepStat Solver::Step(double /*now*/) {
   std::vector<std::string> keys;
@@ -1055,6 +1339,10 @@ StepStat Solver::Step(double /*now*/) {
       for (size_t kk = 0; kk < keys.size(); kk++) st.per[keys[kk]] = cnt[kk];
       if (!in.empty()) { st.has_med = true; st.med = Median(in); }
     }
+  }
+  if (has_x_ && now - last_id_ >= kIdEvery) {
+    last_id_ = now;
+    CheckIdentity(now, keys, S, Z);
   }
   bool locked = false;
   if (has_x_ && st.has_per) {
@@ -1139,8 +1427,8 @@ void Solver::Relevel(const X4 &x) {
 }
 
 // ================================================================ timing
-void Timing::Record(double tg, V3 od, V3 dd) {
-  rec_.push_back({tg, od, dd});
+void Timing::Record(double tg, V3 od, V3 dd, double hg, int cam) {
+  rec_.push_back({tg, od, dd, hg, cam});
   while (!rec_.empty() && (rec_.front().tg < tg - 120 || rec_.size() > 20000)) rec_.pop_front();
 }
 
@@ -1304,8 +1592,9 @@ bool Timing::Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> 
 void Sync::Retime(double old_e, double new_e) {
   const auto &rec = timing_.recs();
   if (rec.empty()) return;
-  std::vector<double> T;
+  std::vector<double> T, G;
   std::vector<V3> O, D;
+  std::vector<int> C;
   for (auto &r : rec) {
     double t = r.tg - new_e, w;
     M3 R;
@@ -1314,8 +1603,10 @@ void Sync::Retime(double old_e, double new_e) {
     T.push_back(t);
     O.push_back(p + R * r.od);
     D.push_back(R * r.dd);
+    G.push_back(r.hg);
+    C.push_back(r.cam);
   }
-  solver_.Replace(rec.front().tg - old_e, T, O, D);
+  solver_.Replace(rec.front().tg - old_e, T, O, D, G, C);
 }
 
 static std::string Join(const std::string &dir, const char *name) {
@@ -1335,6 +1626,10 @@ Sync::Sync(SyncConfig cfg, LogFn log)
       solver_(log_, 1, sfile_.autogen ? std::map<std::string, V3>() : sfile_.fix) {
   if (cfg_.arrival_clock) expo_ = kExpoArrival;
   solver_.SetBody([this](const X4 &x) { return BodyDist(x); });
+  solver_.SetInImage([this](int cam, V3 d) {
+    std::lock_guard<std::mutex> g(net_);
+    return have_optics_ && optics_.InImage(cam, d, 8.0);
+  });
   if (sfile_.loaded)
     log_(Fmt("reference frame: anchor %s%s, %d measured station(s)", sfile_.anchor.c_str(),
              sfile_.autogen ? " (automatic)" : "", (int)sfile_.fix.size()));
@@ -1401,20 +1696,10 @@ bool Sync::Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss) {
     if (it != quest_.end()) { S.push_back(kv.second); Q.push_back(it->second); }
   }
   if (S.size() < 2) return false;
-  V3 ms, mq;
-  for (size_t i = 0; i < S.size(); i++) { ms += S[i]; mq += Q[i]; }
-  ms = ms * (1.0 / S.size()); mq = mq * (1.0 / S.size());
-  double sn = 0, cs = 0;
-  for (size_t i = 0; i < S.size(); i++) {
-    V3 a = S[i] - ms, b = Q[i] - mq;
-    sn += a.z * b.x - a.x * b.z;
-    cs += a.z * b.z + a.x * b.x;
-  }
-  double yaw = std::atan2(sn, cs);
-  V3 t = mq - Ry(yaw) * ms;
+  x = YawFit(S, Q);
+  V3 t{x[1], x[2], x[3]};
   miss = 0;
-  for (size_t i = 0; i < S.size(); i++) miss = std::max(miss, norm(Ry(yaw) * S[i] + t - Q[i]));
-  x = {yaw, t.x, t.y, t.z};
+  for (size_t i = 0; i < S.size(); i++) miss = std::max(miss, norm(Ry(x[0]) * S[i] + t - Q[i]));
   return true;
 }
 
@@ -1422,13 +1707,21 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
+  // the Quest Pro's frame period is known; another headset's is learned from its frames (a few seconds more before
+  // a sighting's poll lag comes off)
+  std::string dev = optics_.device();
+  for (auto &ch : dev) ch = (char)tolower((unsigned char)ch);
+  grid_period_ = (dev.empty() || dev == "seacliff") && !cfg_.learn_grid ? FrameGrid::kQuestPro : 0.0;
+  grid_ = FrameGrid(grid_period_);
+  grid_logged_.clear();
   return true;
 }
 
 void Sync::HeadsetReset() {
   std::lock_guard<std::mutex> g(net_);
   clock_.Clear();
-  grid_ = FrameGrid();
+  grid_ = FrameGrid(grid_period_);
+  grid_logged_.clear();
 }
 
 void Sync::SetStreamer(const std::string &system) {
@@ -1526,35 +1819,67 @@ void Sync::OnLine(double pc, const char *line) {
   double hs = tus / 1e6;
   if (cfg_.arrival_clock) clock_.AddArrival(pc, hs);
   double lag = 0;
-  // the Frame stamps its frames itself; the Quest's are when lhsight found them, the grid takes the poll lag off
-  bool have_lag = nb >= 0 && (optics_.exact_time() || grid_.Lag(cam, hs, lag));
-  if (nb <= 0 || !have_optics_) return;
+  // the Frame stamps its frames itself; the Quest's are when lhsight found them, the grid takes the poll lag off. On
+  // the Frame the grid still learns the frame period, for the channel check
+  bool grid_lag = nb >= 0 && grid_.Lag(cam, hs, lag);
+  if (optics_.exact_time()) lag = 0;
+  bool have_lag = nb >= 0 && (optics_.exact_time() || grid_lag);
+  if (nb >= 0 && !grid_period_) {  // a learned frame period: log it when it's found or moves
+    double p = grid_.period(cam), &was = grid_logged_[cam];
+    if (p > 0 && std::fabs(p - was) > 0.0001) {
+      log_(Fmt("camera %d: short frames every %.3f ms", cam, p * 1000));
+      was = p;
+    }
+  }
+  if (nb < 0) return;
+  spots_.frames++;
+  spots_.seen += nb;
+  if (!have_optics_) { spots_.other += nb; return; }
+  double hg = have_lag ? hs - lag : std::numeric_limits<double>::quiet_NaN();  // frame time, headset clock
+  if (have_lag && grid_.period(cam) > 0) solver_.SetFramePeriod(grid_.period(cam));
   double grid_pc;
-  if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) return;
+  if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) { spots_.other += nb; return; }
   double expo = expo_;
   double t = grid_pc - expo - (have_lag ? 0.0 : kLagFallback);
   M3 R; V3 p;
   double w;
-  if (!poses_.At(t, R, p) || !poses_.Speed(t, w) || poses_.Still(t)) return;
+  if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
+  if (poses_.Still(t)) { spots_.still += nb; return; }
   double wmax = (cfg_.learn_timing && !timing_learned_) ? kWmaxUntimed : kWmax;
+  M3 Rc;
+  V3 tc;
+  if (have_lag && w <= wmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
+  if (nb == 0) return;
   const char *s = line + off;
   for (int i = 0; i < nb; i++) {
     int x10, y10, npx, peak, used = 0;
     if (sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used) < 4) break;
     s += used;
-    if (npx > kMaxPx) continue;
+    if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
-    if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) continue;
-    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d);
+    if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
+    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f\n", t, cam, O.x, O.y, O.z, D.x, D.y,
               D.z, p.x, p.y, p.z, w);
     }
-    if (w > wmax) continue;
-    solver_.Add(t, p + R * o, R * d);
-    nsight_++;
+    if (w > wmax) { spots_.fast++; continue; }
+    solver_.Add(t, p + R * o, R * d, hg, cam);
+    spots_.used++;
   }
+}
+
+std::string Sync::Describe(const Spots &a, const Spots &b) {
+  long n = b.seen - a.seen;
+  if (!n) return Fmt("no bright spots on %ld camera frames", b.frames - a.frames);
+  std::string why;
+  auto part = [&](long k, const char *what) { if (k > 0) why += Fmt("%s%ld %s", why.empty() ? "" : ", ", k, what); };
+  part(b.still - a.still, "while the headset was still");
+  part(b.fast - a.fast, "while it turned fast");
+  part(b.big - a.big, "lamps or windows");
+  part(b.other - a.other, "without a headset pose");
+  return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
 }
 
 void Sync::SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw) {
@@ -1573,6 +1898,11 @@ void Sync::SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw) {
   raw_ = ok;
 }
 
+void Sync::SetChannels(const std::map<std::string, int> &ch) {
+  std::lock_guard<std::mutex> g(raw_m_);
+  channels_ = ch;
+}
+
 void Sync::Reacquire() {
   // like a pose break: older sightings no longer count, acquisition looks again at once
   V3 p;
@@ -1583,9 +1913,11 @@ void Sync::Reacquire() {
 
 // An automatic reference frame is SteamVR's frame as it was when the anchor was first seen, tilt and all. The headset
 // knows gravity: level the frame by it whenever the sightings pin its tilt (Solver::Level), and keep the level in
-// stations.json. A measured frame is the user's own and stays as it is.
-void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw) {
-  if (!sfile_.autogen || frame_.ok() != 1) return;
+// stations.json. A measured frame is the user's own and stays as it is. A wrong alignment (two stations swapped) can
+// be levelled into fitting three stations too, so only a settled one whose worn or held devices sit at the head counts.
+void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
+  if (!sfile_.autogen || frame_.ok() != 1 || !solver_.has_x() || now - lock_time_ < kLevelSettle) return;
+  if (!(BodyDist(solver_.x()) < kLevelBody)) return;
   Solver::LevelR lv;
   if (!solver_.Level(sfile_.anchor_p, lv)) return;
   double step = RotDeg(lv.tilt);
@@ -1604,6 +1936,15 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw) {
            "%.2f deg", step, RotDeg(L), lv.stations, lv.med));
 }
 
+// two stations have 10 sightings that fit
+static bool Locked(bool has_x, const StepStat &st) {
+  if (!has_x || !st.has_per) return false;
+  std::vector<int> c;
+  for (auto &kv : st.per) c.push_back(kv.second);
+  std::sort(c.begin(), c.end());
+  return c.size() >= 2 && c[c.size() - 2] >= 10;
+}
+
 Transform Sync::Tick(double now) {
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
@@ -1614,10 +1955,13 @@ Transform Sync::Tick(double now) {
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
     }
     std::map<std::string, std::pair<V3, M3>> raw;
+    std::map<std::string, int> chans;
     {
       std::lock_guard<std::mutex> g(raw_m_);
       raw = raw_;
+      chans = channels_;
     }
+    for (auto &kv : chans) solver_.SetChannel(kv.first, kv.second);
     if (!sfile_.loaded && !raw.empty()) {  // first run: pin the reference frame to the station at SteamVR's origin
       auto best = raw.begin();
       for (auto it = raw.begin(); it != raw.end(); ++it)
@@ -1647,7 +1991,9 @@ Transform Sync::Tick(double now) {
       if (now - last_s_ >= 10) {
         frame_.Unlevelled(kv.second.first, kv.second.second, p, R);
         Quat q = ToQuat(R);
-        Rec(now, "S %s %.5f %.5f %.5f %.5f %.5f %.5f %.5f", kv.first.c_str(), p.x, p.y, p.z, q.w, q.x, q.y, q.z);
+        auto c = chans.find(kv.first);
+        Rec(now, "S %s %.5f %.5f %.5f %.5f %.5f %.5f %.5f %d", kv.first.c_str(), p.x, p.y, p.z, q.w, q.x, q.y, q.z,
+            c == chans.end() ? 0 : c->second);
       }
     }
     if (now - last_s_ >= 10 && !raw.empty()) last_s_ = now;
@@ -1688,6 +2034,16 @@ Transform Sync::Tick(double now) {
       std::lock_guard<std::mutex> g(st_m_);
       last_st_ = st;
       has_last_st_ = true;
+    }
+    // not acquired: what became of the cameras' bright spots, after a minute and then every 5
+    if (Locked(solver_.has_x(), st)) sum_t_ = -1;
+    else {
+      Spots sp = spots();
+      if (sum_t_ < 0) { sum_t_ = now; sum_sp_ = sp; sum_n_ = 0; }
+      else if (now - sum_t_ >= (sum_n_ ? 300 : 60)) {
+        if (sp.frames > sum_sp_.frames) log_(Fmt("acquiring, last %.0f s: ", now - sum_t_) + Describe(sum_sp_, sp));
+        sum_t_ = now; sum_sp_ = sp; sum_n_++;
+      }
     }
     X4 x = solver_.x();
     if (recording_) {
@@ -1741,7 +2097,7 @@ Transform Sync::Tick(double now) {
     }
     if (now - last_level_ >= 10) {
       last_level_ = now;
-      LevelStep(raw);
+      LevelStep(raw, now);
     }
   }
   // slew toward the solution, faster while the head turns or walks (kSlew*), jump if far (acquisition)
@@ -1778,13 +2134,23 @@ Transform Sync::Tick(double now) {
 
 Sync::Status Sync::GetStatus(double now) {
   Status s;
+  Spots sp = spots();
   if (now - rate_t_ >= 2.0) {
-    long f = nframes_, g = nsight_;
-    if (rate_t_ > 0) { cam_fps_ = (f - rate_f_) / (now - rate_t_); sight_rate_ = (g - rate_s_) / (now - rate_t_); }
-    rate_t_ = now; rate_f_ = f; rate_s_ = g;
+    long f = nframes_;
+    if (rate_t_ > 0) {
+      double dt = now - rate_t_;
+      cam_fps_ = (f - rate_f_) / dt;
+      spot_rate_ = (sp.seen - rate_sp_.seen) / dt;
+      sight_rate_ = (sp.used - rate_sp_.used) / dt;
+    }
+    rate_t_ = now; rate_f_ = f; rate_sp_ = sp;
   }
   s.cam_fps = cam_fps_;
+  s.spot_rate = spot_rate_;
   s.sight_rate = sight_rate_;
+  double th;
+  V3 h;
+  s.head_still = poses_.Latest(h, &th) && poses_.Still(th);
   s.has_x = solver_.has_x();
   s.x = solver_.x();
   s.expo = expo_;
@@ -1801,12 +2167,7 @@ Sync::Status Sync::GetStatus(double now) {
   s.cond = st.cond;
   s.n = st.n;
   s.med = st.has_med ? st.med : -1;
-  if (s.has_x && st.has_per) {
-    std::vector<int> c;
-    for (auto &kv : st.per) c.push_back(kv.second);
-    std::sort(c.begin(), c.end());
-    s.locked = c.size() >= 2 && c[c.size() - 2] >= 10;
-  }
+  s.locked = Locked(s.has_x, st);
   s.locked_for = lock_time_ >= 0 ? now - lock_time_ : -1;
   if (s.has_x && have_applied_) {
     V3 h{0, 1.5, 0};

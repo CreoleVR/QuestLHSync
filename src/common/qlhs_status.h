@@ -7,11 +7,12 @@
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
-#define QLHS_VERSION 1
+#define QLHS_VERSION 2
+#define QLHS_RELEASE "1.4"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
-  QLHS_NO_HMD,       // SteamVR's headset isn't a Quest Pro or Steam Frame (or there's none yet)
+  QLHS_NO_HMD,       // SteamVR's headset isn't a Quest Pro, 3, 3S or Steam Frame (or there's none yet)
   QLHS_SEARCHING,    // no QuestLHSync headset answers on the network
   QLHS_CONNECTING,
   QLHS_NO_CAMERAS,   // connected, but no camera frames come in
@@ -52,7 +53,9 @@ struct QlhsStatus {
   char headset_addr[48];
   char headset_fw[48];
   double cam_fps;       // camera frames/s: the Quest's side cameras (all four from module v1.0), the Frame's four
-  double sight_rate;    // base station sightings/s
+  double sight_rate;    // bright spots/s the alignment uses
+  double spot_rate;     // bright spots/s the cameras see
+  int32_t head_still, pad2;  // 1: the headset hasn't moved for 2 s, its frames wait
   double rtt_ms;        // network round trip (clock sync)
   double expo_ms;       // frame grid -> pose time
   int32_t expo_learned, pad0;
