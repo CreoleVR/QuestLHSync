@@ -35,7 +35,7 @@ var n_poll = F("n_poll", "uint", []), idle_us = F("idle_us", "int", []);
 var scratchBuf = Memory.alloc(MAXW * MAXH), cellBuf = Memory.alloc((MAXW >> 4) * (MAXH >> 4) * 2);
 var labBuf = Memory.alloc((MAXW >> 4) * (MAXH >> 4) * 4);
 var outBuf = Memory.alloc(1 << 20), drainBuf = Memory.alloc(1 << 16), tsBuf = Memory.alloc(16);
-set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 250);
+set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 64);
 var PAGE = 4096;
 function bufSize(c) { return Math.ceil(c.w * c.h / PAGE) * PAGE; }  // one 8-bit frame, whole pages
 function discover() {

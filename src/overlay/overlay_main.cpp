@@ -1,7 +1,7 @@
 // QuestLHSync.exe: the SteamVR dashboard page. Started by the driver each session, exits with SteamVR.
 // Reads the driver's status from the shared memory (qlhs_status.h), draws it with GDI at 2x and downsamples
 // (anti-aliased shapes and text), and sends the buttons back as commands.
-//   QuestLHSync.exe --preview out.png [locked|acquiring|still|searching|nohmd]   renders a sample page, no VR
+//   QuestLHSync.exe --preview out.png [locked|acquiring|still|frozen|searching|nohmd]   renders a sample page, no VR
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -165,8 +165,9 @@ static void StateText(const QlhsStatus &s, bool stale, std::wstring &title, std:
       break;
     case QLHS_ACQUIRING:
       title = L"Finding the base stations";
-      sub = s.head_still ? L"The headset isn't moving, so its camera frames wait. Put it on and look around the room."
-                         : L"Look around the room so the cameras catch both base stations' flashes.";
+      sub = s.head_still == 2 ? L"SteamVR isn't getting your head's motion. Is SteamVR's view in the headset, not a desktop view?"
+            : s.head_still   ? L"The headset isn't moving, so its camera frames wait. Put it on and look around the room."
+                             : L"Look around the room so the cameras catch both base stations' flashes.";
       color = col::amber;
       break;
     case QLHS_LOCKED:
@@ -427,6 +428,7 @@ static QlhsStatus Sample(const char *kind) {
                         "04:55:02  lighthouse frame: SteamVR's is 0.75 deg from the reference"};
   for (auto l : logs) { strcpy(s.log[s.nlog % 8], l); s.nlog++; }
   if (!strcmp(kind, "still")) { s.head_still = 1; s.sight_rate = 0; s.spot_rate = 12; kind = "acquiring"; }
+  if (!strcmp(kind, "frozen")) { s.head_still = 2; s.sight_rate = 0; s.spot_rate = 12; kind = "acquiring"; }
   if (!strcmp(kind, "acquiring")) { s.state = QLHS_ACQUIRING; s.locked = 0; s.med_deg = -1; s.nfit = 0; s.yaw_deg = 0; s.locked_for = -1; s.st[1].last_seen = -1; s.st[1].support = 0; s.expo_learned = 0; s.expo_ms = 15; }
   if (!strcmp(kind, "searching")) { s.state = QLHS_SEARCHING; s.headset_addr[0] = 0; s.cam_fps = 0; s.rtt_ms = 0; s.locked = 0; s.nfit = 0; s.med_deg = -1; s.yaw_deg = 0; s.locked_for = -1; }
   if (!strcmp(kind, "nohmd")) { s.state = QLHS_NO_HMD; strcpy(s.hmd, "PlayStation VR2"); }

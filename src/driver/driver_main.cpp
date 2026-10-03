@@ -28,6 +28,7 @@
 
 #include "../common/qlhs_status.h"
 #include "MinHook.h"
+#include "gravity.h"
 #include "net.h"
 #include "openvr_driver.h"
 #include "sync.h"
@@ -39,6 +40,7 @@ static std::mutex g_log_m;
 static FILE *g_logf;
 static QlhsStatus *g_st;
 static std::unique_ptr<Sync> g_sync;
+static std::unique_ptr<Gravity> g_gravity;
 
 static void PushStatusLog(const std::string &s);
 
@@ -179,8 +181,15 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
     double pos[3];
     vr::HmdQuaternion_t q;
     RawPose(p, pos, q);
-    if (std::isfinite(pos[0] + pos[1] + pos[2]))
-      g_sync->OnBodyPose((int)id, QpcNow() + p.poseTimeOffset, V3{pos[0], pos[1], pos[2]});
+    if (std::isfinite(pos[0] + pos[1] + pos[2])) {
+      double t = QpcNow() + p.poseTimeOffset;
+      g_sync->OnBodyPose((int)id, t, V3{pos[0], pos[1], pos[2]});
+      static std::atomic<double> grav_t[vr::k_unMaxTrackedDeviceCount];
+      if (g_gravity && t - grav_t[id].load(std::memory_order_relaxed) >= 0.1) {  // it keeps 10 Hz
+        grav_t[id].store(t, std::memory_order_relaxed);
+        g_gravity->OnPose((int)id, t, V3{pos[0], pos[1], pos[2]}, ToM3(Quat{q.w, q.x, q.y, q.z}));
+      }
+    }
   }
   Xf x;
   if (!ReadXf(x)) return false;
@@ -282,6 +291,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     SyncConfig cfg;
     cfg.dir = dir_;
     g_sync = std::make_unique<Sync>(cfg, [](const std::string &s) { Log(s); });
+    g_gravity = std::make_unique<Gravity>(dir_, [](const std::string &s) { Log(s); });
     link_ = std::make_unique<HeadsetLink>(
         g_sync.get(), [](const std::string &s) { Log(s); },
         [](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
@@ -299,6 +309,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   void Cleanup() override {
     run_ = false;
     if (worker_.joinable()) worker_.join();
+    if (g_gravity) g_gravity->Stop();
     if (link_) link_->Stop();
     for (int j = 0; j < 2; j++)
       if (g_target[j]) MH_DisableHook(g_target[j]);
@@ -317,6 +328,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
       int kind = g_kind[i].load();
       if (kind == kLighthouse && g_dev[i].cls == vr::TrackedDeviceClass_TrackingReference) ReadChannel(i);
+      if (kind == kLighthouse && g_dev[i].cls != vr::TrackedDeviceClass_TrackingReference) ReadReceiver(i);
       if (kind != kUnknown) continue;
       auto c = props->TrackedDeviceToPropertyContainer(i);
       if (c == vr::k_ulInvalidPropertyContainer) continue;
@@ -331,6 +343,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         g_kind[i] = kLighthouse;
         Log(Fmt("device %u: %s %s (%s) -> moved", i, sys.c_str(), serial.c_str(), model.c_str()));
         if (cls == vr::TrackedDeviceClass_TrackingReference) ReadChannel(i);
+        else ReadReceiver(i);
         continue;
       }
       if (cls == vr::TrackedDeviceClass_HMD && g_hmd.load() < 0) {
@@ -379,6 +392,16 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       Log(Fmt("base station %s: channel %s", g_dev[i].serial, label.c_str()));
   }
 
+  // a controller's or tracker's wireless receiver (gravity.h reads its accelerometer through it)
+  void ReadReceiver(uint32_t i) {
+    auto c = vr::VRProperties()->TrackedDeviceToPropertyContainer(i);
+    if (c == vr::k_ulInvalidPropertyContainer) return;
+    std::string r = GetStr(c, vr::Prop_ConnectedWirelessDongle_String);
+    if (r == receiver_[i]) return;
+    receiver_[i] = r;
+    g_gravity->SetDevice((int)i, g_dev[i].serial, r);
+  }
+
   bool ShouldBlockStandbyMode() override { return false; }
   void EnterStandby() override {}
   void LeaveStandby() override {}
@@ -392,6 +415,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   std::thread worker_;
   std::mutex hmd_m_;
   std::string hmd_model_, hmd_system_;
+  std::string receiver_[vr::k_unMaxTrackedDeviceCount];
+  double last_gravity_ = 0;
   bool any_hmd_ = false, recording_ = false, overlay_started_ = false;
   int cmd_seen_ = 0;
   double started_ = 0, last_status_ = 0;
@@ -416,6 +441,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     char pref[64] = "";
     s->GetString(kSection, "headset", pref, sizeof pref, &e);
     if (e == vr::VRSettingsError_None) link_->SetPreferred(pref);
+    bool grav = s->GetBool(kSection, "gravity", &e);  // levelling by resting devices' gravity (gravity.h); on unset
+    g_gravity->SetEnabled(e != vr::VRSettingsError_None || grav);
     bool rec = s->GetBool(kSection, "record", &e);
     SetRecording(e == vr::VRSettingsError_None && rec);
   }
@@ -590,6 +617,14 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       Stations();
       Commands();
       WriteXf(g_sync->Tick(now));
+      if (now - last_gravity_ >= 1) {
+        last_gravity_ = now;
+        Gravity::Ref ref;
+        ref.ok = g_sync->GravityFrame(ref.C, ref.turn, ref.key);
+        bool on;
+        M3 tilt;
+        if (g_gravity->Step(ref, on, tilt)) g_sync->SetGravity(on, tilt);
+      }
       if (now - last_status_ >= 0.25) { last_status_ = now; Publish(now); }
       if (!overlay_started_ && now - started_ > 2 && !vr::VRServerDriverHost()->IsExiting()) {
         overlay_started_ = true;

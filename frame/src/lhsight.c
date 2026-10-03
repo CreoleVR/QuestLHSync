@@ -2,7 +2,7 @@
 // XRService's camera buffers and writes nothing: the buffer list comes from VIDIOC_QUERYBUF on the cameras' own nodes
 // (anyone may query a queue), the buffers themselves from the questlhsync_frame driver in the Frame's vrserver (see
 // frame/driver/xrfds.cpp). Every new frame: its mean (exposure class), and on short-exposure frames (the controller
-// LED frames, 8.4 ms after each long one, every 30 ms) the saturated blobs. Lines on stdout:
+// LED frames, 8.4 ms after each long one, every 30 ms) the saturated blobs, then dimmer ones. Lines on stdout:
 //   F cam seq t_us mean nblobs [x y npx peak]...   t: the frame's own timestamp on CLOCK_MONOTONIC, mean * 10,
 //                                                  nblobs -1 on long frames, x y in pixels * 10 (pixel centres at .5)
 //   T t_us scans n scan_us u torn n polls n lag_us l   once a second
@@ -32,8 +32,8 @@
 
 #define NCAM 4    // XRService's tracking cameras, its indices = the calibration's cameras
 #define NBUF 16   // per camera ring (QUERYBUF stops there)
-#define MAXB 24   // blobs per frame
-#define THR 250   // saturated
+#define MAXB 48   // blobs per frame
+#define THR 64    // the dim pass: 4x the frame's mean, at least THR (a dot that doesn't saturate, in a light room)
 #define QUIET 0.006     // s: a camera's next frame comes 8.4 ms after a long one, 21.6 ms after a short one
 #define STALLED 0.25    // s without a frame: the cameras are paused (headset off), poll slowly
 
@@ -59,6 +59,7 @@ static struct cam C[NCAM];
 static u8 *scratch;
 static u16 *cells;
 static int *lab;
+static u8 *hot;  // cells the dim pass leaves to the saturated one
 static u32 nscan, ntorn, npoll;
 static u64 scan_ns;
 static double lag_sum;
@@ -66,7 +67,7 @@ static u32 lag_n;
 static clockid_t ts_clock = -1;  // what the V4L2 timestamps count
 
 static void out(const char *fmt, ...) {
-  char b[1400];
+  char b[2600];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(b, sizeof b - 1, fmt, ap);
@@ -250,23 +251,26 @@ static int find(int x) {
   return x;
 }
 
-// saturated blobs in scratch (w x h, packed): 16x16 cells with a saturated pixel, 8-connected, centroid of their
-// saturated pixels
-static int blobs(int w, int h, char *line, int L, int cap) {
+// The blobs of pixels >= T in scratch (w x h, packed): 16x16 cells holding one, 8-connected, centroid of those pixels;
+// added to the arrays from nbl on, up to MAXB. Cells marked hot are left out, and the first pass marks its cells and
+// their neighbours (mark), so a later, dimmer pass doesn't take in a saturated blob's glow.
+static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk) {
   int cw = w >> 4, ch = h >> 4, nc = cw * ch;
   for (int q = 0; q < nc; q++) cells[q] = 0;
-  const u64 M = 0xF8F8F8F8F8F8F8F8ull;  // fast reject: no byte >= 248 in this word
+  // fast reject: no byte > T - 1 in this word (at most 127: brighter thresholds only reject less)
+  const u64 add = 0x0101010101010101ull * (u64)(127 - (T - 1 > 127 ? 127 : T - 1));
   const u64 *q8 = (const u64 *)scratch;
   u32 n = (u32)(w * h), nw = n >> 3;
   for (u32 j = 0; j < nw; j++) {
-    u64 x = q8[j], v = ~x & M;
-    if (!((v - 0x0101010101010101ull) & ~v & 0x8080808080808080ull)) continue;
+    u64 x = q8[j];
+    if (!(((x + add) | x) & 0x8080808080808080ull)) continue;
     for (int bb = 0; bb < 8; bb++) {
-      if ((int)((x >> (8 * bb)) & 0xFF) < THR) continue;
+      if ((int)((x >> (8 * bb)) & 0xFF) < T) continue;
       u32 px = (j << 3) + bb;
       int y = (int)(px / (u32)w), xx = (int)(px - (u32)y * (u32)w);
-      u16 *cc = &cells[(y >> 4) * cw + (xx >> 4)];
-      if (*cc < 65535) (*cc)++;
+      int q = (y >> 4) * cw + (xx >> 4);
+      if (hot[q]) continue;
+      if (cells[q] < 65535) cells[q]++;
     }
   }
   for (int q = 0; q < nc; q++) lab[q] = q;
@@ -274,6 +278,10 @@ static int blobs(int w, int h, char *line, int L, int cap) {
     for (int cx = 0; cx < cw; cx++) {
       int q = cy * cw + cx;
       if (!cells[q]) continue;
+      if (mark)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++)
+            if (cy + dy >= 0 && cy + dy < ch && cx + dx >= 0 && cx + dx < cw) hot[q + dy * cw + dx] = 1;
       int nb[4] = {cx > 0 ? q - 1 : -1, cy > 0 ? q - cw : -1, (cy > 0 && cx > 0) ? q - cw - 1 : -1,
                    (cy > 0 && cx < cw - 1) ? q - cw + 1 : -1};
       for (int e = 0; e < 4; e++)
@@ -282,13 +290,11 @@ static int blobs(int w, int h, char *line, int L, int cap) {
           if (r1 != r2) lab[r1] = r2;
         }
     }
-  int roots[MAXB], nbl = 0, pk[MAXB];
-  u64 sx[MAXB], sy[MAXB];
-  u32 np[MAXB];
+  int roots[MAXB], b0 = nbl;
   for (int q = 0; q < nc; q++) {
     if (!cells[q]) continue;
     int r = find(q), bi = -1;
-    for (int e = 0; e < nbl; e++) if (roots[e] == r) { bi = e; break; }
+    for (int e = b0; e < nbl; e++) if (roots[e] == r) { bi = e; break; }
     if (bi < 0) {
       if (nbl == MAXB) continue;
       bi = nbl++;
@@ -303,18 +309,14 @@ static int blobs(int w, int h, char *line, int L, int cap) {
       for (int x = x0; x < x0 + 16; x++) {
         int v = row[x];
         if (v > pk[bi]) pk[bi] = v;
-        if (v < THR) continue;
+        if (v < T) continue;
         sx[bi] += (u64)(x * 10 + 5);
         sy[bi] += (u64)(y * 10 + 5);
         np[bi]++;
       }
     }
   }
-  L += snprintf(line + L, cap - L, " %d", nbl);
-  for (int e = 0; e < nbl && L < cap - 40; e++)
-    L += snprintf(line + L, cap - L, " %llu %llu %u %d", (unsigned long long)(sx[e] / np[e]),
-                  (unsigned long long)(sy[e] / np[e]), np[e], pk[e]);
-  return L;
+  return nbl;
 }
 
 // V4L2 stamps the frames on CLOCK_MONOTONIC_RAW here (the buffers claim MONOTONIC): take whichever the newest frame
@@ -355,11 +357,22 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
     ntorn++;
     return;
   }
-  char line[1400];
+  char line[2400];
   int L = snprintf(line, sizeof line, "F %d %u %llu %d", k, b->sequence, (unsigned long long)t_us, mean);
   if (!is_short) L += snprintf(line + L, sizeof line - L, " -1");
   else {
-    L = blobs(c->w, c->h, line, L, sizeof line);
+    // saturated blobs (base station dots, lamps), then dimmer ones in the cells they leave alone
+    u64 sx[MAXB], sy[MAXB];
+    u32 np[MAXB];
+    int pk[MAXB], T = mean * 4 / 10, nc = (c->w >> 4) * (c->h >> 4);
+    if (T < THR) T = THR;
+    memset(hot, 0, (size_t)nc);
+    int nbl = blobs(c->w, c->h, 250, 1, 0, sx, sy, np, pk);
+    if (T < 250) nbl = blobs(c->w, c->h, T, 0, nbl, sx, sy, np, pk);
+    L += snprintf(line + L, sizeof line - L, " %d", nbl);
+    for (int e = 0; e < nbl && L < (int)sizeof line - 40; e++)
+      L += snprintf(line + L, sizeof line - L, " %llu %llu %u %d", (unsigned long long)(sx[e] / np[e]),
+                    (unsigned long long)(sy[e] / np[e]), np[e], pk[e]);
     scan_ns += now_ns() - t0;
     nscan++;
   }
@@ -414,6 +427,7 @@ int lhsight_main(void) {
   scratch = aligned_alloc(64, (size_t)maxw * maxh);
   cells = malloc((size_t)(maxw / 16) * (maxh / 16) * sizeof *cells);
   lab = malloc((size_t)(maxw / 16) * (maxh / 16) * sizeof *lab);
+  hot = malloc((size_t)(maxw / 16) * (maxh / 16));
   char desc[400];
   int L = 0;
   for (int k = 0; k < NCAM; k++)

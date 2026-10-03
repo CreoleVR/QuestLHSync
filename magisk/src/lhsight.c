@@ -1,6 +1,6 @@
 // lhsight: streaming bright-spot detector for the tracking cameras, run as a Frida CModule
 // inside the sensors HAL. Read-only on the dmabuf rings. For every new frame: a sampled mean
-// (exposure class), and on short-exposure frames the saturated blobs (centroid, size, peak).
+// (exposure class), and on short-exposure frames the saturated blobs, then dimmer ones (centroid, size, peak).
 // Output is text lines in a ring the JS side drains:
 //   F cam k t_us mean nblobs [x y npx peak]...      (x,y in pixels*10)
 typedef unsigned char u8; typedef unsigned short u16; typedef unsigned int u32; typedef unsigned long long u64;
@@ -10,7 +10,8 @@ extern void *memcpy(void *, const void *, unsigned long);
 extern int snprintf(char *, unsigned long, const char *, ...);
 #define MAXS 128
 #define MAXC 16                                // camera ids 0..15
-#define MAXB 24
+#define MAXB 48
+#define MAXCELL 2048                           // 16x16 cells a frame may have for the dim pass
 #define OUTCAP (1 << 20)
 // Polling sleeps until shortly before a camera's next frame is due. Reading the camera buffers is slow, so checking
 // all of them every millisecond cost far more than the scans. Frames don't come evenly: the Quest Pro's come 20, 21
@@ -21,7 +22,8 @@ struct st {
   u8 *slot[MAXS]; int sw[MAXS], sh[MAXS], cam[MAXS], pend[MAXS]; u32 shash[MAXS]; int nslots;
   u32 k[MAXC]; int m1[MAXC], m2[MAXC];         // per camera: frame counter, previous two means
   int nostrict[MAXC], nalt[MAXC];              // frames since the last strict short one, alternating ones since
-  int thr;
+  int thr;                                     // the dim pass's floor
+  u8 hot[MAXCELL];                             // cells the dim pass leaves to the saturated one
   u8 *scratch; u16 *cells; int *lab;
   char *out; u32 head, tail, ndrop;
   u64 scan_ns; u32 nscan;
@@ -105,6 +107,60 @@ static void predict(int c, u64 t) {
   if (S.late[c]) { S.late[c] = 0; if (S.adj[c] < 8000) S.adj[c] += 1000; }
   else if (S.adj[c] >= 250) S.adj[c] -= 250;
 }
+// The blobs of pixels >= T in scratch (w x h): 16x16 cells holding one, 8-connected, centroid of those pixels; added
+// to the arrays from nbl on, up to MAXB. Cells marked hot are left out, and the first pass marks its cells and
+// their neighbours (mark), so a later, dimmer pass doesn't take in a saturated blob's glow.
+static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk) {
+  u32 n = (u32)(w * h); int cw = w >> 4, ch = h >> 4, nc = cw * ch, hot = nc <= MAXCELL;
+  for (int q = 0; q < nc; q++) S.cells[q] = 0;
+  // fast reject: no byte > T - 1 in this word (at most 127: brighter thresholds only reject less)
+  u64 add = 0x0101010101010101ull * (u64)(127 - (T - 1 > 127 ? 127 : T - 1));
+  const u64 *q8 = (const u64 *)S.scratch; u32 nw = n >> 3;
+  for (u32 j = 0; j < nw; j++) {
+    u64 x = q8[j];
+    if (!(((x + add) | x) & 0x8080808080808080ull)) continue;
+    for (int bb = 0; bb < 8; bb++) {
+      if ((int)((x >> (8 * bb)) & 0xFF) < T) continue;
+      u32 px = (j << 3) + bb; int y = (int)(px / (u32)w), xx = (int)(px - (u32)y * (u32)w);
+      if ((y >> 4) >= ch || (xx >> 4) >= cw) continue;  // the edge strip of a size that isn't a multiple of 16
+      int q = (y >> 4) * cw + (xx >> 4);
+      if (hot && S.hot[q]) continue;
+      if (S.cells[q] < 65535) S.cells[q]++;
+    }
+  }
+  // union 8-connected bright cells into blobs
+  for (int q = 0; q < nc; q++) S.lab[q] = q;
+  for (int cy = 0; cy < ch; cy++)
+    for (int cx = 0; cx < cw; cx++) {
+      int q = cy * cw + cx;
+      if (!S.cells[q]) continue;
+      if (mark && hot)
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++)
+            if (cy + dy >= 0 && cy + dy < ch && cx + dx >= 0 && cx + dx < cw) S.hot[q + dy * cw + dx] = 1;
+      int nb[4] = { cx > 0 ? q - 1 : -1, cy > 0 ? q - cw : -1, (cy > 0 && cx > 0) ? q - cw - 1 : -1, (cy > 0 && cx < cw - 1) ? q - cw + 1 : -1 };
+      for (int e = 0; e < 4; e++) if (nb[e] >= 0 && S.cells[nb[e]]) { int r1 = find(q), r2 = find(nb[e]); if (r1 != r2) S.lab[r1] = r2; }
+    }
+  // per blob: centroid of pixels >= T inside its cells
+  int roots[MAXB], b0 = nbl;
+  for (int q = 0; q < nc; q++) {
+    if (!S.cells[q]) continue;
+    int r = find(q), bi = -1;
+    for (int e = b0; e < nbl; e++) if (roots[e] == r) { bi = e; break; }
+    if (bi < 0) { if (nbl == MAXB) continue; bi = nbl++; roots[bi] = r; sx[bi] = sy[bi] = 0; np[bi] = 0; pk[bi] = 0; }
+    int x0 = (q % cw) * 16, y0 = (q / cw) * 16;
+    for (int y = y0; y < y0 + 16; y++) {
+      const u8 *row = S.scratch + (u32)y * (u32)w;
+      for (int x = x0; x < x0 + 16; x++) {
+        int v = row[x];
+        if (v > pk[bi]) pk[bi] = v;
+        if (v < T) continue;
+        sx[bi] += (u64)(x * 10 + 5); sy[bi] += (u64)(y * 10 + 5); np[bi]++;
+      }
+    }
+  }
+  return nbl;
+}
 static void frame(int i, u64 t) {
   int w = S.sw[i], h = S.sh[i], c = S.cam[i];
   predict(c, t);
@@ -122,7 +178,7 @@ static void frame(int i, u64 t) {
   if (strict) S.nostrict[c] = S.nalt[c] = 0;
   else if (S.nostrict[c] < 100000) { S.nostrict[c]++; S.nalt[c] += alt; }
   int is_short = strict || (alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
-  char line[1200]; int L;
+  char line[2400]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);
     put(line, L);
@@ -130,48 +186,14 @@ static void frame(int i, u64 t) {
   }
   u64 t0 = now();
   memcpy(S.scratch, S.slot[i], n);
-  int cw = w >> 4, ch = h >> 4, nc = cw * ch, T = S.thr;
-  for (int q = 0; q < nc; q++) S.cells[q] = 0;
-  u64 M = 0xF8F8F8F8F8F8F8F8ull;              // fast reject: no byte >= 248 in this word
-  const u64 *q8 = (const u64 *)S.scratch; u32 nw = n >> 3;
-  for (u32 j = 0; j < nw; j++) {
-    u64 x = q8[j], v = ~x & M;
-    if (!((v - 0x0101010101010101ull) & ~v & 0x8080808080808080ull)) continue;
-    for (int bb = 0; bb < 8; bb++) {
-      if ((int)((x >> (8 * bb)) & 0xFF) < T) continue;
-      u32 px = (j << 3) + bb; int y = (int)(px / (u32)w), xx = (int)(px - (u32)y * (u32)w);
-      if ((y >> 4) >= ch || (xx >> 4) >= cw) continue;  // the edge strip of a size that isn't a multiple of 16
-      u16 *cc = &S.cells[(y >> 4) * cw + (xx >> 4)];
-      if (*cc < 65535) (*cc)++;
-    }
-  }
-  // union 8-connected bright cells into blobs
-  for (int q = 0; q < nc; q++) S.lab[q] = q;
-  for (int cy = 0; cy < ch; cy++)
-    for (int cx = 0; cx < cw; cx++) {
-      int q = cy * cw + cx;
-      if (!S.cells[q]) continue;
-      int nb[4] = { cx > 0 ? q - 1 : -1, cy > 0 ? q - cw : -1, (cy > 0 && cx > 0) ? q - cw - 1 : -1, (cy > 0 && cx < cw - 1) ? q - cw + 1 : -1 };
-      for (int e = 0; e < 4; e++) if (nb[e] >= 0 && S.cells[nb[e]]) { int r1 = find(q), r2 = find(nb[e]); if (r1 != r2) S.lab[r1] = r2; }
-    }
-  // per blob: centroid of pixels >= T inside its cells
-  int roots[MAXB], nbl = 0; u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB];
-  for (int q = 0; q < nc; q++) {
-    if (!S.cells[q]) continue;
-    int r = find(q), bi = -1;
-    for (int e = 0; e < nbl; e++) if (roots[e] == r) { bi = e; break; }
-    if (bi < 0) { if (nbl == MAXB) continue; bi = nbl++; roots[bi] = r; sx[bi] = sy[bi] = 0; np[bi] = 0; pk[bi] = 0; }
-    int x0 = (q % cw) * 16, y0 = (q / cw) * 16;
-    for (int y = y0; y < y0 + 16; y++) {
-      const u8 *row = S.scratch + (u32)y * (u32)w;
-      for (int x = x0; x < x0 + 16; x++) {
-        int v = row[x];
-        if (v > pk[bi]) pk[bi] = v;
-        if (v < T) continue;
-        sx[bi] += (u64)(x * 10 + 5); sy[bi] += (u64)(y * 10 + 5); np[bi]++;
-      }
-    }
-  }
+  // saturated blobs (base station dots, lamps), then dimmer ones (>= 4x the frame's mean, at least S.thr) in the cells
+  // the saturated ones leave alone: a dot that doesn't saturate, in a room light enough to shorten the exposure
+  u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB];
+  int cw = w >> 4, ch = h >> 4, nc = cw * ch, T = mean * 4 / 10;
+  if (T < S.thr) T = S.thr;
+  for (int q = 0; q < nc && q < MAXCELL; q++) S.hot[q] = 0;
+  int nbl = blobs(w, h, 250, 1, 0, sx, sy, np, pk);
+  if (T < 250 && nc <= MAXCELL) nbl = blobs(w, h, T, 0, nbl, sx, sy, np, pk);
   S.scan_ns += now() - t0; S.nscan++;
   L = snprintf(line, sizeof line, "F %d %u %llu %d %d", c, k, t / 1000, mean, nbl);
   for (int e = 0; e < nbl && L < (int)sizeof line - 40; e++)

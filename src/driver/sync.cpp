@@ -518,8 +518,17 @@ void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
              ok ? "" : " (over 3 deg: the anchor moved or a new universe; SteamVR's frame as it is)"));
   ok_ = ok;
   deg_ = ang;
-  if (ok) { Cs_ = Cs; C_ = f_.level * Cs; o_ = it->second.first; oref_ = f_.anchor_p; }
-  else { Cs_ = C_ = M3(); o_ = {}; oref_ = {}; }
+  if (ok) {
+    Cs_ = Cs;
+    GC_ = grav_ ? G_ : M3();
+    C_ = GC_ * f_.level * Cs;
+    o_ = it->second.first;
+    oref_ = f_.anchor_p;
+  } else {
+    Cs_ = C_ = GC_ = M3();
+    o_ = {};
+    oref_ = {};
+  }
 }
 
 // ================================================================ solver
@@ -533,21 +542,22 @@ void Solver::Reset(const X4 &x) {
   id_said_.clear();
 }
 
-void Solver::Add(double t, V3 o, V3 d, double gt, int cam) {
+void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
   std::lock_guard<std::mutex> g(m_);
-  rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam);
+  rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam); rb_.push_back(bright);
 }
 
 void Solver::Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
-                     const std::vector<double> &G, const std::vector<int> &C) {
+                     const std::vector<double> &G, const std::vector<int> &C, const std::vector<char> &B) {
   std::lock_guard<std::mutex> g(m_);
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), from) - rt_.begin();
-  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j);
+  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j); rb_.resize(j);
   rt_.insert(rt_.end(), T.begin(), T.end());
   ro_.insert(ro_.end(), O.begin(), O.end());
   rd_.insert(rd_.end(), D.begin(), D.end());
   rg_.insert(rg_.end(), G.begin(), G.end());
   rc_.insert(rc_.end(), C.begin(), C.end());
+  rb_.insert(rb_.end(), B.begin(), B.end());
 }
 
 void Solver::SetChannel(const std::string &serial, int channel) {
@@ -584,6 +594,7 @@ Solver::Rays Solver::GetRays(double t0) {
     rd_.erase(rd_.begin(), rd_.begin() + j);
     rg_.erase(rg_.begin(), rg_.begin() + j);
     rc_.erase(rc_.begin(), rc_.begin() + j);
+    rb_.erase(rb_.begin(), rb_.begin() + j);
   }
   Rays r;
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), t0) - rt_.begin();
@@ -592,6 +603,7 @@ Solver::Rays Solver::GetRays(double t0) {
   r.D.assign(rd_.begin() + j, rd_.end());
   r.G.assign(rg_.begin() + j, rg_.end());
   r.C.assign(rc_.begin() + j, rc_.end());
+  r.B.assign(rb_.begin() + j, rb_.end());
   return r;
 }
 
@@ -725,7 +737,7 @@ static bool Solve(double A[kMaxDof][kMaxDof], const double *b, double *x, int n)
 // nothing by looking longer. xa: the prior's center (default x0). cond: the sightings alone pin every DOF.
 // 4 DOF; with a pivot 6: the stations also tilt about it (Tilt(y[4], y[5])), and the prior holds only the tilt.
 Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now,
-                         double gate, const X4 *xa_in, const V3 *pivot) {
+                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate) {
   FitR out;
   std::vector<V3> P, Zq;
   Predict(x0, S, Z, P, Zq);
@@ -735,7 +747,7 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
   for (size_t n = 0; n < r.size(); n++) {
     double a;
     Nearest(P, Zq, r.O[n], r.D[n], kk[n], a);
-    if (a < gate) { use[n] = 1; m++; }
+    if (a < (r.B.empty() || r.B[n] ? gate : std::min(gate, dim_gate))) { use[n] = 1; m++; }
   }
   out.n = m;
   if (m < 15) return out;
@@ -936,6 +948,25 @@ void Solver::BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, co
   }
 }
 
+bool Solver::Starved(const Rays &r) {
+  size_t nb = 0;
+  for (char b : r.B) nb += b != 0;
+  return !r.B.empty() && r.size() >= 200 && nb * 20 < r.size();
+}
+
+Solver::Rays Solver::Bright(const Rays &r) {
+  size_t nb = 0;
+  for (char b : r.B) nb += b != 0;
+  if (r.B.empty() || nb == r.size() || Starved(r)) return r;
+  Rays o;
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!r.B[n]) continue;
+    o.T.push_back(r.T[n]); o.G.push_back(r.G[n]); o.O.push_back(r.O[n]); o.D.push_back(r.D[n]);
+    o.C.push_back(r.C[n]); o.B.push_back(1);
+  }
+  return o;
+}
+
 // one ray per (5 cm head cell, ~2 deg world direction): a lamp seen from a still head collapses to a few rays,
 // so consensus only counts parallax
 Solver::Rays Solver::Thin(const Rays &r) {
@@ -944,7 +975,10 @@ Solver::Rays Solver::Thin(const Rays &r) {
   for (size_t n = 0; n < r.size(); n++)
     if (first.emplace(KeyOf(r.O[n], r.D[n]), n).second) keep.push_back(n);
   Rays o;
-  for (size_t n : keep) { o.T.push_back(r.T[n]); o.O.push_back(r.O[n]); o.D.push_back(r.D[n]); }
+  for (size_t n : keep) {
+    o.T.push_back(r.T[n]); o.O.push_back(r.O[n]); o.D.push_back(r.D[n]);
+    if (!r.B.empty()) o.B.push_back(r.B[n]);
+  }
   return o;
 }
 
@@ -963,7 +997,8 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
   Stations(keys, S, Z);
-  Rays r = GetRays(std::max(now - ACQ_WIN, since_));
+  Rays all = GetRays(std::max(now - ACQ_WIN, since_)), r = Bright(all);
+  acq_dim_ = r.size() == all.size() && std::count(all.B.begin(), all.B.end(), 0) > 0;
   if (S.size() < 2 || r.size() < 30) return false;
   Rays t = Thin(r);
   std::vector<X4> H;
@@ -1025,7 +1060,7 @@ int Solver::ThinnedScore(const X4 &x, double now) {
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
   Stations(keys, S, Z);
-  Rays t = Thin(GetRays(std::max(now - ACQ_WIN, since_)));
+  Rays t = Thin(Bright(GetRays(std::max(now - ACQ_WIN, since_))));
   if (!t.size()) return 0;
   std::vector<int> c;
   Support(x, S, Z, t, INLIER, c);
@@ -1218,7 +1253,7 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
     }
   }
   if (!in_image_) return;
-  Rays r = GetRays(since_);
+  Rays r = Bright(GetRays(since_));
   std::vector<CamFrame> fr;
   {
     std::lock_guard<std::mutex> g(m_);
@@ -1311,6 +1346,7 @@ StepStat Solver::Step(double /*now*/) {
     return st;
   }
   double now = seen_ = newest;
+  starved_ = Starved(GetRays(std::max(now - ACQ_WIN, since_)));
   StepStat st;
   if (!S.empty() && has_x_) {
     Rays r = GetRays(std::max(now - WIN, since_));
@@ -1323,7 +1359,7 @@ StepStat Solver::Step(double /*now*/) {
       for (size_t kk = 0; kk < S.size(); kk++) {  // a station's recent sightings moved away from its older ones:
         std::vector<double> rec, old;          // the Quest's tracking jumped, forget the older sightings
         for (size_t n = 0; n < r.size(); n++)
-          if (k[n] == (int)kk && ak[n] < GATE) (r.T[n] > now - 4 ? rec : old).push_back(ak[n]);
+          if (k[n] == (int)kk && ak[n] < (r.B[n] ? GATE : DimGate())) (r.T[n] > now - 4 ? rec : old).push_back(ak[n]);
         if (rec.size() >= 20 && old.size() >= 20 && Median(rec) - Median(old) > JUMP) {
           since_ = now - 4;
           st.jump = true;
@@ -1331,7 +1367,7 @@ StepStat Solver::Step(double /*now*/) {
           break;
         }
       }
-      FitR f = Fit(x_, S, Z, r, now, GATE, has_anchor_ ? &anchor_ : nullptr);
+      FitR f = Fit(x_, S, Z, r, now, GATE, has_anchor_ ? &anchor_ : nullptr, nullptr, DimGate());
       if (f.ok) {
         x_ = f.x;
         if (f.cond || !has_anchor_) { anchor_ = f.x; has_anchor_ = true; }
@@ -1374,7 +1410,8 @@ StepStat Solver::Step(double /*now*/) {
       int cur = has_x_ ? ThinnedScore(x_, now) : 0;
       st.has_acq = true; st.acq_sa = sa; st.acq_cur = cur; st.acq_tight = tight;
       // the mirror check's flip has the worn devices for evidence as well: half the support will do
-      bool enough = sa >= ACQ || tight >= TIGHT_N || (acq_forced_ && sa >= ACQ / 2);
+      int k = acq_dim_ ? 2 : 1;  // dim rays: other lights line up with a wrong alignment more easily
+      bool enough = sa >= k * ACQ || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2);
       if (enough && (sa > 2 * cur + 5 || acq_forced_)) {
         log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s", xa[0] * kDeg, xa[1],
                  xa[2], xa[3], sa, tight, TIGHT_DEG, cur, acq_forced_ ? ", by the mirror check" : ""));
@@ -1407,7 +1444,7 @@ bool Solver::Level(V3 pivot, LevelR &out) {
   FitR f;
   for (double gate : {6.0, GATE, 0.6}) {
     level();
-    f = Fit(x, S, Z, r, now, gate, nullptr, &pivot);
+    f = Fit(x, S, Z, r, now, gate, nullptr, &pivot, DimGate());
     if (!f.ok) return false;
     x = f.x;
     L = f.tilt * L;
@@ -1443,8 +1480,8 @@ void Solver::Relevel(const X4 &x) {
 }
 
 // ================================================================ timing
-void Timing::Record(double tg, V3 od, V3 dd, double hg, int cam) {
-  rec_.push_back({tg, od, dd, hg, cam});
+void Timing::Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright) {
+  rec_.push_back({tg, od, dd, hg, cam, bright});
   while (!rec_.empty() && (rec_.front().tg < tg - 120 || rec_.size() > 20000)) rec_.pop_front();
 }
 
@@ -1611,6 +1648,7 @@ void Sync::Retime(double old_e, double new_e) {
   std::vector<double> T, G;
   std::vector<V3> O, D;
   std::vector<int> C;
+  std::vector<char> B;
   for (auto &r : rec) {
     double t = r.tg - new_e, w;
     M3 R;
@@ -1621,8 +1659,9 @@ void Sync::Retime(double old_e, double new_e) {
     D.push_back(R * r.dd);
     G.push_back(r.hg);
     C.push_back(r.cam);
+    B.push_back(r.bright);
   }
-  solver_.Replace(rec.front().tg - old_e, T, O, D, G, C);
+  solver_.Replace(rec.front().tg - old_e, T, O, D, G, C, B);
 }
 
 static std::string Join(const std::string &dir, const char *name) {
@@ -1848,6 +1887,18 @@ void Sync::OnLine(double pc, const char *line) {
     }
   }
   if (nb < 0) return;
+  struct Blob { int x10, y10, npx, peak; };
+  std::vector<Blob> bl;
+  {
+    const char *s = line + off;
+    for (int i = 0; i < nb; i++) {
+      int x10, y10, npx, peak, used = 0;
+      if (sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used) < 4) break;
+      s += used;
+      bl.push_back({x10, y10, npx, peak});
+    }
+  }
+  nb = (int)bl.size();
   spots_.frames++;
   spots_.seen += nb;
   if (!have_optics_) { spots_.other += nb; return; }
@@ -1860,29 +1911,43 @@ void Sync::OnLine(double pc, const char *line) {
   M3 R; V3 p;
   double w;
   if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
-  if (poses_.Still(t)) { spots_.still += nb; return; }
+  bool still = poses_.Still(t);
+  {  // while SteamVR's headset stands still, do the lamps and windows the cameras see stand still too?
+    std::vector<std::pair<double, double>> big;
+    for (const Blob &b : bl)
+      if (b.npx >= kLampPx) big.push_back({b.x10 / 10.0, b.y10 / 10.0});
+    auto &prev = prev_big_[cam];
+    if (!still) img_moved_ = img_still_ = 0;
+    else if (!prev.empty())
+      for (auto &q : big) {
+        double d = 1e9;
+        for (auto &o : prev) d = std::min(d, std::hypot(q.first - o.first, q.second - o.second));
+        img_still_ += d <= 3;
+        img_moved_ += d > 10;
+      }
+    prev = big;
+  }
+  if (still) { spots_.still += nb; return; }
   double wmax = (cfg_.learn_timing && !timing_learned_) ? kWmaxUntimed : kWmax;
   M3 Rc;
   V3 tc;
   if (have_lag && w <= wmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
-  if (nb == 0) return;
-  const char *s = line + off;
-  for (int i = 0; i < nb; i++) {
-    int x10, y10, npx, peak, used = 0;
-    if (sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used) < 4) break;
-    s += used;
+  for (const Blob &b : bl) {
+    int x10 = b.x10, y10 = b.y10, npx = b.npx;
     if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
-    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam);
+    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f\n", t, cam, O.x, O.y, O.z, D.x, D.y,
               D.z, p.x, p.y, p.z, w);
     }
     if (w > wmax) { spots_.fast++; continue; }
-    solver_.Add(t, p + R * o, R * d, hg, cam);
-    spots_.used++;
+    bool bright = b.peak >= kBright;
+    solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
+    if (bright || solver_.starved()) spots_.used++;
+    else spots_.dim++;
   }
 }
 
@@ -1895,6 +1960,7 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.fast - a.fast, "while it turned fast");
   part(b.big - a.big, "lamps or windows");
   part(b.other - a.other, "without a headset pose");
+  part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
 }
 
@@ -1925,6 +1991,25 @@ void Sync::Reacquire() {
   double t;
   if (poses_.Latest(p, &t)) solver_.PoseBreak(t);
   log_("re-acquire asked for: older sightings dropped");
+}
+
+// One or two base stations leave the level to SteamVR, and the cameras can't fix it (gravity.h); with three, an
+// automatic frame is levelled by the cameras (LevelStep)
+bool Sync::GravityFrame(M3 &C, M3 &turn, std::string &key) {
+  if (!sfile_.loaded || frame_.ok() != 1) return false;
+  size_t n;
+  {
+    std::lock_guard<std::mutex> g(raw_m_);
+    n = raw_.size();
+  }
+  if (sfile_.autogen && n >= (size_t)Solver::LEVEL_STATIONS) return false;
+  C = frame_.Anchored();
+  V3 t;
+  frame_.Rotation(turn, t);
+  turn = turn * T(C);
+  Quat q = ToQuat(sfile_.anchor_R);
+  key = Fmt("%s %.5f %.5f %.5f %.5f", sfile_.anchor.c_str(), q.w, q.x, q.y, q.z);
+  return true;
 }
 
 // An automatic reference frame is SteamVR's frame as it was when the anchor was first seen, tilt and all. The headset
@@ -2070,7 +2155,7 @@ Transform Sync::Tick(double now) {
           solver_.has_x() ? Fmt("%+.4f %.4f %.4f %.4f", x[0] * kDeg, x[1], x[2], x[3]).c_str() : "-", st.n,
           st.has_med ? Fmt("%.4f", st.med).c_str() : "None", per.c_str(), st.cond ? " cond" : "", st.jump ? " JUMP" : "");
     }
-    if (solver_.has_x() && st.cond && st.has_med && st.med < 0.3 && now - last_save_ > 10) {
+    if (Locked(solver_.has_x(), st) && st.cond && st.has_med && st.med < 0.3 && now - last_save_ > 10) {
       last_save_ = now;
       SaveState(x, cs);
     }
@@ -2167,6 +2252,24 @@ Sync::Status Sync::GetStatus(double now) {
   double th;
   V3 h;
   s.head_still = poses_.Latest(h, &th) && poses_.Still(th);
+  // still for kFrozen s while the lamps and windows the cameras see keep moving: SteamVR's pose isn't the head's
+  if (!s.head_still || !(cam_fps_ > 5)) still_since_ = -1;
+  else if (still_since_ < 0) still_since_ = now;
+  long moved, stayed;
+  {
+    std::lock_guard<std::mutex> g(net_);
+    moved = img_moved_;
+    stayed = img_still_;
+  }
+  bool frozen = still_since_ >= 0 && now - still_since_ >= kFrozen && moved >= 20 && moved > 3 * stayed;
+  if (frozen) {
+    s.head_still = 2;
+    if (!frozen_said_)
+      log_(Fmt("SteamVR's headset pose hasn't moved for %.0f s while the cameras see the room move (%ld lamp or window "
+               "spots moved, %ld stayed): SteamVR isn't getting the head's motion. Is its view in the headset?",
+               now - still_since_, moved, stayed));
+  }
+  frozen_said_ = frozen || (frozen_said_ && still_since_ >= 0);
   s.has_x = solver_.has_x();
   s.x = solver_.x();
   s.expo = expo_;

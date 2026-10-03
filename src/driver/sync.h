@@ -44,6 +44,12 @@ constexpr int kTimingFirstN = 200;      // such sightings before the first (wide
 constexpr int kTimingNextN = 40;        // ... before each later one
 constexpr int kTimingFullN = 270;       // a later estimate moves the timing all the way from this many on
 constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a laser dot
+// blobs this bright: a base station's dot, or a lamp. Dimmer ones (module 1.6 on) are mostly other lights, a few
+// percent station dots: they count only in a room too light for the dots to saturate (Solver::starved), and then in
+// the running fit only within Solver::INLIER of a station
+constexpr int kBright = 250;
+constexpr int kLampPx = 20;             // blobs this big are steady lights (the frozen-pose check)
+constexpr double kFrozen = 10.0;        // s: SteamVR's headset this still while the cameras see the room move
 constexpr double kKeep = 600.0;         // s of rays kept
 constexpr double kMoved = 0.25;         // m: SteamVR has a measured station this far off: it was moved
 constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much against the reference
@@ -164,6 +170,8 @@ struct StationsFile {
   bool SaveAuto(const std::string &path) const;
 };
 
+// SteamVR's lighthouse frame -> the reference frame: the anchor's pose pins it, then the level (three stations'
+// sightings) or gravity's tilt (gravity.h)
 class Frame {
  public:
   explicit Frame(const StationsFile &f, LogFn log) : f_(f), log_(std::move(log)) {}
@@ -172,13 +180,19 @@ class Frame {
   // before the level: what recordings hold, so a replay with the same stations.json levels them once
   void Unlevelled(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + Cs_ * (p - o_); Ro = Cs_ * R; }
   void Rotation(M3 &C, V3 &t) const { C = C_; t = oref_ - C_ * o_; }  // p_ref = C p_raw + t
+  // levelled by gravity (gravity.h): tilt after the level; from the next Update
+  void SetGravity(bool on, const M3 &tilt) { grav_ = on; G_ = tilt; }
+  const M3 &gravity() const { return GC_; }  // the tilt in C_ (none: identity)
+  M3 Anchored() const { return f_.level * Cs_; }  // SteamVR's frame -> the reference frame, before gravity's tilt
   int ok() const { return ok_; }
   double deg() const { return deg_; }
 
  private:
   const StationsFile &f_;
   LogFn log_;
-  M3 C_, Cs_;  // SteamVR's frame -> the reference frame, with and without the level
+  M3 C_, Cs_;  // SteamVR's frame -> the reference frame, with (and gravity's tilt) and without the level
+  M3 G_, GC_;
+  bool grav_ = false;
   V3 o_, oref_;
   int ok_ = -1;
   double deg_ = 0;
@@ -215,9 +229,9 @@ class Solver {
   void SetBody(BodyFn f) { body_ = std::move(f); }
   void Reset(const X4 &x);
   // g: the frame's time on the headset's clock (NaN until the frame grid is known)
-  void Add(double t, V3 o, V3 d, double g, int cam);
+  void Add(double t, V3 o, V3 d, double g, int cam, bool bright);
   void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
-               const std::vector<double> &G, const std::vector<int> &C);  // rays >= from
+               const std::vector<double> &G, const std::vector<int> &C, const std::vector<char> &B);  // rays >= from
   void SetStation(const std::string &serial, V3 p, const M3 &R);
   void SetChannel(const std::string &serial, int channel);
   void SetFramePeriod(double p) { frame_p_ = p; }  // s between short frames
@@ -226,6 +240,7 @@ class Solver {
   void PoseBreak(double t);
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
+  bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
   // stations (sorted by serial) as the solver uses them
@@ -246,6 +261,7 @@ class Solver {
     std::vector<double> T, G;
     std::vector<V3> O, D;
     std::vector<int> C;
+    std::vector<char> B;  // 1: peak >= kBright
     size_t size() const { return T.size(); }
   };
   struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; M3 tilt; };
@@ -254,6 +270,7 @@ class Solver {
   std::vector<double> rt_, rg_;
   std::vector<V3> ro_, rd_;
   std::vector<int> rc_;
+  std::vector<char> rb_;
   std::map<std::string, std::pair<V3, M3>> S_;
   std::map<std::string, int> ch_;
   std::map<std::string, V3> fix_;
@@ -273,19 +290,27 @@ class Solver {
   int resets_ = 0;
   BodyFn body_;
   bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
+  bool acq_dim_ = false;     // ... was found on dim rays too (Bright): it needs twice the support
+  std::atomic<bool> starved_{false};  // the recent rays are under 5% bright, of 200 or more (see Bright)
+  static bool Starved(const Rays &r);
+  double DimGate() const { return starved_ ? INLIER : -1; }
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
 
   Rays GetRays(double t0);
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
   static int Score(const std::vector<int> &c);
   static void Cells(const Rays &r, const std::vector<char> &use, std::vector<int> &cnt);
-  // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt
+  // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt. dim_gate: the gate for rays
+  // dimmer than kBright, when narrower
   FitR Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now, double gate,
-           const X4 *xa, const V3 *pivot = nullptr);
+           const X4 *xa, const V3 *pivot = nullptr, double dim_gate = 180);
   void Hypotheses(const Rays &r, const std::vector<V3> &S, std::vector<X4> &H, int M = 4000);
   void BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
                     const std::vector<int> &idx, double gate, std::vector<int> &out) const;
   static Rays Thin(const Rays &r);
+  // r's bright rays (kBright): dim ones are mostly other lights, and can make a wrong alignment look supported. All
+  // of r when bright ones are under 5% of 200 or more: a room too light for the dots to saturate
+  static Rays Bright(const Rays &r);
   bool Acquire(double now, X4 &best, int &bs, int &tight);
   int ThinnedScore(const X4 &x, double now);
   // 1: the lighthouse devices worn or held say a, 2: b, 0: they don't tell (da, db: their distance from the head, m)
@@ -298,8 +323,9 @@ class Solver {
 // ---------------------------------------------------------------- timing
 class Timing {
  public:
-  struct Rec { double tg; V3 od, dd; double hg; int cam; };  // grid time (PC s), device-frame ray, headset grid time
-  void Record(double tg, V3 od, V3 dd, double hg, int cam);
+  struct Rec { double tg; V3 od, dd; double hg; int cam; bool bright; };  // grid time (PC s), device-frame ray,
+                                                                          // headset grid time, peak >= kBright
+  void Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright);
   const std::deque<Rec> &recs() const { return rec_; }
   // grid search of the offset on fast-head sightings against the current alignment: true if it found one
   bool Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
@@ -340,6 +366,10 @@ class Sync {
   void ForceExpo(double e) { expo_ = e; }
   // commands
   void Reacquire();
+  // a reference frame to level by gravity (gravity.h): SteamVR's frame -> the reference frame before gravity's tilt
+  // (rotation), the frame's turn on top of that now, and which reference frame (key). False when the cameras level it
+  bool GravityFrame(M3 &C, M3 &turn, std::string &key);
+  void SetGravity(bool on, const M3 &tilt) { frame_.SetGravity(on, tilt); }  // the driver's worker thread, as Tick
   void SetPaused(bool p) { paused_ = p; }
   bool paused() const { return paused_; }
   // status
@@ -347,14 +377,14 @@ class Sync {
     bool has_x = false, locked = false, cond = false, timing_learned = false;
     X4 x{};
     double med = -1, expo = 0, rtt = 0, cam_fps = 0, spot_rate = 0, sight_rate = 0, lag_cm = 0, locked_for = -1;
-    bool head_still = false;
+    int head_still = 0;  // 1: still for 2 s; 2: still for kFrozen s while the cameras see the room move
     int n = 0, nstations = 0;
     struct St { std::string serial; int support = 0; bool anchor = false, measured = false; double last_seen = -1, dist = 0; };
     std::vector<St> st;
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
@@ -400,6 +430,10 @@ class Sync {
   bool has_last_st_ = false;
   std::atomic<long> nframes_{0};
   Spots spots_;  // under net_
+  std::map<int, std::vector<std::pair<double, double>>> prev_big_;  // under net_: each camera's last steady lights
+  long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
+  double still_since_ = -1;
+  bool frozen_said_ = false;
   double rate_t_ = 0, cam_fps_ = 0, spot_rate_ = 0, sight_rate_ = 0;
   long rate_f_ = 0;
   Spots rate_sp_;

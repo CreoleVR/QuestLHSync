@@ -17,9 +17,9 @@ if not exist %OUT% mkdir %OUT%
 if /i "%1"=="overlay" goto overlay
 cl /nologo /LD /O2 /EHsc /std:c++17 /MT /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS ^
   /I%OVR%\headers /I%MH%\include /Fobuild\driver\ ^
-  src\driver\driver_main.cpp src\driver\sync.cpp src\driver\net.cpp ^
+  src\driver\driver_main.cpp src\driver\sync.cpp src\driver\net.cpp src\driver\gravity.cpp ^
   %MH%\src\buffer.c %MH%\src\hook.c %MH%\src\trampoline.c %MH%\src\hde\hde64.c ^
-  /Fe:%OUT%\driver_questlhsync.dll /link /NOLOGO ws2_32.lib iphlpapi.lib shell32.lib ole32.lib || exit /b 1
+  /Fe:%OUT%\driver_questlhsync.dll /link /NOLOGO ws2_32.lib iphlpapi.lib shell32.lib ole32.lib setupapi.lib hid.lib || exit /b 1
 del %OUT%\driver_questlhsync.exp %OUT%\driver_questlhsync.lib 2>nul
 echo built %OUT%\driver_questlhsync.dll
 :overlay

@@ -1,7 +1,8 @@
 // qlhs_replay: run a QuestLHSync recording through the driver's Sync, as if live.
 //   qlhs_replay <log> --calib <camera calibration json> --dir <state dir> [--out file] [--learn] [--expo s]
-//               [--learn-grid]
-// Logs without clock round trips use the arrival envelope clock and EXPO 0.020.
+//               [--learn-grid] [--pings]
+// Logs without clock round trips use the arrival envelope clock and EXPO 0.020. --pings: the round trips alone, like the
+// live driver (QuestLHSync recordings have them).
 // --learn: round-trip-less logs still learn the timing (starting from --expo), to test the estimator.
 // --learn-grid: learn the cameras' frame period as for headsets other than the Quest Pro, to test that.
 // --channel SERIAL=N: a base station's channel, for older logs.
@@ -17,7 +18,7 @@
 
 int main(int argc, char **argv) {
   std::string log, calib, dir, outp;
-  bool learn = false, learn_grid = false;
+  bool learn = false, learn_grid = false, pings = false;
   double expo = -1;
   std::map<std::string, int> chans;
   for (int i = 1; i < argc; i++) {
@@ -33,6 +34,7 @@ int main(int argc, char **argv) {
     else if (a == "--expo" && i + 1 < argc) expo = atof(argv[++i]);
     else if (a == "--learn") learn = true;
     else if (a == "--learn-grid") learn_grid = true;
+    else if (a == "--pings") pings = true;
     else log = a;
   }
   if (log.empty() || calib.empty()) { fprintf(stderr, "usage: qlhs_replay <log> --calib file --dir statedir [--out f] [--learn] [--expo s]\n"); return 2; }
@@ -43,7 +45,7 @@ int main(int argc, char **argv) {
   auto logfn = [&](const std::string &s) { printf("%6.0fs    %s\n", tnow - t0, s.c_str()); };
   SyncConfig cfg;
   cfg.dir = dir;
-  cfg.arrival_clock = true;
+  cfg.arrival_clock = !pings;
   cfg.learn_timing = learn;
   cfg.learn_grid = learn_grid;
   Sync sync(cfg, logfn);

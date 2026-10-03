@@ -4,6 +4,7 @@
 		"host" : "",
 		"headset" : "",
 		"anyHmd" : false,
-		"record" : false
+		"record" : false,
+		"gravity" : true
 	}
 }

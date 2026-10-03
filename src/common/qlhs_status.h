@@ -8,7 +8,7 @@
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
 #define QLHS_VERSION 2
-#define QLHS_RELEASE "1.5"  // magisk/build_module.py reads it
+#define QLHS_RELEASE "1.6"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
@@ -55,7 +55,8 @@ struct QlhsStatus {
   double cam_fps;       // camera frames/s: the Quest's side cameras (all four from module v1.0), the Frame's four
   double sight_rate;    // bright spots/s the alignment uses
   double spot_rate;     // bright spots/s the cameras see
-  int32_t head_still, pad2;  // 1: the headset hasn't moved for 2 s, its frames wait
+  int32_t head_still, pad2;  // 1: the headset hasn't moved for 2 s, its frames wait; 2: for 10 s while its cameras
+                             // see the room move (SteamVR isn't getting the head's motion)
   double rtt_ms;        // network round trip (clock sync)
   double expo_ms;       // frame grid -> pose time
   int32_t expo_learned, pad0;
