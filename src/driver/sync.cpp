@@ -153,6 +153,22 @@ bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
   return true;
 }
 
+bool Optics::Pose(int cam, M3 &R, V3 &t) const {
+  if (cam < 0 || cam >= kMaxCam || !cams_[cam].valid) return false;
+  R = cams_[cam].R;
+  t = cams_[cam].t;
+  return true;
+}
+
+bool Optics::InImage(int cam, V3 dc, double margin) const {
+  if (cam < 0 || cam >= kMaxCam || !cams_[cam].valid || !(dc.z > 0.05)) return false;
+  const CamCal &c = cams_[cam];
+  double u, v;
+  c.Dist(dc.x / dc.z, dc.y / dc.z, u, v);
+  double x = c.cx + c.f * u / c.ir, y = c.cy + c.f * v / c.ir;
+  return x >= margin && y >= margin && x <= c.w - margin && y <= c.h - margin;
+}
+
 // ================================================================ frame grid, clock
 static double PyMod(double a, double m) {
   double r = std::fmod(a, m);
@@ -440,20 +456,35 @@ void Solver::Reset(const X4 &x) {
   x_ = x; has_x_ = true;
   resets_++;
   anchor_ = x; has_anchor_ = true;
+  id_said_.clear();
 }
 
-void Solver::Add(double t, V3 o, V3 d) {
+void Solver::Add(double t, V3 o, V3 d, double gt, int cam) {
   std::lock_guard<std::mutex> g(m_);
-  rt_.push_back(t); ro_.push_back(o); rd_.push_back(d);
+  rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam);
 }
 
-void Solver::Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D) {
+void Solver::Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
+                     const std::vector<double> &G, const std::vector<int> &C) {
   std::lock_guard<std::mutex> g(m_);
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), from) - rt_.begin();
-  rt_.resize(j); ro_.resize(j); rd_.resize(j);
+  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j);
   rt_.insert(rt_.end(), T.begin(), T.end());
   ro_.insert(ro_.end(), O.begin(), O.end());
   rd_.insert(rd_.end(), D.begin(), D.end());
+  rg_.insert(rg_.end(), G.begin(), G.end());
+  rc_.insert(rc_.end(), C.begin(), C.end());
+}
+
+void Solver::SetChannel(const std::string &serial, int channel) {
+  std::lock_guard<std::mutex> g(m_);
+  ch_[serial] = channel;
+}
+
+void Solver::AddFrame(double t, double gt, int cam, V3 o, const M3 &R) {
+  std::lock_guard<std::mutex> g(m_);
+  frames_.push_back({t, gt, cam, o, R});
+  while (frames_.front().t < t - kKeep) frames_.pop_front();
 }
 
 void Solver::SetStation(const std::string &serial, V3 p, const M3 &R) {
@@ -477,12 +508,16 @@ Solver::Rays Solver::GetRays(double t0) {
     rt_.erase(rt_.begin(), rt_.begin() + j);
     ro_.erase(ro_.begin(), ro_.begin() + j);
     rd_.erase(rd_.begin(), rd_.begin() + j);
+    rg_.erase(rg_.begin(), rg_.begin() + j);
+    rc_.erase(rc_.begin(), rc_.begin() + j);
   }
   Rays r;
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), t0) - rt_.begin();
   r.T.assign(rt_.begin() + j, rt_.end());
   r.O.assign(ro_.begin() + j, ro_.end());
   r.D.assign(rd_.begin() + j, rd_.end());
+  r.G.assign(rg_.begin() + j, rg_.end());
+  r.C.assign(rc_.begin() + j, rc_.end());
   return r;
 }
 
@@ -914,6 +949,175 @@ void Solver::PoseBreak(double t) {
   has_acq_x_ = false;
 }
 
+// ================================================================ station identity
+// A 2.0 base station's rotor period is set by its channel (ticks of 48 MHz). A short frame sees a station only in
+// part of its rotor turn, so which frames see it tells the stations apart where the geometry can't.
+static const int kRotorTicks[16] = {959000, 957000, 953000, 949000, 947000, 943000, 941000, 939000,
+                                    937000, 929000, 919000, 911000, 907000, 901000, 893000, 887000};
+
+double RotorPeriod(int channel) { return channel >= 1 && channel <= 16 ? kRotorTicks[channel - 1] / 48e6 : 0; }
+
+struct InView { int cam; double g; bool seen; };  // a short frame a station was in view of
+
+// turns/s the phase at period tau moves from one short frame to the next
+static double Drift(double tau, double P) {
+  double f = std::fmod(P / tau, 1.0);
+  return std::min(f, 1 - f) / P;
+}
+
+// How much seeing a station (in the frames it was in view of, sorted by camera, time) follows the phase at each
+// period, over fake periods near it. Both on the same per-camera windows of whole turns of the slower drift. False if
+// too few frames.
+static bool SeenScores(const std::vector<InView> &s, double tau1, double tau2, double P, double &s1, double &s2) {
+  const double kTurns = 2, kEps[] = {0.0015, 0.0025, 0.0035, 0.0045, 0.0055, 0.0065, 0.0075, 0.0085};
+  const int kMinN = 60, kMinSeen = 20;
+  s1 = s2 = 0;
+  double rate = std::min(Drift(tau1, P), Drift(tau2, P));
+  if (!(rate > 0)) return false;
+  double W = std::max(20.0, (kTurns + 1) / rate);
+  struct Win { size_t a, b; double p; };  // frames [a, b), share seen
+  std::vector<Win> win;
+  int n = 0, ns = 0;
+  for (size_t i = 0; i < s.size();) {
+    size_t j = i;
+    while (j < s.size() && s[j].cam == s[i].cam && s[j].g < s[i].g + W) j++;
+    double turns = std::floor((s[j - 1].g - s[i].g) * rate);
+    if (turns >= kTurns) {
+      size_t k = i;
+      int seen = 0;
+      for (; k < j && s[k].g < s[i].g + turns / rate; k++) seen += s[k].seen;
+      if (seen > 0 && seen < (int)(k - i)) {
+        win.push_back({i, k, seen / (double)(k - i)});
+        n += (int)(k - i);
+        ns += seen;
+      }
+    }
+    i = j;
+  }
+  if (n < kMinN || ns < kMinSeen) return false;
+  auto R = [&](double T) {
+    double tot = 0;
+    for (auto &w : win) {
+      double c = 0, sn = 0, g0 = s[w.a].g;
+      for (size_t k = w.a; k < w.b; k++) {
+        double a = 2 * kPi * (s[k].g - g0) / T, e = s[k].seen - w.p;
+        c += e * std::cos(a);
+        sn += e * std::sin(a);
+      }
+      tot += std::hypot(c, sn);
+    }
+    return tot / n;
+  };
+  auto score = [&](double tau) {
+    double null = 0;
+    for (double e : kEps) null += R(tau * (1 + e)) + R(tau * (1 - e));
+    return std::max(0.0, R(tau) - null / (2 * (sizeof kEps / sizeof kEps[0])));
+  };
+  s1 = score(tau1);
+  s2 = score(tau2);
+  return true;
+}
+
+// yaw + translation taking points S onto Q, least squares
+static X4 YawFit(const std::vector<V3> &S, const std::vector<V3> &Q) {
+  V3 ms, mq;
+  for (size_t i = 0; i < S.size(); i++) { ms += S[i]; mq += Q[i]; }
+  ms = ms * (1.0 / S.size()); mq = mq * (1.0 / S.size());
+  double sn = 0, cs = 0;
+  for (size_t i = 0; i < S.size(); i++) {
+    V3 a = S[i] - ms, b = Q[i] - mq;
+    sn += a.z * b.x - a.x * b.z;
+    cs += a.z * b.z + a.x * b.x;
+  }
+  double yaw = std::atan2(sn, cs);
+  V3 t = mq - Ry(yaw) * ms;
+  return {yaw, t.x, t.y, t.z};
+}
+
+// A pair of stations whose sightings follow each other's rotor periods better than their own is swapped: switch to
+// the alignment with the two exchanged if it fits the rays about as well.
+void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S,
+                           const std::vector<V3> &Z) {
+  double P = frame_p_;
+  if (!(P > 0) || keys.size() < 2) return;
+  std::vector<double> tau(keys.size(), 0.0);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (size_t k = 0; k < keys.size(); k++) {
+      auto it = ch_.find(keys[k]);
+      if (it != ch_.end()) tau[k] = RotorPeriod(it->second);
+    }
+  }
+  if (!in_image_) return;
+  Rays r = GetRays(since_);
+  std::vector<CamFrame> fr;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &f : frames_)
+      if (f.t >= since_) fr.push_back(f);
+  }
+  std::vector<V3> Pq, Zq;
+  Predict(x_, S, Z, Pq, Zq);
+  std::vector<std::set<std::pair<int, double>>> saw(keys.size());  // (camera, frame) with a sighting within 1 deg
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!std::isfinite(r.G[n])) continue;
+    int k;
+    double a;
+    Nearest(Pq, Zq, r.O[n], r.D[n], k, a);
+    if (a < 1.0) saw[k].insert({r.C[n], r.G[n]});
+  }
+  std::vector<std::vector<InView>> in(keys.size());
+  for (auto &f : fr)
+    for (size_t k = 0; k < keys.size(); k++) {
+      V3 U = Pq[k] - f.o;
+      double d = norm(U);
+      if (!(dot(U, Zq[k]) >= 0.2 * d) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
+      in[k].push_back({f.cam, f.g, saw[k].count({f.cam, f.g}) > 0});
+    }
+  for (auto &v : in)
+    std::sort(v.begin(), v.end(), [](const InView &a, const InView &b) { return a.cam != b.cam ? a.cam < b.cam : a.g < b.g; });
+  double worst = 0, best = 0;
+  size_t wa = 0, wb = 0, ba = 0, bb = 0;
+  for (size_t a = 0; a < keys.size(); a++)
+    for (size_t b = a + 1; b < keys.size(); b++) {
+      if (!tau[a] || !tau[b] || tau[a] == tau[b]) continue;
+      double aa, ab, bb_, ba_;
+      if (!SeenScores(in[a], tau[a], tau[b], P, aa, ab) || !SeenScores(in[b], tau[b], tau[a], P, bb_, ba_)) continue;
+      double gain = ab + ba_ - aa - bb_;
+      if (gain > worst) { worst = gain; wa = a; wb = b; }
+      if (gain < best) { best = gain; ba = a; bb = b; }
+    }
+  auto say = [&](const std::string &key, const std::string &s) {  // once per alignment
+    if (key == id_said_) return;
+    id_said_ = key;
+    log_(s);
+  };
+  if (worst > kSwapGain) {
+    std::vector<V3> Q = Pq;
+    std::swap(Q[wa], Q[wb]);
+    X4 xs = YawFit(S, Q);
+    for (double gate : {1.5, 0.6}) {
+      FitR f = Fit(xs, S, Z, r, now, gate, nullptr);
+      if (!f.ok) break;
+      xs = f.x;
+    }
+    int cur = ThinnedScore(x_, now), sw = ThinnedScore(xs, now);
+    std::string pair = keys[wa] + " and " + keys[wb];
+    if (cur > 0 && sw >= kSwapFit * cur) {
+      log_(Fmt("channel check: %s were the wrong way round (by %.2f): yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)",
+               pair.c_str(), worst, xs[0] * kDeg, xs[1], xs[2], xs[3], sw, cur));
+      Reset(xs);
+      has_acq_x_ = false;
+    } else {
+      say("kept " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but the rays fit that way worse "
+                              "(support %d vs %d): kept as it is", pair.c_str(), worst, sw, cur));
+    }
+  } else if (best < -kSwapGain) {
+    say("ok " + keys[ba] + keys[bb], Fmt("channel check: %s are the right way round (by %.2f)",
+                                         (keys[ba] + " and " + keys[bb]).c_str(), -best));
+  }
+}
+
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
 StepStat Solver::Step(double /*now*/) {
   std::vector<std::string> keys;
@@ -976,6 +1180,10 @@ StepStat Solver::Step(double /*now*/) {
       if (!in.empty()) { st.has_med = true; st.med = Median(in); }
     }
   }
+  if (has_x_ && now - last_id_ >= kIdEvery) {
+    last_id_ = now;
+    CheckIdentity(now, keys, S, Z);
+  }
   bool locked = false;
   if (has_x_ && st.has_per) {
     std::vector<int> c;
@@ -1002,8 +1210,8 @@ StepStat Solver::Step(double /*now*/) {
 }
 
 // ================================================================ timing
-void Timing::Record(double tg, V3 od, V3 dd) {
-  rec_.push_back({tg, od, dd});
+void Timing::Record(double tg, V3 od, V3 dd, double hg, int cam) {
+  rec_.push_back({tg, od, dd, hg, cam});
   while (!rec_.empty() && (rec_.front().tg < tg - 120 || rec_.size() > 20000)) rec_.pop_front();
 }
 
@@ -1167,8 +1375,9 @@ bool Timing::Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> 
 void Sync::Retime(double old_e, double new_e) {
   const auto &rec = timing_.recs();
   if (rec.empty()) return;
-  std::vector<double> T;
+  std::vector<double> T, G;
   std::vector<V3> O, D;
+  std::vector<int> C;
   for (auto &r : rec) {
     double t = r.tg - new_e, w;
     M3 R;
@@ -1177,8 +1386,10 @@ void Sync::Retime(double old_e, double new_e) {
     T.push_back(t);
     O.push_back(p + R * r.od);
     D.push_back(R * r.dd);
+    G.push_back(r.hg);
+    C.push_back(r.cam);
   }
-  solver_.Replace(rec.front().tg - old_e, T, O, D);
+  solver_.Replace(rec.front().tg - old_e, T, O, D, G, C);
 }
 
 static std::string Join(const std::string &dir, const char *name) {
@@ -1197,6 +1408,10 @@ Sync::Sync(SyncConfig cfg, LogFn log)
     : cfg_(std::move(cfg)), log_(std::move(log)), sfile_(LoadStations(cfg_.dir)), frame_(sfile_, log_),
       solver_(log_, 1, sfile_.autogen ? std::map<std::string, V3>() : sfile_.fix) {
   if (cfg_.arrival_clock) expo_ = kExpoArrival;
+  solver_.SetInImage([this](int cam, V3 d) {
+    std::lock_guard<std::mutex> g(net_);
+    return have_optics_ && optics_.InImage(cam, d, 8.0);
+  });
   if (sfile_.loaded)
     log_(Fmt("reference frame: anchor %s%s, %d measured station(s)", sfile_.anchor.c_str(),
              sfile_.autogen ? " (automatic)" : "", (int)sfile_.fix.size()));
@@ -1263,20 +1478,10 @@ bool Sync::Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss) {
     if (it != quest_.end()) { S.push_back(kv.second); Q.push_back(it->second); }
   }
   if (S.size() < 2) return false;
-  V3 ms, mq;
-  for (size_t i = 0; i < S.size(); i++) { ms += S[i]; mq += Q[i]; }
-  ms = ms * (1.0 / S.size()); mq = mq * (1.0 / S.size());
-  double sn = 0, cs = 0;
-  for (size_t i = 0; i < S.size(); i++) {
-    V3 a = S[i] - ms, b = Q[i] - mq;
-    sn += a.z * b.x - a.x * b.z;
-    cs += a.z * b.z + a.x * b.x;
-  }
-  double yaw = std::atan2(sn, cs);
-  V3 t = mq - Ry(yaw) * ms;
+  x = YawFit(S, Q);
+  V3 t{x[1], x[2], x[3]};
   miss = 0;
-  for (size_t i = 0; i < S.size(); i++) miss = std::max(miss, norm(Ry(yaw) * S[i] + t - Q[i]));
-  x = {yaw, t.x, t.y, t.z};
+  for (size_t i = 0; i < S.size(); i++) miss = std::max(miss, norm(Ry(x[0]) * S[i] + t - Q[i]));
   return true;
 }
 
@@ -1366,7 +1571,9 @@ void Sync::OnLine(double pc, const char *line) {
       was = p;
     }
   }
-  if (nb <= 0 || !have_optics_) return;
+  if (nb < 0 || !have_optics_) return;
+  double hg = have_lag ? hs - lag : std::numeric_limits<double>::quiet_NaN();  // frame time, headset clock
+  if (have_lag) solver_.SetFramePeriod(grid_.period(cam));
   double grid_pc;
   if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) return;
   double expo = expo_;
@@ -1375,6 +1582,10 @@ void Sync::OnLine(double pc, const char *line) {
   double w;
   if (!poses_.At(t, R, p) || !poses_.Speed(t, w) || poses_.Still(t)) return;
   double wmax = (cfg_.learn_timing && !timing_learned_) ? kWmaxUntimed : kWmax;
+  M3 Rc;
+  V3 tc;
+  if (have_lag && w <= wmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
+  if (nb == 0) return;
   const char *s = line + off;
   for (int i = 0; i < nb; i++) {
     int x10, y10, npx, peak, used = 0;
@@ -1383,14 +1594,14 @@ void Sync::OnLine(double pc, const char *line) {
     if (npx > kMaxPx) continue;
     V3 o, d;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) continue;
-    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d);
+    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f\n", t, cam, O.x, O.y, O.z, D.x, D.y,
               D.z, p.x, p.y, p.z, w);
     }
     if (w > wmax) continue;
-    solver_.Add(t, p + R * o, R * d);
+    solver_.Add(t, p + R * o, R * d, hg, cam);
     nsight_++;
   }
 }
@@ -1411,6 +1622,11 @@ void Sync::SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw) {
   raw_ = ok;
 }
 
+void Sync::SetChannels(const std::map<std::string, int> &ch) {
+  std::lock_guard<std::mutex> g(raw_m_);
+  channels_ = ch;
+}
+
 void Sync::Reacquire() {
   // like a pose break: older sightings no longer count, acquisition looks again at once
   V3 p;
@@ -1429,10 +1645,13 @@ Transform Sync::Tick(double now) {
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
     }
     std::map<std::string, std::pair<V3, M3>> raw;
+    std::map<std::string, int> chans;
     {
       std::lock_guard<std::mutex> g(raw_m_);
       raw = raw_;
+      chans = channels_;
     }
+    for (auto &kv : chans) solver_.SetChannel(kv.first, kv.second);
     if (!sfile_.loaded && !raw.empty()) {  // first run: pin the reference frame to the station at SteamVR's origin
       auto best = raw.begin();
       for (auto it = raw.begin(); it != raw.end(); ++it)
@@ -1460,7 +1679,9 @@ Transform Sync::Tick(double now) {
       solver_.SetStation(kv.first, p, R);
       if (now - last_s_ >= 10) {
         Quat q = ToQuat(R);
-        Rec(now, "S %s %.5f %.5f %.5f %.5f %.5f %.5f %.5f", kv.first.c_str(), p.x, p.y, p.z, q.w, q.x, q.y, q.z);
+        auto c = chans.find(kv.first);
+        Rec(now, "S %s %.5f %.5f %.5f %.5f %.5f %.5f %.5f %d", kv.first.c_str(), p.x, p.y, p.z, q.w, q.x, q.y, q.z,
+            c == chans.end() ? 0 : c->second);
       }
     }
     if (now - last_s_ >= 10 && !raw.empty()) last_s_ = now;

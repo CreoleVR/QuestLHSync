@@ -108,7 +108,14 @@ static bool ReadXf(Xf &x) {
 enum Kind { kUnknown = 0, kLighthouse = 1, kOther = 2, kHmd = 3 };
 static std::atomic<int> g_kind[vr::k_unMaxTrackedDeviceCount];
 static std::atomic<int> g_hmd{-1};             // the eligible HMD's index
-struct StationPose { char serial[32]; int cls; std::atomic<uint32_t> seq; double p[3]; double q[4]; };
+struct StationPose {
+  char serial[32];
+  int cls;
+  std::atomic<int> channel;  // 0 unknown
+  std::atomic<uint32_t> seq;
+  double p[3];
+  double q[4];
+};
 static StationPose g_dev[vr::k_unMaxTrackedDeviceCount];
 static std::atomic<long long> g_hooked{0}, g_moved{0};
 
@@ -299,7 +306,9 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (++tick_ % 45) return;  // classify devices about twice a second
     auto *props = vr::VRProperties();
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
-      if (g_kind[i].load() != kUnknown) continue;
+      int kind = g_kind[i].load();
+      if (kind == kLighthouse && g_dev[i].cls == vr::TrackedDeviceClass_TrackingReference) ReadChannel(i);
+      if (kind != kUnknown) continue;
       auto c = props->TrackedDeviceToPropertyContainer(i);
       if (c == vr::k_ulInvalidPropertyContainer) continue;
       std::string sys = GetStr(c, vr::Prop_TrackingSystemName_String);
@@ -312,6 +321,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         g_dev[i].cls = cls;
         g_kind[i] = kLighthouse;
         Log(Fmt("device %u: %s %s (%s) -> moved", i, sys.c_str(), serial.c_str(), model.c_str()));
+        if (cls == vr::TrackedDeviceClass_TrackingReference) ReadChannel(i);
         continue;
       }
       if (cls == vr::TrackedDeviceClass_HMD && g_hmd.load() < 0) {
@@ -343,6 +353,19 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       }
       g_kind[i] = kOther;
     }
+  }
+
+  // a 2.0 base station's mode label is its channel, "1".."16"
+  void ReadChannel(uint32_t i) {
+    auto c = vr::VRProperties()->TrackedDeviceToPropertyContainer(i);
+    if (c == vr::k_ulInvalidPropertyContainer) return;
+    std::string label = GetStr(c, vr::Prop_ModeLabel_String);
+    int ch = 0;
+    if (!label.empty() && std::all_of(label.begin(), label.end(), [](char x) { return isdigit((unsigned char)x); }))
+      ch = atoi(label.c_str());
+    if (ch < 1 || ch > 16) ch = 0;
+    if (ch != g_dev[i].channel.exchange(ch) && !label.empty())
+      Log(Fmt("base station %s: channel %s", g_dev[i].serial, label.c_str()));
   }
 
   bool ShouldBlockStandbyMode() override { return false; }
@@ -439,9 +462,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
 
   void Stations() {
     std::map<std::string, std::pair<V3, M3>> raw;
+    std::map<std::string, int> chans;
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
       if (g_kind[i].load() != kLighthouse || g_dev[i].cls != vr::TrackedDeviceClass_TrackingReference) continue;
       StationPose &d = g_dev[i];
+      if (int ch = d.channel.load()) chans[d.serial] = ch;
       for (int tries = 0; tries < 8; tries++) {
         uint32_t s = d.seq.load(std::memory_order_acquire);
         if (s == 0 || (s & 1)) { Sleep(0); continue; }
@@ -455,6 +480,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       }
     }
     g_sync->SetStationsRaw(raw);
+    g_sync->SetChannels(chans);
   }
 
   void Commands() {

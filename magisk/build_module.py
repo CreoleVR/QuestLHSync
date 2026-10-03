@@ -16,7 +16,7 @@ import sys
 import urllib.request
 import zipfile
 
-VERSION, CODE = "v1.2", 3
+VERSION, CODE = "v1.3", 4
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(os.path.dirname(HERE), "out")
 # 17.10.0 android-arm64, the build lhsight was developed on. 17.19.0 crashed the sensors HAL on injection (SIGSEGV in

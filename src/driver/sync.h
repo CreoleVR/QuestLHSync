@@ -51,6 +51,11 @@ constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much agai
 // itself moves, and plain to see on a controller held in front of a still head
 constexpr double kSlewStill = 0.005, kSlewTurn = 0.0005, kSlewWalk = 0.05;
 constexpr double kJumpApply = 0.25;     // m: bigger corrections apply at once
+// channel check (Solver::CheckIdentity): every kIdEvery s; a pair is swapped when its sightings follow each other's
+// rotor periods better by kSwapGain, and switched if the swapped alignment keeps kSwapFit of the support
+constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kSwapFit = 0.7;
+
+double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 
 // ---------------------------------------------------------------- optics
 struct CamCal {
@@ -68,6 +73,8 @@ class Optics {
  public:
   bool Load(const std::string &json, std::string *err);
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
+  bool Pose(int cam, M3 &R, V3 &t) const;                     // device <- camera
+  bool InImage(int cam, V3 dc, double margin) const;          // a camera-frame direction lands on the image
   const std::string &device() const { return device_; }       // "Seacliff" (Quest Pro), "Eureka" (Quest 3), ...
 
  private:
@@ -184,9 +191,15 @@ class Solver {
 
   Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix);
   void Reset(const X4 &x);
-  void Add(double t, V3 o, V3 d);
-  void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D);  // rays >= from
+  // g: the frame's time on the headset's clock (NaN until the frame grid is known)
+  void Add(double t, V3 o, V3 d, double g, int cam);
+  void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
+               const std::vector<double> &G, const std::vector<int> &C);  // rays >= from
   void SetStation(const std::string &serial, V3 p, const M3 &R);
+  void SetChannel(const std::string &serial, int channel);
+  void SetFramePeriod(double p) { frame_p_ = p; }  // s between short frames
+  void AddFrame(double t, double g, int cam, V3 o, const M3 &R);  // every short frame; camera pose in Quest space
+  void SetInImage(std::function<bool(int cam, V3 d)> f) { in_image_ = std::move(f); }
   void PoseBreak(double t);
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
@@ -201,18 +214,30 @@ class Solver {
   static void Nearest(const std::vector<V3> &P, const std::vector<V3> &Zq, V3 o, V3 d, int &k, double &a);
 
  private:
-  struct Rays { std::vector<double> T; std::vector<V3> O, D; size_t size() const { return T.size(); } };
+  struct Rays {
+    std::vector<double> T, G;
+    std::vector<V3> O, D;
+    std::vector<int> C;
+    size_t size() const { return T.size(); }
+  };
   struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; };
 
   mutable std::mutex m_;
-  std::vector<double> rt_;
+  std::vector<double> rt_, rg_;
   std::vector<V3> ro_, rd_;
+  std::vector<int> rc_;
   std::map<std::string, std::pair<V3, M3>> S_;
+  std::map<std::string, int> ch_;
   std::map<std::string, V3> fix_;
   std::set<std::string> stale_;
   bool has_x_ = false, has_anchor_ = false, has_acq_x_ = false;
   X4 x_{}, anchor_{}, acq_x_{};
-  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18;
+  double since_ = -1e18, brk_ = -1e18, last_acq_ = -1e18, seen_ = -1e18, last_id_ = -1e18;
+  std::atomic<double> frame_p_{0};
+  struct CamFrame { double t, g; int cam; V3 o; M3 R; };
+  std::deque<CamFrame> frames_;
+  std::function<bool(int, V3)> in_image_;
+  std::string id_said_;
   LogFn log_;
   std::mt19937_64 rng_;
   StepStat stat_;
@@ -230,13 +255,14 @@ class Solver {
   static Rays Thin(const Rays &r);
   bool Acquire(double now, X4 &best, int &bs, int &tight);
   int ThinnedScore(const X4 &x, double now);
+  void CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
 };
 
 // ---------------------------------------------------------------- timing
 class Timing {
  public:
-  struct Rec { double tg; V3 od, dd; };  // grid time (PC s), device-frame origin and ray
-  void Record(double tg, V3 od, V3 dd);
+  struct Rec { double tg; V3 od, dd; double hg; int cam; };  // grid time (PC s), device-frame ray, headset grid time
+  void Record(double tg, V3 od, V3 dd, double hg, int cam);
   const std::deque<Rec> &recs() const { return rec_; }
   // grid search of the offset on fast-head sightings against the current alignment: true if it found one
   bool Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
@@ -268,6 +294,7 @@ class Sync {
   // SteamVR
   void OnHmdPose(double t, const Quat &q, V3 p);
   void SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw);
+  void SetChannels(const std::map<std::string, int> &ch);
   void SetStreamer(const std::string &system);
   // 20 Hz; returns the transform for the lighthouse devices
   Transform Tick(double now);
@@ -319,6 +346,7 @@ class Sync {
 
   std::mutex raw_m_;
   std::map<std::string, std::pair<V3, M3>> raw_;
+  std::map<std::string, int> channels_;
   std::map<std::string, V3> quest_;  // saved station positions in Quest space
   bool seeded_ = false, have_applied_ = false, paused_ = false;
   X4 applied_{};
