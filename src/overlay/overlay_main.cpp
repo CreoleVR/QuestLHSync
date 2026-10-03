@@ -398,7 +398,7 @@ static QlhsStatus Sample(const char *kind) {
   s.magic = QLHS_MAGIC;
   s.version = QLHS_VERSION;
   strcpy(s.hmd, "Quest Pro (CreoleCast)");
-  strcpy(s.hmd_system, "creolecast");
+  strcpy(s.hmd_system, "CreoleCast");
   strcpy(s.headset, "Quest Pro");
   strcpy(s.headset_addr, "192.168.1.50:47280");
   s.cam_fps = 75;
