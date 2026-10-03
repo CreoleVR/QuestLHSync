@@ -130,7 +130,7 @@ The PC side writes only to `%LOCALAPPDATA%\QuestLHSync`:
 Nothing is sent anywhere except between the PC and the headset. The PC only
 makes outgoing connections, so Windows Firewall needs no rule.
 
-While a PC is connected, scanning the cameras takes about 3% of one of the
+While a PC is connected, the camera reader takes about 9% of one of the
 headset's CPU cores, and the stream is about 2.5 KB/s. On the PC, the solver uses
 about 0.2% of one core.
 

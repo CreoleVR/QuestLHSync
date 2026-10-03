@@ -11,6 +11,9 @@ extern int snprintf(char *, unsigned long, const char *, ...);
 #define MAXS 64
 #define MAXB 24
 #define OUTCAP (1 << 20)
+// A camera's next frame comes 26.7 ms after its last (37.5 fps): polling sleeps until shortly before it is due.
+// Reading the camera buffers is slow, so checking all of them every millisecond cost far more than the scans.
+#define QUIET_NS 22000000ull
 struct st {
   u8 *slot[MAXS]; int sw[MAXS], sh[MAXS], cam[MAXS], pend[MAXS]; u32 shash[MAXS]; int nslots;
   u32 k[8]; int m1[8], m2[8];                  // per-camera frame counter, previous two means
@@ -18,6 +21,7 @@ struct st {
   u8 *scratch; u16 *cells; int *lab;
   char *out; u32 head, tail, ndrop;
   u64 scan_ns; u32 nscan;
+  u64 last_t[8]; u32 npoll;                    // per camera: when its last frame was found
 };
 extern struct st S;
 static u64 now(void) { struct ts t; clock_gettime(1, &t); return (u64)t.s * 1000000000ull + (u64)t.ns; }
@@ -31,6 +35,7 @@ void add_slot(u8 *p, int w, int h, int cam) {
 u32 n_drop(void) { return S.ndrop; }
 u64 scan_ns(void) { return S.scan_ns; }
 u32 n_scan(void) { return S.nscan; }
+u32 n_poll(void) { return S.npoll; }
 static u32 hash(int i) {
   const u8 *p = S.slot[i]; u32 n = (u32)(S.sw[i] * S.sh[i]), step = n / 61, h = 2166136261u;
   for (u32 o = step / 2; o < n; o += step) { h ^= p[o]; h *= 16777619u; }
@@ -58,6 +63,7 @@ int drain(char *dst, int cap) {
 static int find(int x) { while (S.lab[x] != x) { S.lab[x] = S.lab[S.lab[x]]; x = S.lab[x]; } return x; }
 static void frame(int i, u64 t) {
   int w = S.sw[i], h = S.sh[i], c = S.cam[i];
+  S.last_t[c] = t;
   u32 n = (u32)(w * h);
   int mean = smean(S.slot[i], n);
   u32 k = S.k[c]++;
@@ -123,10 +129,20 @@ static void frame(int i, u64 t) {
 }
 int poll(void) {
   int got = 0;
+  S.npoll++;
   for (int i = 0; i < S.nslots; i++) {
     u32 hh = hash(i);
     if (hh != S.shash[i]) { S.shash[i] = hh; S.pend[i] = 1; continue; }
     if (S.pend[i]) { S.pend[i] = 0; frame(i, now()); got++; }
   }
   return got;
+}
+// how long the next poll can wait (us): 0 while a frame is pending or a camera is due, else until the first one is
+int idle_us(void) {
+  u64 t = now(), due = ~0ull;
+  for (int i = 0; i < S.nslots; i++) if (S.pend[i]) return 0;
+  for (int c = 0; c < 8; c++) if (S.last_t[c] && S.last_t[c] + QUIET_NS < due) due = S.last_t[c] + QUIET_NS;
+  if (due == ~0ull || due <= t) return 0;
+  u64 us = (due - t) / 1000;
+  return us > 22000 ? 22000 : (int)us;
 }

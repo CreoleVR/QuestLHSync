@@ -22,6 +22,7 @@ var set_bufs = F("set_bufs", "void", ["pointer", "pointer", "pointer", "pointer"
 var prime = F("prime", "void", []), poll = F("poll", "int", []), reset_slots = F("reset_slots", "void", []);
 var drain = F("drain", "int", ["pointer", "int"]);
 var n_drop = F("n_drop", "uint", []), scan_ns = F("scan_ns", "uint64", []), n_scan = F("n_scan", "uint", []);
+var n_poll = F("n_poll", "uint", []), idle_us = F("idle_us", "int", []);
 var scratchBuf = Memory.alloc(640 * 480), cellBuf = Memory.alloc(40 * 30 * 2), labBuf = Memory.alloc(40 * 30 * 4);
 var outBuf = Memory.alloc(1 << 20), drainBuf = Memory.alloc(1 << 16), tsBuf = Memory.alloc(16);
 set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 250);
@@ -75,13 +76,13 @@ function step() {
   var budget = Date.now() + 20;
   while (Date.now() < budget) {
     try { poll(); } catch (e) { faults++; usleep(200000); console.log("W fault " + e.message + " -> " + discover() + " slots"); }
-    usleep(1000);
+    usleep(Math.max(1000, idle_us()));
   }
   flush();
   if (Date.now() - lastBeat >= 1000) {
     lastBeat = Date.now();
     var ns = n_scan();
-    console.log("T " + mono_us() + " scans " + ns + " scan_us " + (scan_ns().valueOf() / 1e3 / Math.max(1, ns)).toFixed(0) + " drops " + n_drop() + " faults " + faults);
+    console.log("T " + mono_us() + " scans " + ns + " scan_us " + (scan_ns().valueOf() / 1e3 / Math.max(1, ns)).toFixed(0) + " drops " + n_drop() + " faults " + faults + " polls " + n_poll());
   }
   if (!MAX_MS || Date.now() - t0 < MAX_MS) setImmediate(step);
   else console.log("I done");
