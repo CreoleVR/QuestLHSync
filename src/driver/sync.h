@@ -308,12 +308,17 @@ class Sync {
   struct Status {
     bool has_x = false, locked = false, cond = false, timing_learned = false;
     X4 x{};
-    double med = -1, expo = 0, rtt = 0, cam_fps = 0, sight_rate = 0, lag_cm = 0, locked_for = -1;
+    double med = -1, expo = 0, rtt = 0, cam_fps = 0, spot_rate = 0, sight_rate = 0, lag_cm = 0, locked_for = -1;
+    bool head_still = false;
     int n = 0, nstations = 0;
     struct St { std::string serial; int support = 0; bool anchor = false, measured = false; double last_seen = -1, dist = 0; };
     std::vector<St> st;
   };
   Status GetStatus(double now);
+  // the cameras' bright spots so far, and what became of them
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0; };
+  Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
+  static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
     std::vector<V3> Z;
     solver_.Stations(keys, S, Z);
@@ -355,9 +360,14 @@ class Sync {
   double last_prec_ = -1e18;
   StepStat last_st_;
   bool has_last_st_ = false;
-  std::atomic<long> nframes_{0}, nsight_{0};
-  double rate_t_ = 0, cam_fps_ = 0, sight_rate_ = 0;
-  long rate_f_ = 0, rate_s_ = 0;
+  std::atomic<long> nframes_{0};
+  Spots spots_;  // under net_
+  double rate_t_ = 0, cam_fps_ = 0, spot_rate_ = 0, sight_rate_ = 0;
+  long rate_f_ = 0;
+  Spots rate_sp_;
+  double sum_t_ = -1;  // not acquired: since then (< 0: acquired), and the spots then
+  Spots sum_sp_;
+  int sum_n_ = 0;
   std::mutex rec_m_;
   FILE *rec_ = nullptr;
   std::atomic<bool> recording_{false};

@@ -67,14 +67,23 @@ static bool Fits(const std::string &family, const std::string &model) {
   return family.empty() || f.empty() || f == family;
 }
 
+static void WriteMemory(const std::string &path, const std::string &ip) {
+  if (FILE *f = fopen(path.c_str(), "w")) {
+    fprintf(f, "%s\n", ip.c_str());
+    fclose(f);
+  }
+}
+
 void HeadsetLink::SetMemory(const std::string &path) {
   std::lock_guard<std::mutex> g(m_);
   mem_path_ = path;
   last_ip_.clear();
   if (FILE *f = fopen(path.c_str(), "r")) {
-    char ip[64];
-    if (fscanf(f, "%63s", ip) == 1) last_ip_ = ip;
+    char ip[64], more[8];
+    int n = fscanf(f, "%63s %7s", ip, more);
     fclose(f);
+    if (n >= 1) last_ip_ = ip;
+    if (n == 2) WriteMemory(path, last_ip_);  // up to 1.3 the headset's serial was kept there too
   }
 }
 
@@ -365,10 +374,7 @@ bool HeadsetLink::Session(const Found &f) {
             fits = Fits(fam, model_);
             if (fits && !mem_path_.empty() && last_ip_ != f.ip && h.rfind("H QuestLHSync ", 0) == 0) {
               last_ip_ = f.ip;
-              if (FILE *mf = fopen(mem_path_.c_str(), "w")) {
-                fprintf(mf, "%s %s\n", f.ip.c_str(), serial_.c_str());
-                fclose(mf);
-              }
+              WriteMemory(mem_path_, f.ip);
             }
           }
           log_(model() + ": firmware " + fw() + ", module " + field("module"));

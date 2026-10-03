@@ -269,7 +269,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       g_st->version = QLHS_VERSION;
       g_st->magic = QLHS_MAGIC;
     }
-    Log("QuestLHSync driver starting, data in " + dir_);
+    Log("QuestLHSync " QLHS_RELEASE " driver starting, data in %LOCALAPPDATA%\\QuestLHSync");
     SyncConfig cfg;
     cfg.dir = dir_;
     g_sync = std::make_unique<Sync>(cfg, [](const std::string &s) { Log(s); });
@@ -384,6 +384,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   bool any_hmd_ = false, recording_ = false, overlay_started_ = false;
   int cmd_seen_ = 0;
   double started_ = 0, last_status_ = 0;
+  Sync::Spots rec_spots_;  // when the recording started
 
   void ReadSettings() {
     auto *s = vr::VRSettings();
@@ -411,7 +412,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   void SetRecording(bool on) {
     if (on == recording_) return;
     recording_ = on;
-    if (!on) { g_sync->SetRecord(nullptr); Log("recording off"); return; }
+    if (!on) {
+      g_sync->SetRecord(nullptr);
+      Log("recording off: " + Sync::Describe(rec_spots_, g_sync->spots()));
+      return;
+    }
     namespace fs = std::filesystem;
     fs::path rd = fs::path(dir_) / "recordings";
     std::vector<fs::path> old;  // keep the newest 9 + this one
@@ -430,6 +435,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (!f) { Log("can't open a recording file"); recording_ = false; return; }
     setvbuf(f, nullptr, _IOFBF, 1 << 16);
     g_sync->SetRecord(f);
+    rec_spots_ = g_sync->spots();
     g_sync->Rec(QpcNow(), "I QuestLHSync recording (qlhs_replay reads it)");
     Log(std::string("recording to recordings\\") + b);
   }
@@ -443,7 +449,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(mod, path, MAX_PATH);
     std::filesystem::path exe = std::filesystem::path(path).parent_path() / L"QuestLHSync.exe";
-    if (!std::filesystem::exists(exe)) { Log("dashboard app missing: " + exe.string()); return; }
+    if (!std::filesystem::exists(exe)) { Log("dashboard app missing: no QuestLHSync.exe next to the driver"); return; }
     std::wstring cmd = L"\"" + exe.wstring() + L"\"";
     STARTUPINFOW si{};
     si.cb = sizeof si;
@@ -528,6 +534,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     Copy(t->headset_fw, sizeof t->headset_fw, link_->fw());
     t->cam_fps = s.cam_fps;
     t->sight_rate = s.sight_rate;
+    t->spot_rate = s.spot_rate;
+    t->head_still = s.head_still;
     t->rtt_ms = s.rtt * 1000;
     t->expo_ms = s.expo * 1000;
     t->expo_learned = s.timing_learned;

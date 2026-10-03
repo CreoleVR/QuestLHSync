@@ -11,14 +11,17 @@ import glob
 import hashlib
 import lzma
 import os
+import re
 import subprocess
 import sys
 import urllib.request
 import zipfile
 
-VERSION, CODE = "v1.3", 4
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(os.path.dirname(HERE), "out")
+with open(os.path.join(os.path.dirname(HERE), "src", "common", "qlhs_status.h"), encoding="utf-8") as _h:
+    VERSION = "v" + re.search(r'#define QLHS_RELEASE "([^"]+)"', _h.read()).group(1)  # the driver's
+CODE = 5
 # 17.10.0 android-arm64, the build lhsight was developed on. 17.19.0 crashed the sensors HAL on injection (SIGSEGV in
 # its bootstrap thread), so test any upgrade before shipping it.
 FRIDA_VERSION = "17.10.0"

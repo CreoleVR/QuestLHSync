@@ -126,6 +126,7 @@ int main(int argc, char **argv) {
   double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall).count();
   printf("replayed %ld lines (%.0f s of log) in %.1f s; expo %.1f ms%s\n", nl, tnow - t0, secs, st.expo * 1000,
          st.timing_learned ? " (learned)" : "");
+  printf("%s\n", Sync::Describe({}, sync.spots()).c_str());
   if (out) fclose(out);
   if (g_ray_dump) {
     std::vector<std::string> keys;

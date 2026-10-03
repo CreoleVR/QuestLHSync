@@ -1571,16 +1571,20 @@ void Sync::OnLine(double pc, const char *line) {
       was = p;
     }
   }
-  if (nb < 0 || !have_optics_) return;
+  if (nb < 0) return;
+  spots_.frames++;
+  spots_.seen += nb;
+  if (!have_optics_) { spots_.other += nb; return; }
   double hg = have_lag ? hs - lag : std::numeric_limits<double>::quiet_NaN();  // frame time, headset clock
   if (have_lag) solver_.SetFramePeriod(grid_.period(cam));
   double grid_pc;
-  if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) return;
+  if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) { spots_.other += nb; return; }
   double expo = expo_;
   double t = grid_pc - expo - (have_lag ? 0.0 : kLagFallback);
   M3 R; V3 p;
   double w;
-  if (!poses_.At(t, R, p) || !poses_.Speed(t, w) || poses_.Still(t)) return;
+  if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
+  if (poses_.Still(t)) { spots_.still += nb; return; }
   double wmax = (cfg_.learn_timing && !timing_learned_) ? kWmaxUntimed : kWmax;
   M3 Rc;
   V3 tc;
@@ -1591,19 +1595,31 @@ void Sync::OnLine(double pc, const char *line) {
     int x10, y10, npx, peak, used = 0;
     if (sscanf(s, " %d %d %d %d%n", &x10, &y10, &npx, &peak, &used) < 4) break;
     s += used;
-    if (npx > kMaxPx) continue;
+    if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
-    if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) continue;
+    if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
     if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f\n", t, cam, O.x, O.y, O.z, D.x, D.y,
               D.z, p.x, p.y, p.z, w);
     }
-    if (w > wmax) continue;
+    if (w > wmax) { spots_.fast++; continue; }
     solver_.Add(t, p + R * o, R * d, hg, cam);
-    nsight_++;
+    spots_.used++;
   }
+}
+
+std::string Sync::Describe(const Spots &a, const Spots &b) {
+  long n = b.seen - a.seen;
+  if (!n) return Fmt("no bright spots on %ld camera frames", b.frames - a.frames);
+  std::string why;
+  auto part = [&](long k, const char *what) { if (k > 0) why += Fmt("%s%ld %s", why.empty() ? "" : ", ", k, what); };
+  part(b.still - a.still, "while the headset was still");
+  part(b.fast - a.fast, "while it turned fast");
+  part(b.big - a.big, "lamps or windows");
+  part(b.other - a.other, "without a headset pose");
+  return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
 }
 
 void Sync::SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw) {
@@ -1633,6 +1649,15 @@ void Sync::Reacquire() {
   double t;
   if (poses_.Latest(p, &t)) solver_.PoseBreak(t);
   log_("re-acquire asked for: older sightings dropped");
+}
+
+// two stations have 10 sightings that fit
+static bool Locked(bool has_x, const StepStat &st) {
+  if (!has_x || !st.has_per) return false;
+  std::vector<int> c;
+  for (auto &kv : st.per) c.push_back(kv.second);
+  std::sort(c.begin(), c.end());
+  return c.size() >= 2 && c[c.size() - 2] >= 10;
 }
 
 Transform Sync::Tick(double now) {
@@ -1709,6 +1734,16 @@ Transform Sync::Tick(double now) {
       std::lock_guard<std::mutex> g(st_m_);
       last_st_ = st;
       has_last_st_ = true;
+    }
+    // not acquired: what became of the cameras' bright spots, after a minute and then every 5
+    if (Locked(solver_.has_x(), st)) sum_t_ = -1;
+    else {
+      Spots sp = spots();
+      if (sum_t_ < 0) { sum_t_ = now; sum_sp_ = sp; sum_n_ = 0; }
+      else if (now - sum_t_ >= (sum_n_ ? 300 : 60)) {
+        if (sp.frames > sum_sp_.frames) log_(Fmt("acquiring, last %.0f s: ", now - sum_t_) + Describe(sum_sp_, sp));
+        sum_t_ = now; sum_sp_ = sp; sum_n_++;
+      }
     }
     X4 x = solver_.x();
     if (recording_) {
@@ -1795,13 +1830,23 @@ Transform Sync::Tick(double now) {
 
 Sync::Status Sync::GetStatus(double now) {
   Status s;
+  Spots sp = spots();
   if (now - rate_t_ >= 2.0) {
-    long f = nframes_, g = nsight_;
-    if (rate_t_ > 0) { cam_fps_ = (f - rate_f_) / (now - rate_t_); sight_rate_ = (g - rate_s_) / (now - rate_t_); }
-    rate_t_ = now; rate_f_ = f; rate_s_ = g;
+    long f = nframes_;
+    if (rate_t_ > 0) {
+      double dt = now - rate_t_;
+      cam_fps_ = (f - rate_f_) / dt;
+      spot_rate_ = (sp.seen - rate_sp_.seen) / dt;
+      sight_rate_ = (sp.used - rate_sp_.used) / dt;
+    }
+    rate_t_ = now; rate_f_ = f; rate_sp_ = sp;
   }
   s.cam_fps = cam_fps_;
+  s.spot_rate = spot_rate_;
   s.sight_rate = sight_rate_;
+  double th;
+  V3 h;
+  s.head_still = poses_.Latest(h, &th) && poses_.Still(th);
   s.has_x = solver_.has_x();
   s.x = solver_.x();
   s.expo = expo_;
@@ -1818,12 +1863,7 @@ Sync::Status Sync::GetStatus(double now) {
   s.cond = st.cond;
   s.n = st.n;
   s.med = st.has_med ? st.med : -1;
-  if (s.has_x && st.has_per) {
-    std::vector<int> c;
-    for (auto &kv : st.per) c.push_back(kv.second);
-    std::sort(c.begin(), c.end());
-    s.locked = c.size() >= 2 && c[c.size() - 2] >= 10;
-  }
+  s.locked = Locked(s.has_x, st);
   s.locked_for = lock_time_ >= 0 ? now - lock_time_ : -1;
   if (s.has_x && have_applied_) {
     V3 h{0, 1.5, 0};

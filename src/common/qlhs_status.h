@@ -7,7 +7,8 @@
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
-#define QLHS_VERSION 1
+#define QLHS_VERSION 2
+#define QLHS_RELEASE "1.4"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
@@ -52,7 +53,9 @@ struct QlhsStatus {
   char headset_addr[48];
   char headset_fw[48];
   double cam_fps;       // camera frames/s, both side cameras (all four from module v1.0)
-  double sight_rate;    // base station sightings/s
+  double sight_rate;    // bright spots/s the alignment uses
+  double spot_rate;     // bright spots/s the cameras see
+  int32_t head_still, pad2;  // 1: the headset hasn't moved for 2 s, its frames wait
   double rtt_ms;        // network round trip (clock sync)
   double expo_ms;       // frame grid -> pose time
   int32_t expo_learned, pad0;
