@@ -1,0 +1,8 @@
+#!/sbin/sh
+umask 022
+OUTFD=$2
+ZIPFILE=$3
+mount /data 2>/dev/null
+[ -f /data/adb/magisk/util_functions.sh ] && . /data/adb/magisk/util_functions.sh || { echo "! Cannot find util_functions.sh"; exit 1; }
+install_module
+exit 0

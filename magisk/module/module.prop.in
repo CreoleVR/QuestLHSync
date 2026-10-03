@@ -1,0 +1,6 @@
+id=questlhsync
+name=QuestLHSync
+version=@VERSION@
+versionCode=@CODE@
+author=CreoleVR
+description=Lets SteamVR keep lighthouse trackers, controllers and base stations aligned to the Quest Pro's own tracking. Serves the tracking cameras' view of the 2.0 base stations' laser flashes on the local network (TCP 47280, discovery UDP 47281) to the QuestLHSync SteamVR driver. The cameras are read inside the sensors HAL with Frida only while a PC is connected; nothing on disk is patched.

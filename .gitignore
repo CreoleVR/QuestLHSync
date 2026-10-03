@@ -1,0 +1,6 @@
+build/
+out/
+driver/questlhsync/bin/
+magisk/build/
+magisk/frida/
+__pycache__/

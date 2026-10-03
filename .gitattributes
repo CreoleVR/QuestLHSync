@@ -1,0 +1,6 @@
+* text=auto
+*.bat text eol=crlf
+*.sh text eol=lf
+magisk/module/META-INF/** text eol=lf
+*.dll binary
+*.lib binary

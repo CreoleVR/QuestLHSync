@@ -1,0 +1,9 @@
+{
+	"driver_questlhsync" : {
+		"enable" : true,
+		"host" : "",
+		"headset" : "",
+		"anyHmd" : false,
+		"record" : false
+	}
+}
