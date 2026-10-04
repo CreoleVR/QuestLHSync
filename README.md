@@ -35,10 +35,18 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
 
 1. Download `QuestLHSync-<version>.zip` from
    [Releases](https://github.com/CreoleVR/QuestLHSync/releases) and extract it.
-2. **Headset, Quest:** install `QuestLHSync-magisk-<version>.zip` in the Magisk
-   app (**Modules > Install from storage**) and reboot.
+   
+3. **Headset, <ins>Quest</ins>:** install `QuestLHSync-magisk-<version>.zip` in the Magisk
+   app (**Modules > Install from storage**) and **reboot**.
+   To install it over adb instead:
 
-   **Headset, Steam Frame:** copy `QuestLHSync-frame-<version>.tar.gz` to the
+   ```
+   adb push QuestLHSync-magisk-<version>.zip /sdcard/Download/
+   adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-magisk-<version>.zip"
+   adb reboot
+   ```
+
+   **Headset, <ins>Steam Frame</ins>:** copy `QuestLHSync-frame-<version>.tar.gz` to the
    Frame (over ssh, or a download in Desktop Mode), then in a terminal on it:
 
    ```
@@ -49,14 +57,14 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
    It installs into `~/.local/share/questlhsync`, starts `lhsyncd` as a systemd
    user service and restarts SteamVR on the headset once, to load the
    `questlhsync_frame` driver.
-3. **PC:** with SteamVR closed, move the `questlhsync` folder somewhere
+4. **PC:** with SteamVR closed, move the `questlhsync` folder somewhere
    permanent and register it:
 
    ```
    "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "C:\path\to\questlhsync"
    ```
 
-4. Turn off SpaceCalibrator, OpenVR-SpaceSync or anything else that moves
+5. Turn off SpaceCalibrator, OpenVR-SpaceSync or anything else that moves
    lighthouse devices. Two tools correcting the same devices fight each other.
 
 ## Use
