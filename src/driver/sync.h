@@ -53,6 +53,9 @@ constexpr double kFrozen = 10.0;        // s: SteamVR's headset this still while
 constexpr double kKeep = 600.0;         // s of rays kept
 constexpr double kMoved = 0.25;         // m: SteamVR has a measured station this far off: it was moved
 constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much against the reference
+// an automatic frame's layout fit: a station kMoved off against the others for kLayoutMoved s takes its new place, and
+// no fit within kMoved for that long starts the frame over; stations within kLine of one line pin no tilt
+constexpr double kLayoutMoved = 30.0, kLine = 0.3;  // s, m
 // corrections move lighthouse devices at the head by at most kSlewStill m/s while the head is still, plus
 // kSlewTurn m per degree it turns and kSlewWalk of the distance it moves: a shift is hard to notice while the view
 // itself moves, and plain to see on a controller held in front of a still head
@@ -149,7 +152,7 @@ class PoseHist {
   int brk_id() const { return brk_id_; }
   double brk_t() const { return brk_t_; }
   std::string brk_what() const { std::lock_guard<std::mutex> g(m_); return brk_what_; }
-  void Clear() { std::lock_guard<std::mutex> g(m_); i_ = 0; }
+  void Clear() { std::lock_guard<std::mutex> g(m_); i_ = 0; pend_ = 0; }
 
  private:
   std::vector<PoseS> ring_;
@@ -158,7 +161,11 @@ class PoseHist {
   std::atomic<int> brk_id_{0};
   double brk_t_ = 0;
   std::string brk_what_;
+  uint64_t pend_ = 0;  // a jump waiting for the poses after it: the index of the first pose past it
   bool Find(double t, uint64_t &i) const;  // newest index with time <= t (caller holds m_)
+  bool Back(const PoseS &s) const;
+  void Settle();
+  void Break(const PoseS &a, const PoseS &b);
 };
 
 // ---------------------------------------------------------------- reference frame
@@ -169,16 +176,22 @@ struct StationsFile {
   M3 anchor_R;
   M3 level;  // automatic frames: turns the frame level with the headset's gravity (Solver::Level)
   std::map<std::string, V3> fix;  // measured positions, reference frame
+  // automatic frames of three or more stations: each one's pose in the reference frame, before the level
+  std::map<std::string, std::pair<V3, M3>> ref;
   bool Load(const std::string &path);
   bool SaveAuto(const std::string &path) const;
 };
 
-// SteamVR's lighthouse frame -> the reference frame: the anchor's pose pins it, then the level (three stations'
-// sightings) or gravity's tilt (gravity.h)
+// SteamVR's lighthouse frame -> the reference frame: the anchor's pose pins it (an automatic frame of three or more
+// stations: the best fit of all their places, Layout), then the level (three stations' sightings) or gravity's tilt
+// (gravity.h)
 class Frame {
  public:
   explicit Frame(const StationsFile &f, LogFn log) : f_(f), log_(std::move(log)) {}
   void Update(const std::map<std::string, std::pair<V3, M3>> &raw);
+  bool layout() const { return f_.autogen && f_.ref.size() >= 3; }
+  const std::string &left() const { return left_; }  // the station the layout fit leaves out: moved against the rest
+  double miss() const { return miss_; }  // m: the layout fit's worst miss of the stations it keeps
   void Apply(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + C_ * (p - o_); Ro = C_ * R; }
   // before the level: what recordings hold, so a replay with the same stations.json levels them once
   void Unlevelled(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + Cs_ * (p - o_); Ro = Cs_ * R; }
@@ -199,6 +212,10 @@ class Frame {
   V3 o_, oref_;
   int ok_ = -1;
   double deg_ = 0;
+  std::string left_;
+  double miss_ = 0;
+  bool Layout(const std::map<std::string, std::pair<V3, M3>> &raw, M3 &Cs, V3 &o, std::string &left, double &off,
+              double &miss) const;
 };
 
 // ---------------------------------------------------------------- solver
@@ -306,6 +323,7 @@ class Solver {
   static bool Starved(const Rays &r);
   double DimGate() const { return starved_ ? INLIER : -1; }
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
+  double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
 
   Rays GetRays(double t0);
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
@@ -469,6 +487,9 @@ class Sync {
   void LoadState();
   void Retime(double old_e, double new_e);
   void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  void LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  std::string left_seen_;  // the station the layout fit leaves out, since left_since_
+  double left_since_ = 0, bad_since_ = -1;  // bad_since_: since when no fit holds (-1: one does)
   void LevelCheck(double now);
   double last_check_ = 0, check_said_ = -1e18;
   void SaveState(const X4 &x, const std::map<std::string, V3> &cs);

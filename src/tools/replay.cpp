@@ -6,6 +6,7 @@
 // --learn: round-trip-less logs still learn the timing (starting from --expo), to test the estimator.
 // --learn-grid: learn the cameras' frame period as for headsets other than the Quest Pro, to test that.
 // --channel SERIAL=N: a base station's channel, for older logs.
+// --xf file: the transform applied to the lighthouse devices (raw -> Quest: pc_ns qw qx qy qz tx ty tz), every 0.25 s
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -17,7 +18,7 @@
 #include "../driver/sync.h"
 
 int main(int argc, char **argv) {
-  std::string log, calib, dir, outp;
+  std::string log, calib, dir, outp, xfp;
   bool learn = false, learn_grid = false, pings = false;
   double expo = -1;
   std::map<std::string, int> chans;
@@ -30,6 +31,7 @@ int main(int argc, char **argv) {
     } else if (a == "--calib" && i + 1 < argc) calib = argv[++i];
     else if (a == "--dir" && i + 1 < argc) dir = argv[++i];
     else if (a == "--out" && i + 1 < argc) outp = argv[++i];
+    else if (a == "--xf" && i + 1 < argc) xfp = argv[++i];
     else if (a == "--rays" && i + 1 < argc) g_ray_dump = fopen(argv[++i], "w");  // every sighting + the stations
     else if (a == "--expo" && i + 1 < argc) expo = atof(argv[++i]);
     else if (a == "--learn") learn = true;
@@ -55,6 +57,8 @@ int main(int argc, char **argv) {
   std::string err;
   if (!sync.SetCalibration(ss.str(), &err)) { fprintf(stderr, "calibration: %s\n", err.c_str()); return 1; }
   FILE *out = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
+  FILE *xf = xfp.empty() ? nullptr : fopen(xfp.c_str(), "w");
+  long ticks = 0;
   FILE *f = fopen(log.c_str(), "rb");
   if (!f) { fprintf(stderr, "can't open %s\n", log.c_str()); return 1; }
   static char line[1 << 16];
@@ -108,7 +112,10 @@ int main(int argc, char **argv) {
     }
     while (pc >= next_tick) {
       bool step = sync.WillStep(next_tick);
-      sync.Tick(next_tick);
+      Transform x = sync.Tick(next_tick);
+      if (xf && x.active && ticks++ % 5 == 0)
+        fprintf(xf, "%lld %.7f %.7f %.7f %.7f %.5f %.5f %.5f\n", (long long)(next_tick * 1e9), x.q.w, x.q.x, x.q.y, x.q.z,
+                x.t.x, x.t.y, x.t.z);
       if (step && out) {
         auto st = sync.GetStatus(next_tick);
         if (st.has_x)
@@ -134,6 +141,7 @@ int main(int argc, char **argv) {
          st.timing_learned ? " (learned)" : "");
   printf("%s\n", Sync::Describe({}, sync.spots()).c_str());
   if (out) fclose(out);
+  if (xf) fclose(xf);
   if (g_ray_dump) {
     std::vector<std::string> keys;
     std::vector<V3> S, Z;
