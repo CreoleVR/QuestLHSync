@@ -8,7 +8,7 @@
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
 #define QLHS_VERSION 2
-#define QLHS_RELEASE "1.6"  // magisk/build_module.py reads it
+#define QLHS_RELEASE "1.7"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
@@ -24,7 +24,7 @@ enum QlhsState : int32_t {
 
 enum QlhsCmd : int32_t {
   QLHS_CMD_NONE = 0,
-  QLHS_CMD_REACQUIRE = 1,
+  QLHS_CMD_REACQUIRE = 1,  // retired in 1.7 (it only threw the sightings away): ignored
   QLHS_CMD_PAUSE = 2,
   QLHS_CMD_RESUME = 3,
   QLHS_CMD_RECORD_ON = 4,

@@ -184,11 +184,7 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
     if (std::isfinite(pos[0] + pos[1] + pos[2])) {
       double t = QpcNow() + p.poseTimeOffset;
       g_sync->OnBodyPose((int)id, t, V3{pos[0], pos[1], pos[2]});
-      static std::atomic<double> grav_t[vr::k_unMaxTrackedDeviceCount];
-      if (g_gravity && t - grav_t[id].load(std::memory_order_relaxed) >= 0.1) {  // it keeps 10 Hz
-        grav_t[id].store(t, std::memory_order_relaxed);
-        g_gravity->OnPose((int)id, t, V3{pos[0], pos[1], pos[2]}, ToM3(Quat{q.w, q.x, q.y, q.z}));
-      }
+      if (g_gravity) g_gravity->OnPose((int)id, t, V3{pos[0], pos[1], pos[2]}, Quat{q.w, q.x, q.y, q.z});
     }
   }
   Xf x;
@@ -292,6 +288,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     cfg.dir = dir_;
     g_sync = std::make_unique<Sync>(cfg, [](const std::string &s) { Log(s); });
     g_gravity = std::make_unique<Gravity>(dir_, [](const std::string &s) { Log(s); });
+    g_gravity->SetRecord([](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
     link_ = std::make_unique<HeadsetLink>(
         g_sync.get(), [](const std::string &s) { Log(s); },
         [](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
@@ -533,7 +530,6 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (s == cmd_seen_) return;
     cmd_seen_ = s;
     switch (g_st->cmd) {
-      case QLHS_CMD_REACQUIRE: g_sync->Reacquire(); break;
       case QLHS_CMD_PAUSE: g_sync->SetPaused(true); Log("corrections paused"); break;
       case QLHS_CMD_RESUME: g_sync->SetPaused(false); Log("corrections resumed"); break;
       case QLHS_CMD_RECORD_ON: SetRecording(true); break;

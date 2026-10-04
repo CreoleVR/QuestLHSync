@@ -66,19 +66,18 @@ the SteamVR dashboard, with a copy on the desktop.
 
 The first time, look around so the cameras catch both base stations (the
 Frame's upper cameras see most of them). It locks within about half a minute,
-and after that starts from the saved alignment.
+and after that starts from the saved alignment. Wear a tracker or hold a
+controller meanwhile: when two base stations could be either way round, the
+devices you wear or hold decide.
 
 With three base stations, glance at the third one too. QuestLHSync's reference
 frame keeps whatever tilt SteamVR's lighthouse space had when it was first
 seen, and with two base stations in view a tilt of 1.5° puts trackers on the
 floor 15 cm to the side. Once the cameras have seen three base stations well
 enough to tell, QuestLHSync levels the reference frame with the headset's
-gravity and keeps the level in `stations.json`.
+gravity and keeps the level in `stations.json`. With two, the lighthouse
+controllers' and trackers' accelerometers level it as they move about.
 
-- **Re-acquire** finds the alignment again from scratch. Use it if lighthouse
-  devices look out of place. Wear a tracker or hold a controller while it
-  acquires: when two base stations could be either way round, the devices near
-  your head decide.
 - **Pause corrections** holds lighthouse devices where they are.
 - **Record session** saves what the driver receives to a file, for bug reports.
 
@@ -93,6 +92,7 @@ Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`:
 | `headset` | `""` | A headset serial to prefer when several answer |
 | `anyHmd` | `false` | Use SteamVR's headset even when it isn't named a Quest Pro, 3, 3S or Steam Frame |
 | `record` | `false` | Record every session (same as the button) |
+| `gravity` | `true` | `false` turns levelling by the lighthouse devices' accelerometers off |
 
 ## Troubleshooting
 

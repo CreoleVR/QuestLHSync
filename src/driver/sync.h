@@ -66,6 +66,9 @@ constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kSwapFit = 0.7;
 // the lighthouse devices worn or held tell two alignments apart (Solver::BodyFavours) when one puts them within
 // kBodyNear of the head and the other kBodyGap further
 constexpr double kBodyNear = 1.0, kBodyGap = 1.0;  // m
+// ... or their motion does (Sync::BodyMotion): when the head went kBodyMoved, and they follow it one way by kBodyCorr
+// and the other way not (a fit and its mirror move them opposite ways)
+constexpr double kBodyMoved = 2.0, kBodyCorr = 0.2;  // m, correlation
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 
@@ -221,12 +224,18 @@ class Solver {
   static constexpr double SIG_LEVEL = 1.0 / kDeg, COND_LEVEL = 0.1 / kDeg, LEVEL_MED = 0.3;
   static constexpr int LEVEL_STATIONS = 3, LEVEL_CELLS = 3;
   struct LevelR { X4 x{}; M3 tilt; int stations = 0; double med = 0; };  // tilt about the pivot, then x
+  // a tilt about one horizontal axis (rad), how well its time slices agree on it (rad), the sightings' median error
+  struct AxisR { double theta = 0, sd = 0, med = 0; int slices = 0; };
 
   Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix);
   // how far (m, horizontally, median) the lighthouse devices worn or held stay from the head if x were the alignment;
   // NaN without enough of them
   using BodyFn = std::function<double(const X4 &)>;
   void SetBody(BodyFn f) { body_ = std::move(f); }
+  // how their horizontal motion follows the head's if x were the alignment (+1 along, -1 against, ~0 left lying), and
+  // how far the head went meanwhile (m); NaN without motion
+  using MotionFn = std::function<double(const X4 &, double &)>;
+  void SetMotion(MotionFn f) { motion_ = std::move(f); }
   void Reset(const X4 &x);
   // g: the frame's time on the headset's clock (NaN until the frame grid is known)
   void Add(double t, V3 o, V3 d, double g, int cam, bool bright);
@@ -250,6 +259,7 @@ class Solver {
   // below the base stations sideways, and with two stations in view the 4-DOF fit can't see it. The third station's
   // sightings can: refit with the stations tilted about pivot (reference frame). True if the sightings pin the tilt.
   bool Level(V3 pivot, LevelR &out);
+  bool LevelAxis(V3 pivot, V3 axis, AxisR &out);  // two stations: the tilt across them (Sync::LevelCheck)
   void Relevel(const X4 &x);  // the alignment for the stations as just levelled
 
   // geometry, also used by Timing
@@ -264,7 +274,7 @@ class Solver {
     std::vector<char> B;  // 1: peak >= kBright
     size_t size() const { return T.size(); }
   };
-  struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; M3 tilt; };
+  struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; M3 tilt; double theta = 0; };
 
   mutable std::mutex m_;
   std::vector<double> rt_, rg_;
@@ -289,6 +299,7 @@ class Solver {
   bool has_stat_ = false;
   int resets_ = 0;
   BodyFn body_;
+  MotionFn motion_;
   bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
   bool acq_dim_ = false;     // ... was found on dim rays too (Bright): it needs twice the support
   std::atomic<bool> starved_{false};  // the recent rays are under 5% bright, of 200 or more (see Bright)
@@ -300,10 +311,10 @@ class Solver {
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
   static int Score(const std::vector<int> &c);
   static void Cells(const Rays &r, const std::vector<char> &use, std::vector<int> &cnt);
-  // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt. dim_gate: the gate for rays
-  // dimmer than kBright, when narrower
+  // pivot: also fit a tilt of the stations about it (6 DOF), returned in FitR::tilt; with axis (horizontal, unit),
+  // only about that axis (5 DOF, FitR::theta too). dim_gate: the gate for rays dimmer than kBright, when narrower
   FitR Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now, double gate,
-           const X4 *xa, const V3 *pivot = nullptr, double dim_gate = 180);
+           const X4 *xa, const V3 *pivot = nullptr, double dim_gate = 180, const V3 *axis = nullptr);
   void Hypotheses(const Rays &r, const std::vector<V3> &S, std::vector<X4> &H, int M = 4000);
   void BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
                     const std::vector<int> &idx, double gate, std::vector<int> &out) const;
@@ -313,8 +324,9 @@ class Solver {
   static Rays Bright(const Rays &r);
   bool Acquire(double now, X4 &best, int &bs, int &tight);
   int ThinnedScore(const X4 &x, double now);
-  // 1: the lighthouse devices worn or held say a, 2: b, 0: they don't tell (da, db: their distance from the head, m)
-  int BodyFavours(const X4 &a, const X4 &b, double &da, double &db) const;
+  // 1: the lighthouse devices worn or held say a, 2: b, 0: they don't tell (da, db: their distance from the head, m;
+  // how: what told)
+  int BodyFavours(const X4 &a, const X4 &b, double &da, double &db, std::string &how) const;
   void CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, const Rays &t,
                    double now);
   void CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
@@ -365,7 +377,6 @@ class Sync {
   bool WillStep(double now) const { return now - last_step_ >= 1.0; }
   void ForceExpo(double e) { expo_ = e; }
   // commands
-  void Reacquire();
   // a reference frame to level by gravity (gravity.h): SteamVR's frame -> the reference frame before gravity's tilt
   // (rotation), the frame's turn on top of that now, and which reference frame (key). False when the cameras level it
   bool GravityFrame(M3 &C, M3 &turn, std::string &key);
@@ -453,10 +464,13 @@ class Sync {
   std::deque<BodyS> body_, body_new_;  // the last ACQ_WIN s; new ones, for the recording
   std::map<int, double> body_last_;
   double BodyDist(const X4 &x);
+  double BodyMotion(const X4 &x, double &moved);
 
   void LoadState();
   void Retime(double old_e, double new_e);
   void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  void LevelCheck(double now);
+  double last_check_ = 0, check_said_ = -1e18;
   void SaveState(const X4 &x, const std::map<std::string, V3> &cs);
   bool Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss);
 };
