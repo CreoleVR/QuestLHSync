@@ -614,6 +614,32 @@ static void RunBg(std::function<void()> fn) {
   }).detach();
 }
 
+// Terminates SteamVR's processes (they hold the driver dll/files open) and waits for them to exit.
+static void StopSteamVr() {
+  static const wchar_t *names[] = {L"vrserver.exe", L"vrmonitor.exe", L"vrcompositor.exe", L"vrdashboard.exe",
+                                   L"vrwebhelper.exe", L"vrstartup.exe"};
+  std::vector<HANDLE> procs;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return;
+  PROCESSENTRY32W pe{sizeof pe};
+  for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+    for (const wchar_t *n : names)
+      if (_wcsicmp(pe.szExeFile, n) == 0) {
+        if (HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID)) procs.push_back(h);
+        break;
+      }
+  CloseHandle(snap);
+  if (procs.empty()) return;
+  Say(L"Stopping SteamVR…");
+  for (HANDLE h : procs) TerminateProcess(h, 1);
+  for (HANDLE h : procs) {
+    WaitForSingleObject(h, 5000);
+    CloseHandle(h);
+  }
+  for (int i = 0; i < 50 && SteamVrRunning(); i++) Sleep(100);
+  if (SteamVrRunning()) throw Fail{L"couldn't stop SteamVR (vrserver.exe is still running)"};
+}
+
 static void Check() {
   RunBg([] {
     Say(L"Checking for updates…");
@@ -640,6 +666,7 @@ static void Install(const std::wstring &tag) {
            if (total) SetProgress((int)std::min<uint64_t>(99, zip.size() * 100 / total));
          });
     if (zip.empty()) throw Fail{L"download failed: " + PackageName(tag) + L" not found"};
+    StopSteamVr();
     Say(L"Installing…");
     std::error_code ec;
     fs::create_directories(g_root, ec);
@@ -655,6 +682,7 @@ static void Install(const std::wstring &tag) {
 
 static void Uninstall() {
   RunBg([] {
+    StopSteamVr();
     RunReg(L"removedriver");
     std::error_code ec;
     fs::remove_all(g_driver, ec);
@@ -788,11 +816,7 @@ static int HitTest(LPARAM lp) {
 
 static void Click(int id) {
   if (id == 2) return Check();
-  if (SteamVrRunning()) {
-    g_svr = true;
-    Say(L"Close SteamVR first.", col::amber);
-    return;
-  }
+  if (SteamVrRunning()) g_svr = true;  // Install/Uninstall stop it themselves
   if (id == 0) {
     std::wstring tag;
     {
