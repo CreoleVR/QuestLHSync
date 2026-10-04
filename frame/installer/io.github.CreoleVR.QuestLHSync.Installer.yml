@@ -1,0 +1,35 @@
+app-id: io.github.CreoleVR.QuestLHSync.Installer
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: questlhsync-installer
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # GitHub releases
+  - --share=network
+  # install.sh and uninstall.sh run on the host (flatpak-spawn --host): systemctl --user, SteamVR's vrpathreg
+  - --talk-name=org.freedesktop.Flatpak
+modules:
+  - name: questlhsync-installer
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 questlhsync_installer.py /app/share/questlhsync-installer/installer/questlhsync_installer.py
+      - install -Dm644 uninstall.sh /app/share/questlhsync-installer/package/uninstall.sh
+      - mkdir -p /app/bin && ln -s ../share/questlhsync-installer/installer/questlhsync_installer.py /app/bin/questlhsync-installer
+      - install -Dm644 ${FLATPAK_ID}.desktop /app/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm644 ${FLATPAK_ID}.metainfo.xml /app/share/metainfo/${FLATPAK_ID}.metainfo.xml
+      - install -Dm644 ${FLATPAK_ID}.svg /app/share/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg
+    sources:
+      - type: file
+        path: questlhsync_installer.py
+      - type: file
+        path: ../package/uninstall.sh
+      - type: file
+        path: io.github.CreoleVR.QuestLHSync.Installer.desktop
+      - type: file
+        path: io.github.CreoleVR.QuestLHSync.Installer.metainfo.xml
+      - type: file
+        path: io.github.CreoleVR.QuestLHSync.Installer.svg

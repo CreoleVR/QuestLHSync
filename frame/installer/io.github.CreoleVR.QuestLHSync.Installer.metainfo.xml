@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.CreoleVR.QuestLHSync.Installer</id>
+  <name>QuestLHSync Installer</name>
+  <summary>Install QuestLHSync on the Steam Frame</summary>
+  <developer id="io.github.creolevr">
+    <name>CreoleVR</name>
+  </developer>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Installs the Steam Frame side of QuestLHSync from its latest GitHub release, or from a release file: lhsyncd as a
+      systemd user service, and the questlhsync_frame driver registered with the headset's SteamVR. It runs the
+      release's own install.sh, and can uninstall again.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.CreoleVR.QuestLHSync.Installer.desktop</launchable>
+  <url type="homepage">https://github.com/CreoleVR/QuestLHSync</url>
+  <url type="bugtracker">https://github.com/CreoleVR/QuestLHSync/issues</url>
+  <content_rating type="oars-1.1"/>
+</component>
