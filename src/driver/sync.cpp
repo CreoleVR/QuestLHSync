@@ -298,7 +298,6 @@ double FrameGrid::Learn(const std::deque<double> &h, double prev) {
 }
 
 double FrameGrid::period(int cam) const {
-  if (fixed_ > 0) return fixed_;
   auto it = c_.find(cam);
   return it == c_.end() ? 0 : it->second.p;
 }
@@ -309,22 +308,26 @@ bool FrameGrid::Lag(int cam, double t, double &lag) {
   h.push_back(t);
   while (!h.empty() && h.front() < t - WIN) h.pop_front();
   auto &lh = c.longer;
-  if (!fixed_) {
-    lh.push_back(t);
-    while (!lh.empty() && lh.front() < t - LEARN_WIN) lh.pop_front();
-  }
+  lh.push_back(t);
+  while (!lh.empty() && lh.front() < t - LEARN_WIN) lh.pop_front();
   if (h.size() < 40) return false;
+  // a Quest: whichever of its two periods the frames fold at, if either folds cleanly (otherwise it's learned)
+  if (quest_ && !c.p && !c.learn) {
+    double a = FoldSpread(h, kQuest50), b = FoldSpread(h, kQuest60), p = b < a ? kQuest60 : kQuest50;
+    if (std::min(a, b) <= 0.5 * p) c.p = p;
+    else c.learn = true;
+  }
   // learned: from the frames so far once the grid's window is full, then refined every WIN over up to LEARN_WIN (a
   // longer stretch pins the period closer). A camera's rate doesn't change, so a stretch too messy to fold (frames
   // misread as short ones) keeps the period found before
-  if (!fixed_) {
+  if (!quest_ || c.learn) {
     if (t >= c.next && h.back() - h.front() >= 0.9 * WIN) {
       double p = Learn(lh, c.p);
       if (p > 0) c.p = p;
       c.next = t + WIN;
     }
   }
-  double P = fixed_ ? fixed_ : c.p;
+  double P = c.p;
   if (P <= 0) return false;
   double grid;
   FoldGap(h, P, &grid);
@@ -380,21 +383,89 @@ bool Clock::Map(double hs, double &pc) {
 }
 
 // ================================================================ poses
+// Faster than this from a to b, the head didn't get there: the pose stream jumped
+static bool PoseJump(const PoseS &a, const PoseS &b, bool *rot = nullptr, bool *pos = nullptr) {
+  double dt = b.t - a.t;
+  bool r = QuatDeg(a.q, b.q) > 5.0 + 500.0 * dt, p = norm(b.p - a.p) > 0.05 + 3.0 * dt;
+  if (rot) *rot = r;
+  if (pos) *pos = p;
+  return r || p;
+}
+
+// A jump waits kBrkSettle s for the poses after it, since streamed poses come late, early and stale. One that comes
+// back near the poses just before it made it a glitch; the head's own motion either side (with kBrkSlack s of
+// timestamp slack) or a stall just before it (the jump catches up with the head) explain it too. Only the rest is a
+// break: the Quest may have moved its space under the older sightings.
+static constexpr double kBrkSettle = 0.2, kBrkSpan = 0.12, kBrkSlack = 0.05, kBrkStall = 0.05, kBrkBefore = 0.15;
+
 void PoseHist::Add(double t, const Quat &q, V3 p) {
   std::lock_guard<std::mutex> g(m_);
+  PoseS s{t, q, p};
   if (i_) {
     const PoseS &l = ring_[(i_ - 1) % N];
-    double dt = t - l.t;
-    if (dt <= 0) return;  // poses must move forward in time
-    double dp = norm(p - l.p), da = QuatDeg(q, l.q);
-    if (dt > 1.0 || dp > 0.05 + 3.0 * dt || da > 5.0 + 500.0 * dt) {
-      brk_t_ = t;
-      brk_what_ = Fmt("%.2f s, %.0f cm, %.1f deg", dt, dp * 100, da);
-      brk_id_++;
+    if (t - l.t <= 0) return;  // poses must move forward in time
+    if (t - l.t > 1.0) {  // a stall this long is a break, whatever the poses
+      pend_ = 0;
+      Break(l, s);
+    } else if (pend_) {
+      if (Back(s)) { i_ = pend_; pend_ = 0; }  // a glitch: its poses go
+    } else if (PoseJump(l, s)) {
+      pend_ = i_;
     }
   }
-  ring_[i_ % N] = {t, q, p};
+  ring_[i_ % N] = s;
   i_++;
+  if (pend_ && t - ring_[pend_ % N].t >= kBrkSettle) Settle();
+}
+
+void PoseHist::Break(const PoseS &a, const PoseS &b) {
+  brk_t_ = b.t;
+  brk_what_ = Fmt("%.2f s, %.0f cm, %.1f deg", b.t - a.t, norm(b.p - a.p) * 100, QuatDeg(a.q, b.q));
+  brk_id_++;
+}
+
+// s back near the poses just before the pending jump, and well off where the jump went?
+bool PoseHist::Back(const PoseS &s) const {
+  const PoseS &a = ring_[(pend_ - 1) % N], &c = ring_[pend_ % N];
+  bool jr, jp;
+  PoseJump(a, c, &jr, &jp);
+  double da = QuatDeg(a.q, c.q), dp = norm(c.p - a.p);
+  uint64_t lo = i_ > (uint64_t)N ? i_ - N : 0;
+  for (uint64_t k = pend_; k-- > lo;) {
+    const PoseS &b = ring_[k % N];
+    if (b.t < a.t - kBrkSlack) break;
+    if (!PoseJump(b, s) && (!jr || QuatDeg(b.q, s.q) < 0.5 * da) && (!jp || norm(s.p - b.p) < 0.5 * dp)) return true;
+  }
+  return false;
+}
+
+void PoseHist::Settle() {
+  uint64_t lo = i_ > (uint64_t)N ? i_ - N : 0, ia = pend_ - 1, ic = pend_;
+  pend_ = 0;
+  const PoseS &a = ring_[ia % N], &c = ring_[ic % N];
+  double dt = c.t - a.t, da = QuatDeg(a.q, c.q), dp = norm(c.p - a.p);
+  // the head's speed over kBrkSpan before the jump and after it
+  double w = 0, v = 0;
+  auto speed = [&](uint64_t i, uint64_t j) {
+    const PoseS &x = ring_[i % N], &y = ring_[j % N];
+    double d = std::max(1e-3, y.t - x.t);
+    w = std::max(w, QuatDeg(x.q, y.q) / d);
+    v = std::max(v, norm(y.p - x.p) / d);
+  };
+  uint64_t ib, id;
+  ib = Find(a.t - kBrkSpan, ib) ? ib + 1 : lo;
+  if (ib < ia) speed(ib, ia);
+  else if (ia > lo) speed(ia - 1, ia);
+  id = Find(c.t + kBrkSpan, id) ? std::min(id + 1, i_ - 1) : i_ - 1;
+  speed(ic, std::max(id, ic + 1));
+  bool moving = da <= 5.0 + w * (dt + kBrkSlack) && dp <= 0.05 + v * (dt + kBrkSlack);
+  double span = 0;  // from the pose before the oldest stall within kBrkBefore
+  for (uint64_t k = ic; k > lo && ring_[k % N].t >= c.t - kBrkBefore; k--) {
+    const PoseS &y = ring_[k % N], &x = ring_[(k - 1) % N];
+    if (y.t - x.t > kBrkStall) span = c.t - x.t;
+  }
+  bool stale = span > 0 && da <= 5.0 + 800.0 * span && dp <= 0.05 + 2.0 * span;
+  if (!moving && !stale) Break(a, c);
 }
 
 bool PoseHist::Find(double t, uint64_t &idx) const {
@@ -482,11 +553,16 @@ bool StationsFile::Load(const std::string &path) {
   anchor_R = ToM3(QuatFromJ(aq));
   if (const JVal *lq = d.get("level")) level = ToM3(QuatFromJ(lq));
   if (const JVal *st = d.get("stations"))
-    for (auto &kv : st->o)
+    for (auto &kv : st->o) {
       if (const JVal *pos = kv.second.get("pos")) {
         auto v = pos->nums();
         if (v.size() >= 3) fix[kv.first] = {v[0], v[1], v[2]};
       }
+      if (const JVal *rp = kv.second.get("ref")) {
+        auto v = rp->nums();
+        if (v.size() >= 3) ref[kv.first] = {V3{v[0], v[1], v[2]}, ToM3(QuatFromJ(kv.second.get("ref_q")))};
+      }
+    }
   const JVal *ag = d.get("auto");
   autogen = ag && ag->t == JVal::Bool && ag->b;
   loaded = true;
@@ -495,24 +571,182 @@ bool StationsFile::Load(const std::string &path) {
 
 bool StationsFile::SaveAuto(const std::string &path) const {
   Quat q = ToQuat(anchor_R), l = ToQuat(level);
+  std::string st;
+  for (auto &kv : ref) {
+    Quat r = ToQuat(kv.second.second);
+    const V3 &p = kv.second.first;
+    st += Fmt("%s\n  \"%s\": {\"ref\": [%.6f, %.6f, %.6f], \"ref_q\": [%.6f, %.6f, %.6f, %.6f]}", st.empty() ? "" : ",",
+              kv.first.c_str(), p.x, p.y, p.z, r.w, r.x, r.y, r.z);
+  }
+  if (!st.empty()) st += "\n ";
   std::string s = Fmt(
       "{\n \"auto\": true,\n \"note\": \"QuestLHSync's reference frame: %s's pose when it was first seen. SteamVR re-tilts "
-      "its lighthouse universe at every start; this pins it. level: the turn that levels it with the headset's gravity, "
-      "found from the base stations' sightings. Delete to start over.\",\n \"anchor\": \"%s\",\n"
-      " \"anchor_p\": [%.6f, %.6f, %.6f],\n \"anchor_q\": [%.6f, %.6f, %.6f, %.6f],\n"
-      " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"stations\": {},\n \"saved\": \"%s\"\n}\n",
-      anchor.c_str(), anchor.c_str(), anchor_p.x, anchor_p.y, anchor_p.z, q.w, q.x, q.y, q.z, l.w, l.x, l.y, l.z,
-      Now().c_str());
+      "its lighthouse universe at every start; this pins it. stations: each base station's pose in it; with three or "
+      "more, the frame follows the best fit of them all. level: the turn that levels it with the headset's gravity, "
+      "found from the base stations' sightings. Delete to start over.\",\n", anchor.c_str());
+  s += Fmt(" \"anchor\": \"%s\",\n \"anchor_p\": [%.6f, %.6f, %.6f],\n \"anchor_q\": [%.6f, %.6f, %.6f, %.6f],\n"
+           " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"stations\": {", anchor.c_str(), anchor_p.x, anchor_p.y,
+           anchor_p.z, q.w, q.x, q.y, q.z, l.w, l.x, l.y, l.z);
+  s += st + Fmt("},\n \"saved\": \"%s\"\n}\n", Now().c_str());
   return WriteFileAtomic(path, s);
+}
+
+// symmetric 4 x 4: the eigenvector of the largest eigenvalue (Jacobi)
+static void MaxEigVec4(double A[4][4], double v[4]) {
+  double a[4][4], V[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+  memcpy(a, A, sizeof a);
+  for (int sweep = 0; sweep < 50; sweep++) {
+    double off = 0;
+    for (int i = 0; i < 4; i++)
+      for (int j = i + 1; j < 4; j++) off += a[i][j] * a[i][j];
+    if (off < 1e-30) break;
+    for (int p = 0; p < 4; p++)
+      for (int q = p + 1; q < 4; q++) {
+        if (std::fabs(a[p][q]) < 1e-300) continue;
+        double th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+        double t = (th >= 0 ? 1 : -1) / (std::fabs(th) + std::sqrt(th * th + 1));
+        double c = 1 / std::sqrt(t * t + 1), s = t * c;
+        for (int k = 0; k < 4; k++) {
+          double akp = a[k][p], akq = a[k][q];
+          a[k][p] = c * akp - s * akq;
+          a[k][q] = s * akp + c * akq;
+          double vkp = V[k][p], vkq = V[k][q];
+          V[k][p] = c * vkp - s * vkq;
+          V[k][q] = s * vkp + c * vkq;
+        }
+        for (int k = 0; k < 4; k++) {
+          double apk = a[p][k], aqk = a[q][k];
+          a[p][k] = c * apk - s * aqk;
+          a[q][k] = s * apk + c * aqk;
+        }
+      }
+  }
+  int b = 0;
+  for (int i = 1; i < 4; i++)
+    if (a[i][i] > a[b][b]) b = i;
+  for (int k = 0; k < 4; k++) v[k] = V[k][b];
+}
+
+// the turn R that puts points a best on points b about their centres: R (a - ca) ~ b - cb. Three or more off one line:
+// Horn's quaternion method; fewer: a turn about the vertical alone, keeping `prev`'s tilt (one: `prev` itself).
+// Returns the worst miss.
+static double FitTurn(const std::vector<V3> &a, const std::vector<V3> &b, const std::vector<char> &use, const M3 &prev,
+                      M3 &R, V3 &ca, V3 &cb) {
+  std::vector<size_t> u;
+  for (size_t i = 0; i < a.size(); i++)
+    if (use[i]) u.push_back(i);
+  ca = cb = {};
+  for (size_t i : u) { ca += a[i]; cb += b[i]; }
+  ca = ca * (1.0 / u.size());
+  cb = cb * (1.0 / u.size());
+  double line = 0;  // how far the stations reach off the line through the two furthest apart
+  if (u.size() >= 3) {
+    size_t i0 = u[0], i1 = u[1];
+    for (size_t i : u)
+      for (size_t j : u)
+        if (norm(a[i] - a[j]) > norm(a[i0] - a[i1])) { i0 = i; i1 = j; }
+    V3 d = a[i1] - a[i0];
+    d = d * (1.0 / norm(d));
+    for (size_t i : u) line = std::max(line, norm(cross(a[i] - a[i0], d)));
+  }
+  if (line >= kLine) {
+    double S[3][3] = {};
+    for (size_t i : u) {
+      V3 p = a[i] - ca, q = b[i] - cb;
+      for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) S[r][c] += p[r] * q[c];
+    }
+    double N[4][4] = {
+        {S[0][0] + S[1][1] + S[2][2], S[1][2] - S[2][1], S[2][0] - S[0][2], S[0][1] - S[1][0]},
+        {S[1][2] - S[2][1], S[0][0] - S[1][1] - S[2][2], S[0][1] + S[1][0], S[2][0] + S[0][2]},
+        {S[2][0] - S[0][2], S[0][1] + S[1][0], -S[0][0] + S[1][1] - S[2][2], S[1][2] + S[2][1]},
+        {S[0][1] - S[1][0], S[2][0] + S[0][2], S[1][2] + S[2][1], -S[0][0] - S[1][1] + S[2][2]}};
+    double v[4];
+    MaxEigVec4(N, v);
+    R = ToM3(Quat{v[0], v[1], v[2], v[3]});
+  } else {
+    const auto &m = prev.m;
+    M3 tilt = Ry(-std::atan2(m[0][2] - m[2][0], m[0][0] + m[2][2])) * prev;
+    double sn = 0, cs = 0;
+    for (size_t i : u) {
+      V3 p = tilt * (a[i] - ca), q = b[i] - cb;
+      sn += p.z * q.x - p.x * q.z;
+      cs += p.x * q.x + p.z * q.z;
+    }
+    R = u.size() >= 2 ? Ry(std::atan2(sn, cs)) * tilt : prev;
+  }
+  double worst = 0;
+  for (size_t i : u) worst = std::max(worst, norm(R * (a[i] - ca) - (b[i] - cb)));
+  return worst;
+}
+
+// An automatic frame of three or more stations: SteamVR's frame -> the reference frame is the best fit of all the
+// stations' places, not one station's pose. SteamVR re-solves the stations now and then, each a few cm and a degree or
+// so its own way; one station's pose then turns the frame, and the level with it, while the fit of them all hardly
+// moves. A station kMoved off when the rest fit within it is left out (`left`, `off`: how far); `miss`: the worst miss
+// of the stations kept.
+bool Frame::Layout(const std::map<std::string, std::pair<V3, M3>> &raw, M3 &Cs, V3 &o, std::string &left,
+                   double &off, double &miss) const {
+  std::vector<std::string> keys;
+  std::vector<V3> a, b;
+  M3 prev = Cs_;
+  for (auto &kv : raw) {
+    auto r = f_.ref.find(kv.first);
+    if (r == f_.ref.end()) continue;
+    if (keys.empty() && ok_ != 1) prev = r->second.second * T(kv.second.second);  // no fit yet: a station's own turn
+    keys.push_back(kv.first);
+    a.push_back(kv.second.first);
+    b.push_back(r->second.first);
+  }
+  if (keys.empty()) return false;
+  std::vector<char> use(keys.size(), 1);
+  V3 ca, cb;
+  double worst = FitTurn(a, b, use, prev, Cs, ca, cb);
+  left.clear();
+  off = 0;
+  if (keys.size() >= 3 && worst > kMoved) {  // one station moved: the fit of the rest that misses least
+    double best = kMoved;
+    M3 R;
+    V3 pa, pb;
+    for (size_t i = 0; i < keys.size(); i++) {
+      use.assign(keys.size(), 1);
+      use[i] = 0;
+      double w = FitTurn(a, b, use, prev, R, pa, pb);
+      if (w < best) {
+        best = w;
+        left = keys[i];
+        off = norm(R * (a[i] - pa) - (b[i] - pb));
+        Cs = R; ca = pa; cb = pb;
+      }
+    }
+    if (!left.empty()) worst = best;
+  }
+  miss = worst;
+  o = ca + T(Cs) * (f_.anchor_p - cb);  // about the anchor's place, as the level turns it
+  return true;
 }
 
 void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
   if (!f_.loaded) return;
-  auto it = raw.find(f_.anchor);
-  if (it == raw.end()) return;
-  M3 Cs = f_.anchor_R * T(it->second.second);
+  M3 Cs;
+  V3 o;
+  bool lay = layout();
+  if (lay) {
+    std::string left;
+    double off;
+    if (!Layout(raw, Cs, o, left, off, miss_)) return;
+    if (left != left_ && !left.empty())
+      log_(Fmt("lighthouse frame: base station %s is %.0f cm off against the others: left out of the fit", left.c_str(),
+               off * 100));
+    left_ = left;
+  } else {
+    auto it = raw.find(f_.anchor);
+    if (it == raw.end()) return;
+    Cs = f_.anchor_R * T(it->second.second);
+    o = it->second.first;
+  }
   double ang = RotDeg(Cs);
-  int ok = ang < kMaxRot;
+  int ok = lay || ang < kMaxRot;
   if (ok != ok_ || (ok && RotDeg(Cs * T(Cs_)) > 0.01))
     log_(Fmt("lighthouse frame: SteamVR's is %.2f deg from the reference%s", ang,
              ok ? "" : " (over 3 deg: the anchor moved or a new universe; SteamVR's frame as it is)"));
@@ -522,7 +756,7 @@ void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
     Cs_ = Cs;
     GC_ = grav_ ? G_ : M3();
     C_ = GC_ * f_.level * Cs;
-    o_ = it->second.first;
+    o_ = o;
     oref_ = f_.anchor_p;
   } else {
     Cs_ = C_ = GC_ = M3();
@@ -1157,8 +1391,11 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
              "fit about as well: %s", best[0] * kDeg, bs, Meters(db).c_str(), m[0] * kDeg, sm, Meters(dm).c_str(),
              why.c_str()));
   amb_state_ = state;
+  X4 other = pick_m ? best : m;
   if (pick_m) { best = m; bs = sm; }
-  acq_forced_ = (state == 1 || state == 2) && has_x_ && Apart(best, x_, S) > 0.3;
+  // the devices' evidence flips the current fit to its own mirror; a pair without the current fit in it is just
+  // another candidate
+  acq_forced_ = (state == 1 || state == 2) && has_x_ && Apart(best, x_, S) > 0.3 && Apart(other, x_, S) < 1.0;
 }
 
 // the HMD pose stream broke: the Quest's space may have changed under the older sightings (boundary reset)
@@ -1424,10 +1661,25 @@ StepStat Solver::Step(double /*now*/) {
     if (Acquire(now, xa, sa, tight)) {
       int cur = has_x_ ? ThinnedScore(x_, now) : 0;
       st.has_acq = true; st.acq_sa = sa; st.acq_cur = cur; st.acq_tight = tight;
-      // the mirror check's flip has the worn devices for evidence as well: half the support will do
+      // the mirror check's flip has the worn devices for evidence as well: half the support will do. A fit far off the
+      // current one (four stations in a square fit about as well turned by 90 deg) goes by the worn or held devices
+      // too; without them it takes twice the support, or tight sightings: a wrong fit that lines stations up with other
+      // stations or lamps gathers a dozen, few of them tight, and after a pose break the current one has few yet
       int k = acq_dim_ ? 2 : 1;  // dim rays: other lights line up with a wrong alignment more easily
-      bool enough = sa >= k * ACQ || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2);
-      if (enough && (sa > 2 * cur + 5 || acq_forced_)) {
+      double dn, dc;
+      std::string how;
+      bool far = has_x_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
+      int fav = far ? BodyFavours(xa, x_, dn, dc, how) : 0;
+      int need = far && !fav ? 2 * ACQ : ACQ;
+      bool enough = sa >= k * need || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2);
+      if (!enough || !(sa > 2 * cur + 5 || acq_forced_)) {
+      } else if (fav == 2) {
+        if (now - kept_said_ > 60) {
+          kept_said_ = now;
+          log_(Fmt("acquisition: yaw %+.1f deg (support %d, was %d) would fit as well, but %s: the current fit stays",
+                   xa[0] * kDeg, sa, cur, how.c_str()));
+        }
+      } else {
         log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s", xa[0] * kDeg, xa[1],
                  xa[2], xa[3], sa, tight, TIGHT_DEG, cur, acq_forced_ ? ", by the mirror check" : ""));
         Reset(xa);
@@ -1771,8 +2023,9 @@ Sync::Sync(SyncConfig cfg, LogFn log)
     return have_optics_ && optics_.InImage(cam, d, 8.0);
   });
   if (sfile_.loaded)
-    log_(Fmt("reference frame: anchor %s%s, %d measured station(s)", sfile_.anchor.c_str(),
-             sfile_.autogen ? " (automatic)" : "", (int)sfile_.fix.size()));
+    log_(Fmt("reference frame: anchor %s%s, %d measured station(s)%s", sfile_.anchor.c_str(),
+             sfile_.autogen ? " (automatic)" : "", (int)sfile_.fix.size(),
+             frame_.layout() ? Fmt(", the fit of %d stations", (int)sfile_.ref.size()).c_str() : ""));
   else
     log_("no stations.json yet: the reference frame is set the first time base stations show up");
   LoadState();
@@ -1847,12 +2100,9 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
-  // the Quest Pro's frame period is known; another headset's is learned from its frames (a few seconds more before
-  // a sighting's poll lag comes off)
-  std::string dev = optics_.device();
-  for (auto &ch : dev) ch = (char)tolower((unsigned char)ch);
-  grid_period_ = (dev.empty() || dev == "seacliff") && !cfg_.learn_grid ? FrameGrid::kQuestPro : 0.0;
-  grid_ = FrameGrid(grid_period_);
+  // a Quest's frame period is one of two, the Frame's is learned from its frames
+  grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
+  grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   return true;
 }
@@ -1860,7 +2110,7 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
 void Sync::HeadsetReset() {
   std::lock_guard<std::mutex> g(net_);
   clock_.Clear();
-  grid_ = FrameGrid(grid_period_);
+  grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
 }
 
@@ -2003,7 +2253,7 @@ void Sync::OnLine(double pc, const char *line) {
   bool grid_lag = nb >= 0 && grid_.Lag(cam, hs, lag);
   if (optics_.exact_time()) lag = 0;
   bool have_lag = nb >= 0 && (optics_.exact_time() || grid_lag);
-  if (nb >= 0 && !grid_period_) {  // a learned frame period: log it when it's found or moves
+  if (nb >= 0) {  // the frame period: log it when it's found or moves
     double p = grid_.period(cam), &was = grid_logged_[cam];
     if (p > 0 && std::fabs(p - was) > 0.0001) {
       log_(Fmt("camera %d: short frames every %.3f ms", cam, p * 1000));
@@ -2153,6 +2403,47 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
            "%.2f deg", step, RotDeg(L), lv.stations, lv.med));
 }
 
+// An automatic frame takes its stations' poses in it once three show up (Frame::Layout follows them from then on), adds
+// new ones as they come, and moves a station's place when the fit has left it out for kLayoutMoved s (it was moved).
+// When no fit gets within kMoved for kLayoutMoved s, more than one was moved: the frame starts over from SteamVR's.
+void Sync::LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
+  if (!sfile_.autogen || frame_.ok() != 1) return;
+  bool was = frame_.layout();
+  if (!was && raw.size() < 3) return;
+  if (!was || frame_.miss() <= kMoved) bad_since_ = -1;
+  else if (bad_since_ < 0) bad_since_ = now;
+  if (bad_since_ >= 0 && now - bad_since_ >= kLayoutMoved && raw.size() >= 3) {
+    sfile_.ref.clear();
+    sfile_.ref.insert(raw.begin(), raw.end());
+    sfile_.level = M3();  // SteamVR's frame as it is now: its level is found again
+    sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
+    bad_since_ = -1;
+    log_(Fmt("lighthouse frame: base stations moved (%.0f cm off the fit): reference frame reset",
+             frame_.miss() * 100));
+    frame_.Update(raw);
+    return;
+  }
+  std::string left = frame_.left();
+  if (left != left_seen_) { left_seen_ = left; left_since_ = now; }
+  int n = 0;
+  for (auto &kv : raw) {
+    bool known = sfile_.ref.count(kv.first) > 0;
+    bool moved = known && kv.first == left && now - left_since_ >= kLayoutMoved;
+    if (known && !moved) continue;
+    V3 p; M3 R;
+    frame_.Unlevelled(kv.second.first, kv.second.second, p, R);
+    sfile_.ref[kv.first] = {p, R};
+    n++;
+    if (was)
+      log_(Fmt("lighthouse frame: base station %s %s", kv.first.c_str(),
+               moved ? "was moved: its new place taken" : "added to the fit"));
+  }
+  if (!n) return;
+  if (!was) log_(Fmt("lighthouse frame: follows the fit of %d base stations from now on", n));
+  sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
+  frame_.Update(raw);
+}
+
 // Two stations: the level the cameras see across them, against gravity's (gravity.h) about the same axis. Logged every
 // few minutes (and recorded), so the two can be compared; nothing is applied from it.
 void Sync::LevelCheck(double now) {
@@ -2216,7 +2507,7 @@ Transform Sync::Tick(double now) {
       sfile_.anchor_R = best->second.second;
       sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
       log_("reference frame set: anchor " + best->first);
-    } else if (sfile_.autogen && raw.count(sfile_.anchor)) {  // an automatic reference follows a moved anchor
+    } else if (sfile_.autogen && !frame_.layout() && raw.count(sfile_.anchor)) {  // follows a moved anchor
       auto &a = raw[sfile_.anchor];
       if (RotDeg(sfile_.anchor_R * T(a.second)) > kMaxRot || norm(a.first - sfile_.anchor_p) > kMoved) {
         sfile_.anchor_p = a.first;
@@ -2227,6 +2518,7 @@ Transform Sync::Tick(double now) {
       }
     }
     frame_.Update(raw);
+    LayoutStep(raw, now);
     std::map<std::string, V3> cs;
     for (auto &kv : raw) {
       V3 p; M3 R;

@@ -56,7 +56,6 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
    It installs into `~/.local/share/questlhsync`, starts `lhsyncd` as a systemd
    user service and restarts SteamVR on the headset once, to load the
    `questlhsync_frame` driver.
-
    Or with a window instead of a terminal: install
    `QuestLHSync-frame-installer-<version>.flatpak` (open it in Discover in
    Desktop Mode, or `flatpak install --user QuestLHSync-frame-installer-<version>.flatpak`;
@@ -65,6 +64,7 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
    its `install.sh`; **Choose…** takes a `QuestLHSync-<version>.zip` or
    `QuestLHSync-frame-<version>.tar.gz` you already have. It also shows
    whether the service runs and the driver is registered, and uninstalls.
+
 3. **PC:** with SteamVR closed, move the `questlhsync` folder somewhere
    permanent and register it:
 
@@ -138,10 +138,16 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 ## Uninstall
 
 - **Quest:** remove the module in the Magisk app and reboot.
+<<<<<<< HEAD
 - **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset, or
   **Uninstall** in QuestLHSync Installer.
 - **PC:** with SteamVR closed, run
   `vrpathreg removedriver "C:\path\to\questlhsync"`, then delete
+=======
+- **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset.
+- **PC:** with SteamVR closed, click **Uninstall** in the installer, or run
+  `vrpathreg removedriver "C:\path\to\questlhsync"` and delete
+>>>>>>> master
   `%LOCALAPPDATA%\QuestLHSync`.
 
 ## Building
@@ -150,7 +156,8 @@ Visual Studio 2022 with C++, the Android NDK, [Zig](https://ziglang.org) and
 Python 3:
 
 ```
-build.bat                        SteamVR driver + dashboard app (SteamVR closed)
+build.bat                        SteamVR driver + dashboard app (SteamVR closed) + out\QuestLHSync-Installer.exe
+build.bat installer              only the installer
 python magisk\build_module.py    Magisk module, into out\
 python frame\build.py            Steam Frame package, into out\
 python release.py                out\QuestLHSync-<version>.zip
