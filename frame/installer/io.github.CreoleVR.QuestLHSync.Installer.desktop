@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=QuestLHSync Installer
+Comment=Install QuestLHSync's headset service and SteamVR driver on the Steam Frame
+Exec=questlhsync-installer
+Icon=io.github.CreoleVR.QuestLHSync.Installer
+Terminal=false
+Categories=Utility;Settings;
+Keywords=SteamVR;Lighthouse;VR;Steam Frame;

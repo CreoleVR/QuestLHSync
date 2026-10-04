@@ -7,6 +7,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 DEST=$HOME/.local/share/questlhsync
 UNIT=$HOME/.config/systemd/user/questlhsync.service
 VRPATHREG=/opt/steamvr/bin/linuxarm64/vrpathreg
+# Desktop Mode's terminal has XDG_RUNTIME_DIR=/run/user/<uid>/nested_plasma, where systemctl --user finds no systemd
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
 [ -x "$VRPATHREG" ] || { echo "SteamVR not found in /opt/steamvr: is this a Steam Frame?" >&2; exit 1; }
 
 systemctl --user stop questlhsync.service 2>/dev/null || true

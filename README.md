@@ -56,6 +56,15 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
    It installs into `~/.local/share/questlhsync`, starts `lhsyncd` as a systemd
    user service and restarts SteamVR on the headset once, to load the
    `questlhsync_frame` driver.
+
+   Or with a window instead of a terminal: install
+   `QuestLHSync-frame-installer-<version>.flatpak` (open it in Discover in
+   Desktop Mode, or `flatpak install --user QuestLHSync-frame-installer-<version>.flatpak`;
+   it pulls the GNOME runtime from Flathub), then open **QuestLHSync
+   Installer**. **Install** downloads the latest release from GitHub and runs
+   its `install.sh`; **Choose…** takes a `QuestLHSync-<version>.zip` or
+   `QuestLHSync-frame-<version>.tar.gz` you already have. It also shows
+   whether the service runs and the driver is registered, and uninstalls.
 3. **PC:** with SteamVR closed, move the `questlhsync` folder somewhere
    permanent and register it:
 
@@ -129,7 +138,8 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 ## Uninstall
 
 - **Quest:** remove the module in the Magisk app and reboot.
-- **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset.
+- **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset, or
+  **Uninstall** in QuestLHSync Installer.
 - **PC:** with SteamVR closed, run
   `vrpathreg removedriver "C:\path\to\questlhsync"`, then delete
   `%LOCALAPPDATA%\QuestLHSync`.
@@ -151,6 +161,14 @@ python install.py headset        install the module over adb, no reboot
 Zig cross-compiles the Steam Frame package (`zig` on PATH, or `ZIG` set to it).
 On the Frame itself or any arm64 Linux, `frame/build.py` uses `cc` and `c++`
 instead.
+
+The Steam Frame's installer app is a Flatpak, built on Linux for the machine's
+own architecture (so on the Frame, or any arm64 Linux) with
+`python3 frame/installer/build.py`, into
+`out/QuestLHSync-frame-installer-<version>.flatpak`. It needs flatpak-builder
+and the GNOME SDK:
+`flatpak install --user flathub org.flatpak.Builder org.gnome.Sdk//50`.
+`release.py` doesn't pack it: attach it to the release on its own.
 
 `lhsyncd`'s core (`src/headset/lhsyncd.c`) is shared by both headsets; each adds
 its own side behind `src/headset/headset.h` (`magisk/src/quest.c`,

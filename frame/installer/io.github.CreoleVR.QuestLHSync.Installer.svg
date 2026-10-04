@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="#1b2838"/>
+  <!-- a base station's sweep -->
+  <path d="M24 30 L64 54 L24 78 Z" fill="#66c0f4" opacity="0.35"/>
+  <rect x="16" y="40" width="16" height="28" rx="4" fill="#c7d5e0"/>
+  <!-- the headset -->
+  <rect x="52" y="44" width="60" height="32" rx="12" fill="#c7d5e0"/>
+  <circle cx="70" cy="60" r="7" fill="#1b2838"/>
+  <circle cx="94" cy="60" r="7" fill="#1b2838"/>
+  <!-- install arrow -->
+  <path d="M82 84 v16 m-10 -9 l10 10 l10 -10" stroke="#66c0f4" stroke-width="6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
