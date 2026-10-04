@@ -35,10 +35,17 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
 
 1. Download `QuestLHSync-<version>.zip` from
    [Releases](https://github.com/CreoleVR/QuestLHSync/releases) and extract it.
-2. **Headset, Quest:** install `QuestLHSync-magisk-<version>.zip` in the Magisk
-   app (**Modules > Install from storage**) and reboot.
+2. **Headset, <ins>Quest</ins>:** install `QuestLHSync-magisk-<version>.zip` in the Magisk
+   app (**Modules > Install from storage**) and **reboot**.
+   To install it over adb instead:
 
-   **Headset, Steam Frame:** copy `QuestLHSync-frame-<version>.tar.gz` to the
+   ```
+   adb push QuestLHSync-magisk-<version>.zip /sdcard/Download/
+   adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-magisk-<version>.zip"
+   adb reboot
+   ```
+
+   **Headset, <ins>Steam Frame</ins>:** copy `QuestLHSync-frame-<version>.tar.gz` to the
    Frame (over ssh, or a download in Desktop Mode), then in a terminal on it:
 
    ```
