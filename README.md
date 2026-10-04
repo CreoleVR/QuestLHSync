@@ -56,8 +56,13 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
    It installs into `~/.local/share/questlhsync`, starts `lhsyncd` as a systemd
    user service and restarts SteamVR on the headset once, to load the
    `questlhsync_frame` driver.
-3. **PC:** with SteamVR closed, move the `questlhsync` folder somewhere
-   permanent and register it:
+3. **PC:** run `QuestLHSync-Installer.exe` (built with `build.bat`, in `out\`).
+   It downloads the latest release, installs the driver to
+   `%LOCALAPPDATA%\QuestLHSync\questlhsync`, registers it with SteamVR and
+   offers an update whenever a newer release is out. Close SteamVR first.
+
+   Or by hand: move the `questlhsync` folder from the zip somewhere permanent
+   and, with SteamVR closed, register it:
 
    ```
    "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "C:\path\to\questlhsync"
@@ -130,8 +135,8 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 
 - **Quest:** remove the module in the Magisk app and reboot.
 - **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset.
-- **PC:** with SteamVR closed, run
-  `vrpathreg removedriver "C:\path\to\questlhsync"`, then delete
+- **PC:** with SteamVR closed, click **Uninstall** in the installer, or run
+  `vrpathreg removedriver "C:\path\to\questlhsync"` and delete
   `%LOCALAPPDATA%\QuestLHSync`.
 
 ## Building
@@ -140,7 +145,8 @@ Visual Studio 2022 with C++, the Android NDK, [Zig](https://ziglang.org) and
 Python 3:
 
 ```
-build.bat                        SteamVR driver + dashboard app (SteamVR closed)
+build.bat                        SteamVR driver + dashboard app (SteamVR closed) + out\QuestLHSync-Installer.exe
+build.bat installer              only the installer
 python magisk\build_module.py    Magisk module, into out\
 python frame\build.py            Steam Frame package, into out\
 python release.py                out\QuestLHSync-<version>.zip
