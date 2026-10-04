@@ -138,16 +138,10 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 ## Uninstall
 
 - **Quest:** remove the module in the Magisk app and reboot.
-<<<<<<< HEAD
 - **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset, or
   **Uninstall** in QuestLHSync Installer.
 - **PC:** with SteamVR closed, run
   `vrpathreg removedriver "C:\path\to\questlhsync"`, then delete
-=======
-- **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset.
-- **PC:** with SteamVR closed, click **Uninstall** in the installer, or run
-  `vrpathreg removedriver "C:\path\to\questlhsync"` and delete
->>>>>>> master
   `%LOCALAPPDATA%\QuestLHSync`.
 
 ## Building
