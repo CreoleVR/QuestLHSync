@@ -284,10 +284,9 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
   // buttons
   pg.buttons.clear();
   int by = H - 66, bh = 46;
-  pg.buttons.push_back({48, by, 200, bh, QLHS_CMD_REACQUIRE, L"Re-acquire", false});
-  pg.buttons.push_back({264, by, 240, bh, s.paused ? QLHS_CMD_RESUME : QLHS_CMD_PAUSE,
+  pg.buttons.push_back({48, by, 240, bh, s.paused ? QLHS_CMD_RESUME : QLHS_CMD_PAUSE,
                         s.paused ? L"Resume corrections" : L"Pause corrections", s.paused != 0});
-  pg.buttons.push_back({520, by, 210, bh, s.recording ? QLHS_CMD_RECORD_OFF : QLHS_CMD_RECORD_ON,
+  pg.buttons.push_back({304, by, 210, bh, s.recording ? QLHS_CMD_RECORD_OFF : QLHS_CMD_RECORD_ON,
                         s.recording ? L"Stop recording" : L"Record session", false});
   for (size_t i = 0; i < pg.buttons.size(); i++) {
     auto &b = pg.buttons[i];

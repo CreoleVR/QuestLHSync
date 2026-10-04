@@ -737,7 +737,7 @@ static bool Solve(double A[kMaxDof][kMaxDof], const double *b, double *x, int n)
 // nothing by looking longer. xa: the prior's center (default x0). cond: the sightings alone pin every DOF.
 // 4 DOF; with a pivot 6: the stations also tilt about it (Tilt(y[4], y[5])), and the prior holds only the tilt.
 Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now,
-                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate) {
+                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate, const V3 *axis) {
   FitR out;
   std::vector<V3> P, Zq;
   Predict(x0, S, Z, P, Zq);
@@ -767,16 +767,17 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
   std::vector<V3> Sc(S.size());  // about the centroid; with a pivot, about the pivot (pc: the pivot about the centroid)
   for (size_t k = 0; k < S.size(); k++) Sc[k] = S[k] - (pivot ? *pivot : c);
   const V3 pc = pivot ? *pivot - c : V3{};
-  const int np = pivot ? 6 : 4;
+  if (!pivot) axis = nullptr;
+  const int np = pivot ? (axis ? 5 : 6) : 4;
   const double f = FSCALE;
-  const size_t nrob = rows.size() * 3, nr = nrob + (pivot ? 2 : 4);
+  const size_t nrob = rows.size() * 3, nr = nrob + (pivot ? (axis ? 1 : 2) : 4);
 
   auto res = [&](const double *y, std::vector<double> &rv) {
     rv.resize(nr);
     double cy = std::cos(y[0]), sy = std::sin(y[0]);
     V3 sh = cq + V3{y[1], y[2], y[3]};
     M3 Rt;
-    if (pivot) Rt = Tilt(y[4], y[5]);
+    if (pivot) Rt = axis ? Tilt(y[4] * axis->x, y[4] * axis->z) : Tilt(y[4], y[5]);
     for (size_t i = 0; i < rows.size(); i++) {
       const Row &w = rows[i];
       V3 U = RyMul(cy, sy, pivot ? pc + Rt * Sc[w.k] : Sc[w.k]) + sh - w.o;
@@ -786,7 +787,7 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
     }
     if (pivot) {
       rv[nrob] = f * y[4] / SIG_LEVEL;
-      rv[nrob + 1] = f * y[5] / SIG_LEVEL;
+      if (!axis) rv[nrob + 1] = f * y[5] / SIG_LEVEL;
       return;
     }
     rv[nrob] = f * Wrap(y[0] - xa[0]) / SIG_YAW;
@@ -868,7 +869,8 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
       for (int b = 0; b < np; b++) H[a][b] += w * Ji[a] * Ji[b] * sc[a] * sc[b] / (SIG_R * SIG_R);
   }
   out.cond = MinEig(H, np) >= 1.0;
-  if (pivot) out.tilt = Tilt(y[4], y[5]);
+  if (pivot) out.tilt = axis ? Tilt(y[4] * axis->x, y[4] * axis->z) : Tilt(y[4], y[5]);
+  if (axis) out.theta = y[4];
   double yaw = Wrap(y[0]);
   V3 t = cq + V3{y[1], y[2], y[3]} - Ry(yaw) * c;
   out.x = {yaw, t.x, t.y, t.z};
@@ -1083,11 +1085,22 @@ static double Apart(const X4 &a, const X4 &b, const std::vector<V3> &S) {
 
 static std::string Meters(double d) { return std::isfinite(d) ? Fmt("%.1f m", d) : std::string("none"); }
 
-int Solver::BodyFavours(const X4 &a, const X4 &b, double &da, double &db) const {
+// Their motion first: worn or held, they go where the head goes, and a fit and its mirror (turned 180 deg) move them
+// opposite ways, wherever one stands and whatever lies about. Then how near the head they stay.
+int Solver::BodyFavours(const X4 &a, const X4 &b, double &da, double &db, std::string &how) const {
   da = body_ ? body_(a) : NAN;
   db = body_ ? body_(b) : NAN;
+  double moved = 0, ma = motion_ ? motion_(a, moved) : NAN, mb = motion_ ? motion_(b, moved) : NAN;
+  if (std::isfinite(ma) && std::isfinite(mb) && moved >= kBodyMoved && std::max(ma, mb) >= kBodyCorr &&
+      std::fabs(ma - mb) >= 2 * kBodyCorr) {
+    how = Fmt("the lighthouse devices worn or held move with the head one way (%+.2f against %+.2f)", std::max(ma, mb),
+              std::min(ma, mb));
+    return ma > mb ? 1 : 2;
+  }
   if (!std::isfinite(da) || !std::isfinite(db) || std::min(da, db) >= kBodyNear || std::fabs(da - db) <= kBodyGap)
     return 0;
+  how = Fmt("the lighthouse devices worn or held stay near the head one way (%s from it, %s the other way)",
+            Meters(std::min(da, db)).c_str(), Meters(std::max(da, db)).c_str());
   return da < db ? 1 : 2;
 }
 
@@ -1122,14 +1135,15 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
   if (sm * 2 < bs) { amb_state_ = 0; return; }  // clearly worse: not ambiguous
   if (bs * 2 < sm) { amb_state_ = 0; best = m; bs = sm; return; }
   double db, dm;
-  int fav = BodyFavours(best, m, db, dm);
+  std::string how;
+  int fav = BodyFavours(best, m, db, dm, how);
   bool pick_m = false;
   int state;
-  const char *why;
+  std::string why;
   if (fav) {
     pick_m = fav == 2;
     state = pick_m ? 1 : 2;
-    why = "the lighthouse devices near the head decide";
+    why = how + (pick_m ? ": the mirror" : ": the fit");
   } else if (has_x_) {
     pick_m = Apart(m, x_, S) < Apart(best, x_, S);
     state = 3;
@@ -1140,7 +1154,8 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
   }
   if (state != amb_state_)
     log_(Fmt("mirror check: yaw %+.1f (support %d, devices %s from the head) and its mirror yaw %+.1f (support %d, %s) "
-             "fit about as well: %s", best[0] * kDeg, bs, Meters(db).c_str(), m[0] * kDeg, sm, Meters(dm).c_str(), why));
+             "fit about as well: %s", best[0] * kDeg, bs, Meters(db).c_str(), m[0] * kDeg, sm, Meters(dm).c_str(),
+             why.c_str()));
   amb_state_ = state;
   if (pick_m) { best = m; bs = sm; }
   acq_forced_ = (state == 1 || state == 2) && has_x_ && Apart(best, x_, S) > 0.3;
@@ -1310,10 +1325,10 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
     // the devices worn or held are the stronger evidence, and the mirror check goes by them: a switch against them
     // would only be switched back
     double dc, ds;
-    if (BodyFavours(x_, xs, dc, ds) == 1) {
-      say("body " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but the lighthouse devices near the "
-                              "head say they aren't (%s from it, %s that way round): kept as it is", pair.c_str(), worst,
-                              Meters(dc).c_str(), Meters(ds).c_str()));
+    std::string how;
+    if (BodyFavours(x_, xs, dc, ds, how) == 1) {
+      say("body " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but %s: kept as it is",
+                              pair.c_str(), worst, how.c_str()));
     } else if (cur > 0 && sw >= kSwapFit * cur) {
       log_(Fmt("channel check: %s were the wrong way round (by %.2f): yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)",
                pair.c_str(), worst, xs[0] * kDeg, xs[1], xs[2], xs[3], sw, cur));
@@ -1470,6 +1485,75 @@ bool Solver::Level(V3 pivot, LevelR &out) {
   out.tilt = L;
   out.stations = held;
   out.med = med;
+  return true;
+}
+
+// With two stations the cameras can't see a tilt about the line through them (both stay put), but they do see one
+// across it: that raises one station and lowers the other. The 4-DOF fit's stations tilted about axis through
+// pivot, on the last WIN s of sightings, and on four time slices of them: their scatter says how well it's known.
+bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out) {
+  if (!has_x_) return false;
+  std::vector<std::string> keys;
+  std::vector<V3> S0, Z0;
+  Stations(keys, S0, Z0);
+  if (S0.size() < 2) return false;
+  const double now = seen_;
+  Rays r = GetRays(std::max(now - WIN, since_));
+  if (r.size() < 200) return false;
+  auto fit = [&](const Rays &rr, double &th, double *med) {
+    X4 x = x_;
+    double t = 0;
+    std::vector<V3> S(S0.size()), Z(Z0.size());
+    for (double gate : {GATE, 0.6}) {
+      M3 L = Tilt(t * axis.x, t * axis.z);
+      for (size_t k = 0; k < S0.size(); k++) { S[k] = pivot + L * (S0[k] - pivot); Z[k] = L * Z0[k]; }
+      FitR f = Fit(x, S, Z, rr, now, gate, nullptr, &pivot, DimGate(), &axis);
+      if (!f.ok) return false;
+      x = f.x;
+      t += f.theta;
+    }
+    th = t;
+    if (med) {  // and each station seen from enough (head, direction) cells
+      M3 L = Tilt(t * axis.x, t * axis.z);
+      for (size_t k = 0; k < S0.size(); k++) { S[k] = pivot + L * (S0[k] - pivot); Z[k] = L * Z0[k]; }
+      std::vector<int> cells;
+      Support(x, S, Z, Thin(rr), INLIER, cells);
+      for (int c : cells)
+        if (c < LEVEL_CELLS) return false;
+      std::vector<V3> P, Zq;
+      Predict(x, S, Z, P, Zq);
+      std::vector<double> in;
+      for (size_t n = 0; n < rr.size(); n++) {
+        int k;
+        double a;
+        Nearest(P, Zq, rr.O[n], rr.D[n], k, a);
+        if (a < INLIER) in.push_back(a);
+      }
+      if (in.empty()) return false;
+      *med = Median(in);
+    }
+    return true;
+  };
+  if (!fit(r, out.theta, &out.med) || out.med > LEVEL_MED) return false;
+  std::vector<double> ts;
+  double t0 = r.T.front(), t1 = r.T.back();
+  for (int q = 0; q < 4; q++) {
+    Rays s;
+    for (size_t n = 0; n < r.size(); n++)
+      if (r.T[n] >= t0 + (t1 - t0) * q / 4 && r.T[n] < t0 + (t1 - t0) * (q + 1) / 4 + (q == 3 ? 1 : 0)) {
+        s.T.push_back(r.T[n]); s.G.push_back(r.G[n]); s.O.push_back(r.O[n]); s.D.push_back(r.D[n]);
+        s.C.push_back(r.C[n]); s.B.push_back(r.B[n]);
+      }
+    double th;
+    if (s.size() >= 50 && fit(s, th, nullptr)) ts.push_back(th);
+  }
+  out.slices = (int)ts.size();
+  if (ts.size() < 3) return false;
+  double m = 0, v = 0;
+  for (double t : ts) m += t;
+  m /= ts.size();
+  for (double t : ts) v += (t - m) * (t - m);
+  out.sd = std::sqrt(v / (ts.size() - 1) / ts.size());
   return true;
 }
 
@@ -1681,6 +1765,7 @@ Sync::Sync(SyncConfig cfg, LogFn log)
       solver_(log_, 1, sfile_.autogen ? std::map<std::string, V3>() : sfile_.fix) {
   if (cfg_.arrival_clock) expo_ = kExpoArrival;
   solver_.SetBody([this](const X4 &x) { return BodyDist(x); });
+  solver_.SetMotion([this](const X4 &x, double &moved) { return BodyMotion(x, moved); });
   solver_.SetInImage([this](int cam, V3 d) {
     std::lock_guard<std::mutex> g(net_);
     return have_optics_ && optics_.InImage(cam, d, 8.0);
@@ -1839,6 +1924,45 @@ double Sync::BodyDist(const X4 &x) {
   return Median(v);
 }
 
+// How the worn or held lighthouse devices' horizontal motion follows the head's, were x the alignment: the
+// correlation of their steps (about 0.3 s each) with the head's over the same times, all devices together. +1 every
+// step along, -1 every step against; devices left lying add nothing. moved: the head's own path meanwhile (m).
+double Sync::BodyMotion(const X4 &x, double &moved) {
+  std::vector<BodyS> b;
+  {
+    std::lock_guard<std::mutex> g(body_m_);
+    b.assign(body_.begin(), body_.end());
+  }
+  moved = 0;
+  if (b.size() < 20) return NAN;
+  M3 C;
+  V3 tc;
+  frame_.Rotation(C, tc);
+  double c = std::cos(x[0]), s = std::sin(x[0]), num = 0, nh = 0, nd = 0;
+  std::map<int, std::vector<const BodyS *>> per;
+  for (const BodyS &e : b) per[e.dev].push_back(&e);
+  for (auto &kv : per) {
+    const std::vector<const BodyS *> &v = kv.second;
+    for (size_t i = 0, j = 0; i < v.size(); i = j) {
+      for (j = i + 1; j < v.size() && v[j]->t - v[i]->t < 0.25; j++) {}
+      if (j >= v.size()) break;
+      if (v[j]->t - v[i]->t > 0.5) continue;
+      M3 R;
+      V3 h0, h1;
+      if (!poses_.At(v[i]->t, R, h0) || !poses_.At(v[j]->t, R, h1)) continue;
+      V3 dq = RyMul(c, s, C * (v[j]->p - v[i]->p)), dh = h1 - h0;
+      num += dh.x * dq.x + dh.z * dq.z;
+      nh += dh.x * dh.x + dh.z * dh.z;
+      nd += dq.x * dq.x + dq.z * dq.z;
+    }
+  }
+  M3 R;
+  V3 h0, h1;
+  for (double t = b.front().t; t + 0.25 <= b.back().t; t += 0.25)
+    if (poses_.At(t, R, h0) && poses_.At(t + 0.25, R, h1)) moved += std::hypot(h1.x - h0.x, h1.z - h0.z);
+  return nh > 0 && nd > 0 ? num / std::sqrt(nh * nd) : NAN;
+}
+
 void Sync::SetRecord(FILE *f) {
   std::lock_guard<std::mutex> g(rec_m_);
   if (rec_) fclose(rec_);
@@ -1985,14 +2109,6 @@ void Sync::SetChannels(const std::map<std::string, int> &ch) {
   channels_ = ch;
 }
 
-void Sync::Reacquire() {
-  // like a pose break: older sightings no longer count, acquisition looks again at once
-  V3 p;
-  double t;
-  if (poses_.Latest(p, &t)) solver_.PoseBreak(t);
-  log_("re-acquire asked for: older sightings dropped");
-}
-
 // One or two base stations leave the level to SteamVR, and the cameras can't fix it (gravity.h); with three, an
 // automatic frame is levelled by the cameras (LevelStep)
 bool Sync::GravityFrame(M3 &C, M3 &turn, std::string &key) {
@@ -2035,6 +2151,33 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
   solver_.Relevel(lv.x);
   log_(Fmt("lighthouse frame levelled with the headset: tilted %.2f deg (%.2f deg in all), %d base stations within "
            "%.2f deg", step, RotDeg(L), lv.stations, lv.med));
+}
+
+// Two stations: the level the cameras see across them, against gravity's (gravity.h) about the same axis. Logged every
+// few minutes (and recorded), so the two can be compared; nothing is applied from it.
+void Sync::LevelCheck(double now) {
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z;
+  solver_.Stations(keys, S, Z);
+  if (S.size() != 2) return;  // with three, LevelStep levels the frame by the cameras themselves
+  // a measured station stays where the cameras put it, gravity's levelling or not: they'd only check themselves
+  if (solver_.measured(keys[0]) || solver_.measured(keys[1])) return;
+  V3 b = S[1] - S[0];
+  double h = std::hypot(b.x, b.z);
+  if (h < 1) return;
+  V3 axis{-b.z / h, 0, b.x / h}, pivot = (S[0] + S[1]) * 0.5;
+  Solver::AxisR a;
+  if (!solver_.LevelAxis(pivot, axis, a)) return;
+  // gravity's tilt in the frame now, about the same axis: the cameras' view of the frame before it is the two together
+  const M3 &G = frame_.gravity();
+  V3 rg{G.m[2][1] - G.m[1][2], G.m[0][2] - G.m[2][0], G.m[1][0] - G.m[0][1]};
+  double g = dot(rg, axis) * 0.5, cam = a.theta + g;
+  Rec(now, "I level %.5f %.5f %.5f %.4f", cam * kDeg, a.sd * kDeg, g * kDeg, a.med);
+  if (now - check_said_ < 180) return;
+  check_said_ = now;
+  log_(Fmt("level check across %s and %s: the cameras see the frame %+.2f deg off level (within %.2f) before "
+           "gravity's levelling, which turns it %+.2f deg about the same axis%s", keys[0].c_str(), keys[1].c_str(),
+           cam * kDeg, a.sd * kDeg, g * kDeg, std::fabs(a.theta) > 3 * a.sd ? "" : ": they agree"));
 }
 
 // two stations have 10 sightings that fit
@@ -2199,6 +2342,10 @@ Transform Sync::Tick(double now) {
     if (now - last_level_ >= 10) {
       last_level_ = now;
       LevelStep(raw, now);
+    }
+    if (now - last_check_ >= 60 && Locked(solver_.has_x(), st) && st.cond) {
+      last_check_ = now;
+      LevelCheck(now);
     }
   }
   // slew toward the solution, faster while the head turns or walks (kSlew*), jump if far (acquisition)
