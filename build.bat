@@ -1,7 +1,8 @@
 @echo off
-rem builds the SteamVR driver (driver\questlhsync\bin\win64\driver_questlhsync.dll) and the dashboard app
-rem (QuestLHSync.exe next to it). SteamVR must be closed to replace a loaded DLL; "build.bat overlay" builds only
-rem the dashboard app (close QuestLHSync.exe first). Needs Visual Studio 2022 (or its Build Tools) with C++.
+rem builds the SteamVR driver (driver\questlhsync\bin\win64\driver_questlhsync.dll), the dashboard app
+rem (QuestLHSync.exe next to it) and the installer (out\QuestLHSync-Installer.exe). SteamVR must be closed to
+rem replace a loaded DLL; "build.bat overlay" builds only the dashboard app (close QuestLHSync.exe first) and
+rem "build.bat installer" only the installer. Needs Visual Studio 2022 (or its Build Tools) with C++.
 setlocal
 set VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe
 for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VS=%%i
@@ -15,6 +16,7 @@ if not exist build\driver mkdir build\driver
 if not exist build\overlay mkdir build\overlay
 if not exist %OUT% mkdir %OUT%
 if /i "%1"=="overlay" goto overlay
+if /i "%1"=="installer" goto installer
 cl /nologo /LD /O2 /EHsc /std:c++17 /MT /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS ^
   /I%OVR%\headers /I%MH%\include /Fobuild\driver\ ^
   src\driver\driver_main.cpp src\driver\sync.cpp src\driver\net.cpp src\driver\gravity.cpp ^
@@ -28,3 +30,11 @@ cl /nologo /utf-8 /O2 /EHsc /std:c++17 /MT /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN 
   /Fe:%OUT%\QuestLHSync.exe /link /NOLOGO /SUBSYSTEM:WINDOWS %OVR%\lib\win64\openvr_api.lib gdi32.lib user32.lib shell32.lib d3d11.lib dxgi.lib || exit /b 1
 copy /y %OVR%\bin\win64\openvr_api.dll %OUT%\ >nul
 echo built %OUT%\QuestLHSync.exe
+if /i "%1"=="overlay" exit /b 0
+:installer
+if not exist build\installer mkdir build\installer
+if not exist out mkdir out
+cl /nologo /utf-8 /O2 /EHsc /std:c++17 /MT /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
+  /Fobuild\installer\ src\installer\installer_main.cpp ^
+  /Fe:out\QuestLHSync-Installer.exe /link /NOLOGO /SUBSYSTEM:WINDOWS winhttp.lib gdi32.lib user32.lib dwmapi.lib || exit /b 1
+echo built out\QuestLHSync-Installer.exe
