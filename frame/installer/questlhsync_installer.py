@@ -231,7 +231,11 @@ class Window(Adw.ApplicationWindow):
     def install(self, path):
         script = unpack(path)
         self.log(f"unpacked {os.path.dirname(script)}")
-        self.stream("sh", script)
+        try:
+            self.stream("sh", script)
+        finally:
+            # install.sh copied what it needs to ~/.local/share/questlhsync
+            shutil.rmtree(os.path.join(WORK, "package"), ignore_errors=True)
 
     def on_install_latest(self):
         def work():

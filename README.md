@@ -35,38 +35,39 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
 
 1. Download `QuestLHSync-<version>.zip` from
    [Releases](https://github.com/CreoleVR/QuestLHSync/releases) and extract it.
-2. **Headset, <ins>Quest</ins>:** install `QuestLHSync-magisk-<version>.zip` in the Magisk
-   app (**Modules > Install from storage**) and **reboot**.
-   To install it over adb instead:
+2. **Headset:**
+   - **Quest:** install `QuestLHSync-magisk-<version>.zip` in the Magisk app
+     (**Modules > Install from storage**) and reboot. Or over adb:
 
-   ```
-   adb push QuestLHSync-magisk-<version>.zip /sdcard/Download/
-   adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-magisk-<version>.zip"
-   adb reboot
-   ```
+     ```
+     adb push QuestLHSync-magisk-<version>.zip /sdcard/Download/
+     adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-magisk-<version>.zip"
+     adb reboot
+     ```
 
-   **Headset, <ins>Steam Frame</ins>:** copy `QuestLHSync-frame-<version>.tar.gz` to the
-   Frame (over ssh, or a download in Desktop Mode), then in a terminal on it:
+   - **Steam Frame:** in Desktop Mode, open
+     `QuestLHSync-frame-installer-<version>.flatpak` from
+     [Releases](https://github.com/CreoleVR/QuestLHSync/releases) in Discover,
+     then start **QuestLHSync Installer** and click **Install**. Or copy
+     `QuestLHSync-frame-<version>.tar.gz` to the Frame and, in a terminal on it
+     or over ssh:
 
-   ```
-   tar xzf QuestLHSync-frame-<version>.tar.gz
-   QuestLHSync-frame/install.sh
-   ```
+     ```
+     tar xzf QuestLHSync-frame-<version>.tar.gz
+     QuestLHSync-frame/install.sh
+     ```
 
-   It installs into `~/.local/share/questlhsync`, starts `lhsyncd` as a systemd
-   user service and restarts SteamVR on the headset once, to load the
-   `questlhsync_frame` driver.
-   Or with a window instead of a terminal: install
-   `QuestLHSync-frame-installer-<version>.flatpak` (open it in Discover in
-   Desktop Mode, or `flatpak install --user QuestLHSync-frame-installer-<version>.flatpak`;
-   it pulls the GNOME runtime from Flathub), then open **QuestLHSync
-   Installer**. **Install** downloads the latest release from GitHub and runs
-   its `install.sh`; **Choose…** takes a `QuestLHSync-<version>.zip` or
-   `QuestLHSync-frame-<version>.tar.gz` you already have. It also shows
-   whether the service runs and the driver is registered, and uninstalls.
+     Either way, SteamVR on the headset restarts once to load its driver.
 
-3. **PC:** with SteamVR closed, move the `questlhsync` folder somewhere
-   permanent and register it:
+3. **PC:** run `QuestLHSync-Installer.exe`, next to the zip in
+   [Releases](https://github.com/CreoleVR/QuestLHSync/releases). It downloads
+   the latest release, installs the driver to
+   `%LOCALAPPDATA%\QuestLHSync\questlhsync`, registers it with SteamVR (in
+   place of a copy you registered by hand) and offers an update whenever a
+   newer release is out. It closes SteamVR if it's running.
+
+   Or by hand: move the `questlhsync` folder from the zip somewhere permanent
+   and, with SteamVR closed, register it:
 
    ```
    "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "C:\path\to\questlhsync"
@@ -138,10 +139,10 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 ## Uninstall
 
 - **Quest:** remove the module in the Magisk app and reboot.
-- **Steam Frame:** run `QuestLHSync-frame/uninstall.sh` on the headset, or
-  **Uninstall** in QuestLHSync Installer.
-- **PC:** with SteamVR closed, run
-  `vrpathreg removedriver "C:\path\to\questlhsync"`, then delete
+- **Steam Frame:** click **Uninstall** in QuestLHSync Installer, or run
+  `QuestLHSync-frame/uninstall.sh` on the headset.
+- **PC:** with SteamVR closed, click **Uninstall** in the installer, or run
+  `vrpathreg removedriver "C:\path\to\questlhsync"` and delete
   `%LOCALAPPDATA%\QuestLHSync`.
 
 ## Building
