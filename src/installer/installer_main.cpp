@@ -487,11 +487,13 @@ static void ExtractDriver(const std::vector<uint8_t> &z) {
 }
 
 // ---------------------------------------------------------------- SteamVR
-static fs::path VrPathReg() {
+// the paths in openvrpaths.vrpath's `key` array ("runtime", "external_drivers")
+static std::vector<fs::path> VrPaths(const char *key) {
   wchar_t b[MAX_PATH * 2];
   DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", b, _countof(b));
   std::string t = Slurp(fs::path(std::wstring(b, n)) / L"openvr" / L"openvrpaths.vrpath");
-  size_t k = t.find("\"runtime\"");
+  std::vector<fs::path> v;
+  size_t k = t.find("\"" + std::string(key) + "\"");
   size_t a = k == std::string::npos ? k : t.find('[', k), e = a == std::string::npos ? a : t.find(']', a);
   if (e != std::string::npos) {
     for (size_t i = a; i < e; i++) {
@@ -501,12 +503,30 @@ static fs::path VrPathReg() {
         if (t[i] == '\\' && i + 1 < e) i++;
         s += t[i];
       }
-      fs::path exe = fs::path(Wide(s)) / L"bin" / L"win64" / L"vrpathreg.exe";
-      std::error_code ec;
-      if (fs::exists(exe, ec)) return exe;
+      v.push_back(fs::path(Wide(s)));
     }
   }
+  return v;
+}
+
+static fs::path VrPathReg() {
+  for (const fs::path &p : VrPaths("runtime")) {
+    fs::path exe = p / L"bin" / L"win64" / L"vrpathreg.exe";
+    std::error_code ec;
+    if (fs::exists(exe, ec)) return exe;
+  }
   throw Fail{L"SteamVR not found: install and run it once, then try again"};
+}
+
+// other QuestLHSync driver folders registered with SteamVR (installed by hand before the installer)
+static std::vector<fs::path> OtherCopies() {
+  std::vector<fs::path> v;
+  for (const fs::path &p : VrPaths("external_drivers")) {
+    std::error_code ec;
+    if (fs::exists(p / L"bin" / L"win64" / L"driver_questlhsync.dll", ec) && !fs::equivalent(p, g_driver, ec))
+      v.push_back(p);
+  }
+  return v;
 }
 
 static bool SteamVrRunning() {
@@ -520,8 +540,8 @@ static bool SteamVrRunning() {
   return found;
 }
 
-static void RunReg(const wchar_t *action) {
-  std::wstring cmd = L"\"" + VrPathReg().wstring() + L"\" " + action + L" \"" + g_driver.wstring() + L"\"";
+static void RunReg(const wchar_t *action, const fs::path &dir = g_driver) {
+  std::wstring cmd = L"\"" + VrPathReg().wstring() + L"\" " + action + L" \"" + dir.wstring() + L"\"";
   SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
   HANDLE rd, wr;
   if (!CreatePipe(&rd, &wr, &sa, 0)) throw Fail{L"couldn't start vrpathreg"};
@@ -614,11 +634,21 @@ static void RunBg(std::function<void()> fn) {
   }).detach();
 }
 
-// Terminates SteamVR's processes (they hold the driver dll/files open) and waits for them to exit.
+static BOOL CALLBACK CloseVrMonitor(HWND w, LPARAM pids) {
+  DWORD pid = 0;
+  GetWindowThreadProcessId(w, &pid);
+  for (DWORD p : *(std::vector<DWORD> *)pids)
+    if (p == pid) PostMessageW(w, WM_CLOSE, 0, 0);
+  return TRUE;
+}
+
+// Stops SteamVR (its processes hold the driver dll/files open) and waits for it to exit. It's asked to close first,
+// like closing its window: killed outright, Steam can go on thinking SteamVR runs and refuse to start it again.
 static void StopSteamVr() {
   static const wchar_t *names[] = {L"vrserver.exe", L"vrmonitor.exe", L"vrcompositor.exe", L"vrdashboard.exe",
                                    L"vrwebhelper.exe", L"vrstartup.exe"};
   std::vector<HANDLE> procs;
+  std::vector<DWORD> monitor;
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (snap == INVALID_HANDLE_VALUE) return;
   PROCESSENTRY32W pe{sizeof pe};
@@ -626,12 +656,22 @@ static void StopSteamVr() {
     for (const wchar_t *n : names)
       if (_wcsicmp(pe.szExeFile, n) == 0) {
         if (HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID)) procs.push_back(h);
+        if (_wcsicmp(n, L"vrmonitor.exe") == 0) monitor.push_back(pe.th32ProcessID);
         break;
       }
   CloseHandle(snap);
   if (procs.empty()) return;
   Say(L"Stopping SteamVR…");
-  for (HANDLE h : procs) TerminateProcess(h, 1);
+  if (!monitor.empty()) {
+    EnumWindows(CloseVrMonitor, (LPARAM)&monitor);
+    for (int i = 0; i < 150; i++) {
+      bool left = false;
+      for (HANDLE h : procs) left = left || WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+      if (!left) break;
+      Sleep(100);
+    }
+  }
+  for (HANDLE h : procs) TerminateProcess(h, 1);  // what didn't close in 15 s
   for (HANDLE h : procs) {
     WaitForSingleObject(h, 5000);
     CloseHandle(h);
@@ -672,6 +712,10 @@ static void Install(const std::wstring &tag) {
     fs::create_directories(g_root, ec);
     ExtractDriver(zip);
     RunReg(L"adddriver");
+    for (const fs::path &old : OtherCopies()) {  // SteamVR would load one of the two: this one only from now on
+      RunReg(L"removedriver", old);
+      Say(L"Unregistered the older copy in " + old.wstring() + L" (its files are left as they are)");
+    }
     std::string utf8(WideCharToMultiByte(CP_UTF8, 0, tag.c_str(), (int)tag.size(), nullptr, 0, nullptr, nullptr), '\0');
     WideCharToMultiByte(CP_UTF8, 0, tag.c_str(), (int)tag.size(), utf8.data(), (int)utf8.size(), nullptr, nullptr);
     std::ofstream(g_state) << "{\"version\":\"" << utf8 << "\"}";

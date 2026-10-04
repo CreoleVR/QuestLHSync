@@ -56,10 +56,12 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
    It installs into `~/.local/share/questlhsync`, starts `lhsyncd` as a systemd
    user service and restarts SteamVR on the headset once, to load the
    `questlhsync_frame` driver.
-3. **PC:** run `QuestLHSync-Installer.exe` (built with `build.bat`, in `out\`).
-   It downloads the latest release, installs the driver to
-   `%LOCALAPPDATA%\QuestLHSync\questlhsync`, registers it with SteamVR and
-   offers an update whenever a newer release is out. Close SteamVR first.
+3. **PC:** run `QuestLHSync-Installer.exe`, next to the zip in
+   [Releases](https://github.com/CreoleVR/QuestLHSync/releases). It downloads
+   the latest release, installs the driver to
+   `%LOCALAPPDATA%\QuestLHSync\questlhsync`, registers it with SteamVR (in
+   place of a copy you registered by hand) and offers an update whenever a
+   newer release is out. It closes SteamVR if it's running.
 
    Or by hand: move the `questlhsync` folder from the zip somewhere permanent
    and, with SteamVR closed, register it:
