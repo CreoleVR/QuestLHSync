@@ -695,9 +695,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
       DispatchMessageW(&msg);
     }
     DWORD now = GetTickCount();
-    if (!vr_up && now - last_check >= 1000) {
+    if (now - last_check >= 1000) {  // also when vrserver crashed or was killed, with no Quit sent
       last_check = now;
-      if (!server_up()) break;
+      if (!server_up()) {
+        vr_up = false;  // nothing left to shut down
+        break;
+      }
     }
     bool have = ReadStatus(st);
     if (!have) memset(&st, 0, sizeof st);

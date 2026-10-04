@@ -480,10 +480,23 @@ static void ExtractDriver(const std::vector<uint8_t> &z) {
     files++;
   }
   if (!files) throw Fail{L"release zip has no questlhsync/ driver folder"};
-  fs::remove_all(g_driver, ec);
-  if (fs::exists(g_driver, ec)) throw Fail{L"couldn't replace the old driver files (is SteamVR running?)"};
+  // swapped by renames: a file still in use leaves the old driver whole instead of half deleted
+  fs::path old = g_driver;
+  old += L".old";
+  fs::remove_all(old, ec);
+  if (fs::exists(g_driver, ec)) {
+    fs::rename(g_driver, old, ec);
+    if (ec) {
+      fs::remove_all(nw, ec);
+      throw Fail{L"couldn't replace the old driver files (is SteamVR running?)"};
+    }
+  }
   fs::rename(nw, g_driver, ec);
-  if (ec) throw Fail{L"couldn't move the driver into place"};
+  if (ec) {
+    fs::rename(old, g_driver, ec);
+    throw Fail{L"couldn't move the driver into place"};
+  }
+  fs::remove_all(old, ec);  // what's still in use goes at the next install
 }
 
 // ---------------------------------------------------------------- SteamVR
@@ -642,11 +655,12 @@ static BOOL CALLBACK CloseVrMonitor(HWND w, LPARAM pids) {
   return TRUE;
 }
 
-// Stops SteamVR (its processes hold the driver dll/files open) and waits for it to exit. It's asked to close first,
-// like closing its window: killed outright, Steam can go on thinking SteamVR runs and refuse to start it again.
+// Stops SteamVR and our dashboard app (they hold the driver folder's files open) and waits for them to exit. SteamVR
+// is asked to close first, like closing its window: killed outright, Steam can go on thinking SteamVR runs and refuse
+// to start it again. The dashboard app leaves with it.
 static void StopSteamVr() {
   static const wchar_t *names[] = {L"vrserver.exe", L"vrmonitor.exe", L"vrcompositor.exe", L"vrdashboard.exe",
-                                   L"vrwebhelper.exe", L"vrstartup.exe"};
+                                   L"vrwebhelper.exe", L"vrstartup.exe", L"QuestLHSync.exe"};
   std::vector<HANDLE> procs;
   std::vector<DWORD> monitor;
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);

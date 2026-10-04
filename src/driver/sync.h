@@ -108,15 +108,17 @@ class Optics {
 // ---------------------------------------------------------------- timing helpers
 class FrameGrid {
  public:
-  static constexpr double kQuestPro = 3 / 37.5;  // s: the Quest Pro's short frames, every third at 37.5 fps
+  // s: a Quest's short frames, every third at 37.5 fps, or at 45 fps with its power line frequency set to 60 Hz
+  static constexpr double kQuest50 = 3 / 37.5, kQuest60 = 3 / 45.0;
   static constexpr double WIN = 10.0, LEARN_WIN = 30.0;  // s: the grid's window, the period's
-  explicit FrameGrid(double period = kQuestPro) : fixed_(period) {}  // 0: learn the period (other headsets)
+  // quest: the period is whichever of the two the frames fold at; otherwise it's learned (the Frame)
+  explicit FrameGrid(bool quest = true) : quest_(quest) {}
   bool Lag(int cam, double t, double &lag);  // t: a short frame's detection time (headset s), call for all
   double period(int cam) const;              // s, 0 while unknown
 
  private:
-  struct Cam { std::deque<double> h, longer; double p = 0, next = 0; };
-  double fixed_;
+  struct Cam { std::deque<double> h, longer; double p = 0, next = 0; bool learn = false; };
+  bool quest_;
   std::map<int, Cam> c_;
   static double Learn(const std::deque<double> &h, double prev);
 };
@@ -434,8 +436,8 @@ class Sync {
   bool have_optics_ = false;
   Clock clock_;
   FrameGrid grid_;
-  double grid_period_ = FrameGrid::kQuestPro;  // 0: learned (not a Quest Pro)
-  std::map<int, double> grid_logged_;           // learned periods as last logged, per camera
+  bool grid_quest_ = true;             // a Quest's frame grid (otherwise learned)
+  std::map<int, double> grid_logged_;  // frame periods as last logged, per camera
   PoseHist poses_;
   StationsFile sfile_;
   Frame frame_;

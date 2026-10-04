@@ -298,7 +298,6 @@ double FrameGrid::Learn(const std::deque<double> &h, double prev) {
 }
 
 double FrameGrid::period(int cam) const {
-  if (fixed_ > 0) return fixed_;
   auto it = c_.find(cam);
   return it == c_.end() ? 0 : it->second.p;
 }
@@ -309,22 +308,26 @@ bool FrameGrid::Lag(int cam, double t, double &lag) {
   h.push_back(t);
   while (!h.empty() && h.front() < t - WIN) h.pop_front();
   auto &lh = c.longer;
-  if (!fixed_) {
-    lh.push_back(t);
-    while (!lh.empty() && lh.front() < t - LEARN_WIN) lh.pop_front();
-  }
+  lh.push_back(t);
+  while (!lh.empty() && lh.front() < t - LEARN_WIN) lh.pop_front();
   if (h.size() < 40) return false;
+  // a Quest: whichever of its two periods the frames fold at, if either folds cleanly (otherwise it's learned)
+  if (quest_ && !c.p && !c.learn) {
+    double a = FoldSpread(h, kQuest50), b = FoldSpread(h, kQuest60), p = b < a ? kQuest60 : kQuest50;
+    if (std::min(a, b) <= 0.5 * p) c.p = p;
+    else c.learn = true;
+  }
   // learned: from the frames so far once the grid's window is full, then refined every WIN over up to LEARN_WIN (a
   // longer stretch pins the period closer). A camera's rate doesn't change, so a stretch too messy to fold (frames
   // misread as short ones) keeps the period found before
-  if (!fixed_) {
+  if (!quest_ || c.learn) {
     if (t >= c.next && h.back() - h.front() >= 0.9 * WIN) {
       double p = Learn(lh, c.p);
       if (p > 0) c.p = p;
       c.next = t + WIN;
     }
   }
-  double P = fixed_ ? fixed_ : c.p;
+  double P = c.p;
   if (P <= 0) return false;
   double grid;
   FoldGap(h, P, &grid);
@@ -2097,12 +2100,9 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
-  // the Quest Pro's frame period is known; another headset's is learned from its frames (a few seconds more before
-  // a sighting's poll lag comes off)
-  std::string dev = optics_.device();
-  for (auto &ch : dev) ch = (char)tolower((unsigned char)ch);
-  grid_period_ = (dev.empty() || dev == "seacliff") && !cfg_.learn_grid ? FrameGrid::kQuestPro : 0.0;
-  grid_ = FrameGrid(grid_period_);
+  // a Quest's frame period is one of two, the Frame's is learned from its frames
+  grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
+  grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   return true;
 }
@@ -2110,7 +2110,7 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
 void Sync::HeadsetReset() {
   std::lock_guard<std::mutex> g(net_);
   clock_.Clear();
-  grid_ = FrameGrid(grid_period_);
+  grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
 }
 
@@ -2253,7 +2253,7 @@ void Sync::OnLine(double pc, const char *line) {
   bool grid_lag = nb >= 0 && grid_.Lag(cam, hs, lag);
   if (optics_.exact_time()) lag = 0;
   bool have_lag = nb >= 0 && (optics_.exact_time() || grid_lag);
-  if (nb >= 0 && !grid_period_) {  // a learned frame period: log it when it's found or moves
+  if (nb >= 0) {  // the frame period: log it when it's found or moves
     double p = grid_.period(cam), &was = grid_logged_[cam];
     if (p > 0 && std::fabs(p - was) > 0.0001) {
       log_(Fmt("camera %d: short frames every %.3f ms", cam, p * 1000));
