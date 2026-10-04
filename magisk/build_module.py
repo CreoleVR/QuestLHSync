@@ -22,7 +22,7 @@ OUT = os.path.join(os.path.dirname(HERE), "out")
 HEADSET = os.path.join(os.path.dirname(HERE), "src", "headset")
 with open(os.path.join(os.path.dirname(HERE), "src", "common", "qlhs_status.h"), encoding="utf-8") as _h:
     VERSION = "v" + re.search(r'#define QLHS_RELEASE "([^"]+)"', _h.read()).group(1)  # the driver's
-CODE = 7
+CODE = 8
 # 17.10.0 android-arm64, the build lhsight was developed on. 17.19.0 crashed the sensors HAL on injection (SIGSEGV in
 # its bootstrap thread), so test any upgrade before shipping it.
 FRIDA_VERSION = "17.10.0"

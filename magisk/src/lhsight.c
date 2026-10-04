@@ -30,6 +30,7 @@ struct st {
   u64 last_t[MAXC], due[MAXC]; u32 npoll;      // per camera: when its last frame was found, when to look for the next
   u64 ft[MAXC][HIST]; u32 nft[MAXC];           // its last frame times (ns)
   int adj[MAXC], late[MAXC], slept;            // how much earlier to wake for it (us), its frame waited for us
+  int cyes[MAXC], cno[MAXC];                   // clearly darker frames the cycle took for short ones, and didn't
 };
 extern struct st S;
 static u64 now(void) { struct ts t; clock_gettime(1, &t); return (u64)t.s * 1000000000ull + (u64)t.ns; }
@@ -107,6 +108,23 @@ static void predict(int c, u64 t) {
   if (S.late[c]) { S.late[c] = 0; if (S.adj[c] < 8000) S.adj[c] += 1000; }
   else if (S.adj[c] >= 250) S.adj[c] -= 250;
 }
+// The Quest Pro's cameras take 3 frames on a 4-slot grid, long, short, long, and leave the 4th slot out (gaps ~20, 21,
+// 39 ms at 37.5 frames/s, 17, 17, 33 at 45): the short frame is the one between the two short gaps. Its place tells it
+// in any light, where its brightness doesn't: in a lit room the long frames' exposure shortens until they are hardly
+// brighter than the short one, or darker. From the last 10 cycles' gaps (found times jitter by several ms): 1 for the
+// short frame, 0 for a long one, -1 without such a cycle (yet)
+#define NCYC 10
+static int cycle_short(int c) {
+  u32 n = S.nft[c];                            // this frame is n - 1
+  if (n < 3 * NCYC + 2) return -1;
+  int g[3] = { 0, 0, 0 };                      // the gaps before: this frame's place, the one before, the one before that
+  for (u32 j = 0; j < 3 * NCYC; j++) g[j % 3] += rel_us(c, n - 1 - j, S.ft[c][(n - 2 - j) % HIST]);
+  int lo = 0;
+  for (int j = 1; j < 3; j++) if (g[j] > g[lo]) lo = j;
+  int a = g[(lo + 1) % 3], b = g[(lo + 2) % 3];
+  if (g[lo] * 10 < (a + b) * 7 || g[lo] * 10 > (a + b) * 14 || (a < b ? a * 10 < b * 6 : b * 10 < a * 6)) return -1;
+  return lo == 1;                              // the long gap was before the frame before
+}
 // The blobs of pixels >= T in scratch (w x h): 16x16 cells holding one, 8-connected, centroid of those pixels; added
 // to the arrays from nbl on, up to MAXB. Cells marked hot are left out, and the first pass marks its cells and
 // their neighbours (mark), so a later, dimmer pass doesn't take in a saturated blob's glow.
@@ -171,13 +189,18 @@ static void frame(int i, u64 t) {
   int a = S.m1[c], b = S.m2[c];
   S.m2[c] = a; S.m1[c] = mean;
   int lo = a < b ? a : b;
-  // short exposure: well under both previous frames (long-short-long, the Quest Pro). A camera alternating long and
-  // short frames never passes that (one of the two is short too): after 60 frames without a short one while every
-  // fourth or more is well under the frame before, it is judged against the frame before alone
+  // short exposure: well under both previous frames (long-short-long, the Quest Pro), or at the short frame's place in
+  // the cycle (cycle_short), which a lit room doesn't hide. The place is trusted while the clearly darker frames agree
+  // with it (a headset with another cycle turns it off). Without a cycle: a camera alternating long and short frames
+  // never passes the first test (one of the two is short too): after 60 frames without a short one while every fourth
+  // or more is well under the frame before, it is judged against the frame before alone
   int strict = k >= 2 && mean * 10 < lo * 6, alt = k >= 1 && mean * 10 < a * 6;
   if (strict) S.nostrict[c] = S.nalt[c] = 0;
   else if (S.nostrict[c] < 100000) { S.nostrict[c]++; S.nalt[c] += alt; }
-  int is_short = strict || (alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
+  int cyc = cycle_short(c);
+  if (strict && cyc >= 0 && S.cyes[c] + S.cno[c] < 1000000) { if (cyc) S.cyes[c]++; else S.cno[c]++; }
+  if (S.cno[c] * 4 > S.cyes[c] + 4) cyc = -1;
+  int is_short = strict || (cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
   char line[2400]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);
