@@ -51,6 +51,9 @@ constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a
 // the running fit only within Solver::INLIER of a station
 constexpr int kBright = 250;
 constexpr int kLampPx = 20;             // blobs this big are steady lights (the frozen-pose check)
+// a camera frame whose head pose hasn't come in yet waits for it this long: a learned timing can put the pose time
+// after the frame's arrival (the Frame's Steam Link: -6 ms, the newest pose then a few ms short of it)
+constexpr double kPoseWait = 0.1;       // s
 constexpr double kFrozen = 10.0;        // s: SteamVR's headset this still while the cameras see the room move
 constexpr double kKeep = 600.0;         // s of rays kept
 constexpr double kMoved = 0.25;         // m: SteamVR has a measured station this far off: it was moved
@@ -487,6 +490,11 @@ class Sync {
   Spots spots_;  // under net_
   std::map<int, std::vector<std::pair<double, double>>> prev_big_;  // under net_: each camera's last steady lights
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
+  // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
+  struct Spot { int x10, y10, npx, peak; };
+  struct Shot { double pc, t, hg, grid_pc; int cam; bool have_lag; std::vector<Spot> bl; };
+  std::deque<Shot> waiting_;
+  void Use(const Shot &f);  // under net_
   double still_since_ = -1;
   bool frozen_said_ = false;
   double rate_t_ = 0, cam_fps_ = 0, spot_rate_ = 0, sight_rate_ = 0;

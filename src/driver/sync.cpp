@@ -2239,6 +2239,7 @@ void Sync::HeadsetReset() {
   clock_.Clear();
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
+  waiting_.clear();
 }
 
 void Sync::SetStreamer(const std::string &system) {
@@ -2388,8 +2389,7 @@ void Sync::OnLine(double pc, const char *line) {
     }
   }
   if (nb < 0) return;
-  struct Blob { int x10, y10, npx, peak; };
-  std::vector<Blob> bl;
+  std::vector<Spot> bl;
   {
     const char *s = line + off;
     for (int i = 0; i < nb; i++) {
@@ -2409,13 +2409,30 @@ void Sync::OnLine(double pc, const char *line) {
   if (!clock_.Map(hs - (have_lag ? lag : 0.0), grid_pc)) { spots_.other += nb; return; }
   double expo = expo_;
   double t = grid_pc - expo - (have_lag ? 0.0 : kLagFallback);
+  waiting_.push_back({pc, t, hg, grid_pc, cam, have_lag, std::move(bl)});
+  // the frames whose head pose is in (one after their pose time), or that waited long enough, oldest first
+  while (!waiting_.empty()) {
+    V3 lp;
+    double lt;
+    const Shot &f = waiting_.front();
+    if (!(pc - f.pc >= kPoseWait || (poses_.Latest(lp, &lt) && lt > f.t))) break;
+    Use(f);
+    waiting_.pop_front();
+  }
+}
+
+void Sync::Use(const Shot &f) {
+  const double t = f.t, hg = f.hg, grid_pc = f.grid_pc;
+  const int cam = f.cam, nb = (int)f.bl.size();
+  const bool have_lag = f.have_lag;
+  const std::vector<Spot> &bl = f.bl;
   M3 R; V3 p;
   double w;
   if (!poses_.At(t, R, p) || !poses_.Speed(t, w)) { spots_.other += nb; return; }
   bool still = poses_.Still(t);
   {  // while SteamVR's headset stands still, do the lamps and windows the cameras see stand still too?
     std::vector<std::pair<double, double>> big;
-    for (const Blob &b : bl)
+    for (const Spot &b : bl)
       if (b.npx >= kLampPx) big.push_back({b.x10 / 10.0, b.y10 / 10.0});
     auto &prev = prev_big_[cam];
     if (!still) img_moved_ = img_still_ = 0;
@@ -2433,7 +2450,7 @@ void Sync::OnLine(double pc, const char *line) {
   M3 Rc;
   V3 tc;
   if (have_lag && w <= wmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
-  for (const Blob &b : bl) {
+  for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
     if (npx > kMaxPx) { spots_.big++; continue; }
     V3 o, d;
