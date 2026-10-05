@@ -45,6 +45,15 @@ constexpr double kNearDeg = 5.0;        // deg: a fast-head sighting this close 
 constexpr int kTimingFirstN = 200;      // such sightings before the first (wide) timing estimate
 constexpr int kTimingNextN = 40;        // ... before each later one
 constexpr int kTimingFullN = 270;       // a later estimate moves the timing all the way from this many on
+// an estimate's left and right turns (a quarter of its sightings each, at least, turning kTimingTurn about the
+// vertical) each find the timing. A camera a little off its calibration moves them apart, as far one way as the other,
+// and the timing is their mean. Up to kTimingSplit apart (0.5 deg at 35 deg/s is 14 ms either way); wider is no
+// camera's error, and isn't taken
+constexpr double kTimingTurn = 10.0, kTimingSplit = 0.030;  // deg/s, s
+// ... and the sightings pin that mean: resampled kTimingBoot times, 90% of the means lie within kTimingCI (Quest
+// recordings: 1.1-3.9 ms; a Frame's, its few sightings coming in bursts: 5-15 ms, and it keeps kExpoDefault)
+constexpr int kTimingBoot = 200;
+constexpr double kTimingCI = 0.006;  // s
 constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a laser dot
 // blobs this bright: a base station's dot, or a lamp. Dimmer ones (module 1.6 on) are mostly other lights, a few
 // percent station dots: they count only in a room too light for the dots to saturate (Solver::starved), and then in
@@ -386,12 +395,16 @@ class Timing {
                                                                           // headset grid time, peak >= kBright
   void Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright);
   const std::deque<Rec> &recs() const { return rec_; }
+  // the left and right turns' timings (NaN: none), their sightings, and the 90% spread of their mean (s)
+  struct Split { double left, right; int nl = 0, nr = 0; double ci; };
   // grid search of the offset on fast-head sightings against the current alignment: true if it found one
   bool Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
-                bool wide, double &best, int &n);
+                bool wide, double &best, int &n, Split &sp);
 
  private:
   std::deque<Rec> rec_;
+  bool Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
+              bool wide, double &best, int &n, Split &sp, bool &edge);  // edge: a minimum at the search's edge
 };
 
 // ---------------------------------------------------------------- the app
@@ -482,6 +495,7 @@ class Sync {
   bool seeded_ = false, have_applied_ = false, paused_ = false;
   X4 applied_{};
   double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, last_level_ = 0, lock_time_ = -1;
+  double split_said_ = -1e18;  // when a timing estimate too unsure to take was last logged
   int brk_seen_ = 0, resets_seen_ = 0;
   double last_prec_ = -1e18;
   StepStat last_st_;

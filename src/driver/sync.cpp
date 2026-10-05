@@ -2031,9 +2031,21 @@ static bool RefitSlow(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z,
 
 // The time a sighting's HMD pose is looked up at is (frame grid point - offset). The offset is the camera's own
 // delay plus how the streamer times the poses it hands SteamVR (some predict ahead). A wrong offset shows only while
-// the head turns: grid search the robust error of fast-head sightings against an alignment from the slow ones.
+// the head turns: grid search the robust error of fast-head sightings against an alignment from the slow ones. A
+// later estimate searches near the current timing, and the whole range when its minimum lies at that search's edge:
+// a timing saved far off (a Frame's at -6.2 ms) could otherwise never move
 bool Timing::Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
-                      bool wide, double &best, int &n) {
+                      bool wide, double &best, int &n, Split &sp) {
+  bool edge = false;
+  if (Search(poses, x, S, Z, cur, wide, best, n, sp, edge)) return true;
+  return !wide && edge && Search(poses, x, S, Z, cur, true, best, n, sp, edge);
+}
+
+bool Timing::Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
+                    bool wide, double &best, int &n, Split &sp, bool &edge) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  sp = {nan, nan, 0, 0, nan};
+  edge = false;
   n = 0;
   if (rec_.empty() || S.size() < 2) return false;
   double lo = wide ? -0.04 : cur - 0.015, hi = wide ? 0.10 : cur + 0.015, step = wide ? 0.0025 : 0.001;
@@ -2071,28 +2083,90 @@ bool Timing::Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> 
   n = (int)fast.size();
   // the first (wide) estimate wants plenty of turning
   if (n < (wide ? kTimingFirstN : kTimingNextN)) return false;
-  std::vector<double> es, cs;
+  // each sighting's error at every timing tried, and which way the head turned about the vertical then
+  std::vector<double> es;
+  for (double e = lo; e <= hi + 1e-9; e += step) es.push_back(e);
+  const size_t m = es.size();
   const double s2 = 0.3 * 0.3;
-  for (double e = lo; e <= hi + 1e-9; e += step) {
-    double c = 0;
-    for (const Rec *r : fast) {
+  std::vector<double> cost(fast.size() * m);
+  std::vector<int> way(fast.size(), 0);
+  for (size_t i = 0; i < fast.size(); i++) {
+    const Rec *r = fast[i];
+    Quat qa, qb;
+    V3 pa, pb;
+    if (poses.AtQ(r->tg - cur - 0.02, qa, pa) && poses.AtQ(r->tg - cur + 0.02, qb, pb)) {
+      Quat d = qb * Quat{qa.w, -qa.x, -qa.y, -qa.z};  // the turn between, in the room
+      double yaw = 2 * std::asin(std::max(-1.0, std::min(1.0, d.w < 0 ? -d.y : d.y))) * kDeg / 0.04;  // deg/s
+      way[i] = yaw > kTimingTurn ? 1 : yaw < -kTimingTurn ? -1 : 0;
+    }
+    for (size_t j = 0; j < m; j++) {
       M3 R; V3 p;
-      if (!poses.At(r->tg - e, R, p)) { c += 1; continue; }
+      double &c = cost[i * m + j];
+      if (!poses.At(r->tg - es[j], R, p)) { c = 1; continue; }
       int k; double a;
       Solver::Nearest(P, Zq, p + R * r->od, R * r->dd, k, a);
-      c += std::isfinite(a) ? a * a / (a * a + s2) : 1;
+      c = std::isfinite(a) ? a * a / (a * a + s2) : 1;
     }
-    es.push_back(e);
-    cs.push_back(c / n);
   }
-  size_t i = std::min_element(cs.begin(), cs.end()) - cs.begin();
-  if (i == 0 || i + 1 == cs.size()) return false;  // at the edge of the search: no clear minimum
-  double c0 = cs[i - 1], c1 = cs[i], c2 = cs[i + 1], den = c0 - 2 * c1 + c2;
-  double sh = den > 0 ? 0.5 * (c0 - c2) / den : 0;
-  best = es[i] + std::max(-1.0, std::min(1.0, sh)) * step;
-  // a real minimum stands out of the error floor; a flat curve (no fast sightings of stations) doesn't
-  double mx = *std::max_element(cs.begin(), cs.end());
-  return mx - c1 > 0.05 * mx;
+  // the error curve's minimum on the sightings turning one way (1 left, -1 right, 0 all): none at the edge of the
+  // search, or when it doesn't stand out of the error floor (a flat curve: no fast sightings of stations)
+  auto at = [&](const std::vector<double> &cs, size_t &i) {  // the curve's lowest point, between grid steps
+    i = std::min_element(cs.begin(), cs.end()) - cs.begin();
+    if (i == 0 || i + 1 == m) return es[i];
+    double c0 = cs[i - 1], c1 = cs[i], c2 = cs[i + 1], den = c0 - 2 * c1 + c2;
+    double sh = den > 0 ? 0.5 * (c0 - c2) / den : 0;
+    return es[i] + std::max(-1.0, std::min(1.0, sh)) * step;
+  };
+  auto minimum = [&](int w, double &b, int &k) {
+    std::vector<double> cs(m, 0.0);
+    k = 0;
+    for (size_t i = 0; i < fast.size(); i++)
+      if (!w || way[i] == w) {
+        k++;
+        for (size_t j = 0; j < m; j++) cs[j] += cost[i * m + j];
+      }
+    if (k < (wide ? kTimingFirstN : kTimingNextN) / (w ? 4 : 1)) return false;
+    size_t i;
+    b = at(cs, i);
+    if (i == 0 || i + 1 == m) { edge = true; return false; }
+    double mx = *std::max_element(cs.begin(), cs.end());
+    return mx - cs[i] > 0.05 * mx;
+  };
+  // a camera a little off its calibration looks like a timing error one way while the head turns left and the other
+  // way turning right: the timing is the two turns' mean (a Frame recording with another Frame's calibration: -1 and
+  // 20 ms, 9.6 ms, where all of it put 17.9; Quest recordings' turns lie 0.6-5.5 ms apart)
+  int k0;
+  bool all = minimum(0, best, k0), l = minimum(1, sp.left, sp.nl), r = minimum(-1, sp.right, sp.nr);
+  if (!all || !l || !r) {
+    sp.left = sp.right = nan;
+    return false;
+  }
+  if (std::fabs(sp.left - sp.right) > kTimingSplit) return false;
+  best = (sp.left + sp.right) / 2;
+  // how well the sightings pin it: the mean again on resampled sightings, each way's drawn with replacement
+  std::vector<size_t> L, Rt;
+  for (size_t i = 0; i < fast.size(); i++)
+    if (way[i]) (way[i] > 0 ? L : Rt).push_back(i);
+  std::mt19937 rng(1);
+  std::vector<double> bs;
+  for (int b = 0; b < kTimingBoot; b++) {
+    double side[2];
+    for (int s = 0; s < 2; s++) {
+      const std::vector<size_t> &I = s ? Rt : L;
+      std::uniform_int_distribution<size_t> u(0, I.size() - 1);
+      std::vector<double> cs(m, 0.0);
+      for (size_t k = 0; k < I.size(); k++) {
+        const double *c = &cost[I[u(rng)] * m];
+        for (size_t j = 0; j < m; j++) cs[j] += c[j];
+      }
+      size_t i;
+      side[s] = at(cs, i);
+    }
+    bs.push_back((side[0] + side[1]) / 2);
+  }
+  std::sort(bs.begin(), bs.end());
+  sp.ci = bs[bs.size() * 95 / 100] - bs[bs.size() * 5 / 100];
+  return sp.ci <= kTimingCI;
 }
 
 // ================================================================ the app
@@ -2170,7 +2244,9 @@ void Sync::LoadState() {
       auto v = kv.second.nums();
       if (v.size() >= 3) quest_[kv.first] = {v[0], v[1], v[2]};
     }
-  if (const JVal *t = d.get("timing"))
+  // timings checked as Timing::Estimate does since 1.13 ("timing", before, could be a camera's error or noise: one sat
+  // at -6.2 ms for a Frame and kept it from ever finding the base stations)
+  if (const JVal *t = d.get("pose_timing"))
     for (auto &kv : t->o)
       if (kv.second.t == JVal::Num) timings_[kv.first] = kv.second.n;
   seeded_ = quest_.empty();
@@ -2201,7 +2277,7 @@ void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs) {
     s += Fmt("%s\n  \"%s\": [%.5f, %.5f, %.5f]", first ? "" : ",", kv.first.c_str(), q.x, q.y, q.z);
     first = false;
   }
-  s += Fmt("\n },\n \"x\": [%.9f, %.9f, %.9f, %.9f],\n \"timing\": {", x[0], x[1], x[2], x[3]);
+  s += Fmt("\n },\n \"x\": [%.9f, %.9f, %.9f, %.9f],\n \"pose_timing\": {", x[0], x[1], x[2], x[3]);
   first = true;
   for (auto &kv : timings_) { s += Fmt("%s\n  \"%s\": %.5f", first ? "" : ",", kv.first.c_str(), kv.second); first = false; }
   s += Fmt("\n },\n \"saved\": \"%s\"\n}\n", Now().c_str());
@@ -2845,23 +2921,32 @@ Transform Sync::Tick(double now) {
       last_save_ = now;
       SaveState(x, cs);
     }
-    // timing: every 15 s on a well-pinned alignment
-    if (cfg_.learn_timing && solver_.has_x() && st.cond && st.has_med && st.med < 0.3 && now - last_timing_ > 15) {
+    // timing: every 15 s on a well-pinned alignment (under 0.4 deg: a wrong timing spreads the sightings itself, and
+    // a Frame's at -6.2 ms sat at 0.33, where 0.3 kept it from ever being corrected)
+    if (cfg_.learn_timing && solver_.has_x() && st.cond && st.has_med && st.med < 0.4 && now - last_timing_ > 15) {
       last_timing_ = now;
       std::vector<std::string> keys;
       std::vector<V3> S, Z;
       solver_.Stations(keys, S, Z);
       double best;
       int n;
+      Timing::Split sp;
       bool ok;
       double cur = expo_;
       {
         std::lock_guard<std::mutex> g(net_);
-        ok = timing_.Estimate(poses_, x, S, Z, cur, !timing_learned_, best, n);
+        ok = timing_.Estimate(poses_, x, S, Z, cur, !timing_learned_, best, n, sp);
+      }
+      if (!ok && std::isfinite(sp.left) && now - split_said_ >= 300) {
+        split_said_ = now;
+        log_(Fmt("timing: turning left fits %.1f ms, turning right %.1f ms%s: too unsure to take, it stays %.1f ms",
+                 sp.left * 1000, sp.right * 1000,
+                 std::isfinite(sp.ci) ? Fmt(", their mean within %.1f ms", sp.ci * 1000).c_str() : "", cur * 1000));
       }
       if (ok) {
-        // the step trusts the estimate by how much turning it saw
-        double e = timing_learned_ ? cur + std::min(1.0, (double)n / kTimingFullN) * (best - cur) : best;
+        // the step trusts the estimate by how much turning it saw, both ways
+        double e = timing_learned_ ? cur + std::min(1.0, 2.0 * std::min(sp.nl, sp.nr) / kTimingFullN) * (best - cur)
+                                   : best;
         e = std::max(-0.05, std::min(0.12, e));
         expo_ = e;
         if (std::fabs(e - cur) > 1e-4) {
@@ -2877,9 +2962,11 @@ Transform Sync::Tick(double now) {
         }
         if (!sys.empty()) timings_[sys] = e;
         if (first || std::fabs(best - cur) > 0.002)
-          log_(Fmt("timing%s%s: %.1f ms (best fit %.1f ms on %d fast-head sightings)", sys.empty() ? "" : " for ",
-                   sys.c_str(), e * 1000, best * 1000, n));
-        Rec(now, "I timing %.5f best %.5f n %d", e, best, n);
+          log_(Fmt("timing%s%s: %.1f ms (best fit %.1f ms within %.1f, on %d fast-head sightings: %.1f turning left, "
+                   "%.1f right)", sys.empty() ? "" : " for ", sys.c_str(), e * 1000, best * 1000, sp.ci * 1000, n,
+                   sp.left * 1000, sp.right * 1000));
+        Rec(now, "I timing %.5f best %.5f ci %.5f n %d left %.5f %d right %.5f %d", e, best, sp.ci, n, sp.left, sp.nl,
+            sp.right, sp.nr);
       }
     }
     if (now - last_level_ >= 10) {
