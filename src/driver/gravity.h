@@ -15,8 +15,8 @@
 // gravity stays put in the room while the offset turns with the device: devices that move and turn, as they do in
 // use, tell them apart, and a device at rest is the same with v = 0. A Kalman filter follows G per SteamVR session
 // (it re-tilts at every start), in the reference frame as the anchor alone places it: G is what the devices agree
-// on. The offsets are kept (gravity.json) for the next session. The IMU's clock is mapped onto the poses' by the
-// samples' arrival times and the gyro's turning against the orientations'.
+// on. Once settled, the level is held for the session. The offsets are kept (gravity.json) for the next session. The
+// IMU's clock is mapped onto the poses' by the samples' arrival times and the gyro's turning against the orientations'.
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -137,6 +137,9 @@ class Gravity {
   bool new_wins_ = false, dirty_ = false, applying_ = false;
   int said_state_ = -1;
   double said_tx_ = 0, said_tz_ = 0;
+  // the level once settled (kHoldAfter): held for the session
+  bool held_ = false;
+  double settle_since_ = -1, held_tx_ = 0, held_tz_ = 0;
   // Step's
   int seen_seq_ = 0;
   bool on_ = false, good_ = false;

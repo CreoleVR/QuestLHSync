@@ -56,6 +56,17 @@ constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much agai
 // an automatic frame's layout fit: a station kMoved off against the others for kLayoutMoved s takes its new place, and
 // no fit within kMoved for that long starts the frame over; stations within kLine of one line pin no tilt
 constexpr double kLayoutMoved = 30.0, kLine = 0.3;  // s, m
+// an automatic frame of two stations: SteamVR places the second from what single devices saw, centimetres off and
+// moved as it goes, and with two stations its height and distance set where along the line between them the headset
+// sits. The cameras measure both (Solver::Triangulate) every kPlaceEvery s; a measurement counts when the sightings,
+// from kPlaceCells head cells per station or more, pin them within kPlaceSdD and kPlaceSdH, and one kPlaceMoved off
+// the kept place (and well outside both) means the station moved
+constexpr double kPlaceEvery = 30.0, kPlaceSdD = 0.015, kPlaceSdH = 0.010, kPlaceMoved = 0.05;  // s, m, m, m
+constexpr int kPlaceCells = 30;
+// one session's place is never taken as known better than kPlaceSessD / kPlaceSessH (recordings of one room: 1.4 and
+// 0.9 cm apart from session to session, more than each one's sightings say), so the kept place is the sessions'
+// average; it's never known better than kPlaceFloor, and each session loosens it by kPlaceAge
+constexpr double kPlaceSessD = 0.012, kPlaceSessH = 0.008, kPlaceFloor = 0.003, kPlaceAge = 0.003;  // m
 // corrections move lighthouse devices at the head by at most kSlewStill m/s while the head is still, plus
 // kSlewTurn m per degree it turns and kSlewWalk of the distance it moves: a shift is hard to notice while the view
 // itself moves, and plain to see on a controller held in front of a still head
@@ -180,6 +191,10 @@ struct StationsFile {
   std::map<std::string, V3> fix;  // measured positions, reference frame
   // automatic frames of three or more stations: each one's pose in the reference frame, before the level
   std::map<std::string, std::pair<V3, M3>> ref;
+  // automatic frames of two stations: the other's distance (horizontal) and height from the anchor as the cameras
+  // measured them, and how well (m)
+  struct Place { double d = 0, h = 0, sd_d = 1, sd_h = 1; };
+  std::map<std::string, Place> place;
   bool Load(const std::string &path);
   bool SaveAuto(const std::string &path) const;
 };
@@ -274,6 +289,13 @@ class Solver {
   // stations (sorted by serial) as the solver uses them
   void Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::vector<V3> &Z) const;
   bool measured(const std::string &serial) const { return fix_.count(serial) && !stale_.count(serial); }
+  // a measured place from now on (Sync's automatic two-station frames: it follows SteamVR's), or none
+  void SetFix(const std::string &serial, V3 p) { fix_[serial] = p; }
+  void DropFix(const std::string &serial) { fix_.erase(serial); stale_.erase(serial); }
+  // each station's place as the cameras see it (headset space), from the sightings since the last pose break, its
+  // covariance (m^2), the inliers, the 5 cm head cells they came from, and the oldest one's time
+  struct Seen { V3 q; M3 C; int n = 0, cells = 0; double t0 = 0; };
+  bool Triangulate(std::map<std::string, Seen> &out);
   // Both spaces share gravity only if SteamVR's lighthouse frame is level: a tilt of it moves lighthouse devices far
   // below the base stations sideways, and with two stations in view the 4-DOF fit can't see it. The third station's
   // sightings can: refit with the stations tilted about pivot (reference frame). True if the sightings pin the tilt.
@@ -494,6 +516,14 @@ class Sync {
   double left_since_ = 0, bad_since_ = -1;  // bad_since_: since when no fit holds (-1: one does)
   void LevelCheck(double now);
   double last_check_ = 0, check_said_ = -1e18;
+  // automatic frames of two stations: the other station's place (StationsFile::place) from the cameras
+  bool TwoStations(const std::map<std::string, std::pair<V3, M3>> &raw, std::string &other) const;
+  void PlaceStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  struct PlaceM { double t0, t1, d, h, sd_d, sd_h; };
+  std::map<std::string, std::vector<PlaceM>> place_sess_;  // this session's: overlapping ones keep the better
+  std::map<std::string, StationsFile::Place> place_prior_;  // kept by earlier sessions
+  std::map<std::string, int> place_off_;  // measurements in a row far off the kept place
+  double last_place_ = 0, place_saved_ = -1e18;
   void SaveState(const X4 &x, const std::map<std::string, V3> &cs);
   bool Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss);
 };

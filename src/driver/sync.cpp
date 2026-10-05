@@ -562,6 +562,11 @@ bool StationsFile::Load(const std::string &path) {
         auto v = rp->nums();
         if (v.size() >= 3) ref[kv.first] = {V3{v[0], v[1], v[2]}, ToM3(QuatFromJ(kv.second.get("ref_q")))};
       }
+      const JVal *pl = kv.second.get("place"), *ps = kv.second.get("place_sd");
+      if (pl && ps) {
+        auto v = pl->nums(), s = ps->nums();
+        if (v.size() >= 2 && s.size() >= 2 && s[0] > 0 && s[1] > 0) place[kv.first] = {v[0], v[1], s[0], s[1]};
+      }
     }
   const JVal *ag = d.get("auto");
   autogen = ag && ag->t == JVal::Bool && ag->b;
@@ -572,17 +577,29 @@ bool StationsFile::Load(const std::string &path) {
 bool StationsFile::SaveAuto(const std::string &path) const {
   Quat q = ToQuat(anchor_R), l = ToQuat(level);
   std::string st;
-  for (auto &kv : ref) {
-    Quat r = ToQuat(kv.second.second);
-    const V3 &p = kv.second.first;
-    st += Fmt("%s\n  \"%s\": {\"ref\": [%.6f, %.6f, %.6f], \"ref_q\": [%.6f, %.6f, %.6f, %.6f]}", st.empty() ? "" : ",",
-              kv.first.c_str(), p.x, p.y, p.z, r.w, r.x, r.y, r.z);
+  std::set<std::string> keys;
+  for (auto &kv : ref) keys.insert(kv.first);
+  for (auto &kv : place) keys.insert(kv.first);
+  for (const std::string &k : keys) {
+    std::string e;
+    auto r = ref.find(k);
+    if (r != ref.end()) {
+      Quat rq = ToQuat(r->second.second);
+      const V3 &p = r->second.first;
+      e = Fmt("\"ref\": [%.6f, %.6f, %.6f], \"ref_q\": [%.6f, %.6f, %.6f, %.6f]", p.x, p.y, p.z, rq.w, rq.x, rq.y, rq.z);
+    }
+    auto pl = place.find(k);
+    if (pl != place.end())
+      e += Fmt("%s\"place\": [%.4f, %.4f], \"place_sd\": [%.4f, %.4f]", e.empty() ? "" : ", ", pl->second.d,
+               pl->second.h, pl->second.sd_d, pl->second.sd_h);
+    st += Fmt("%s\n  \"%s\": {%s}", st.empty() ? "" : ",", k.c_str(), e.c_str());
   }
   if (!st.empty()) st += "\n ";
   std::string s = Fmt(
       "{\n \"auto\": true,\n \"note\": \"QuestLHSync's reference frame: %s's pose when it was first seen. SteamVR re-tilts "
       "its lighthouse universe at every start; this pins it. stations: each base station's pose in it; with three or "
-      "more, the frame follows the best fit of them all. level: the turn that levels it with the headset's gravity, "
+      "more, the frame follows the best fit of them all. place: with two, the other's distance and height from the "
+      "anchor (m) as the headset's cameras measured them. level: the turn that levels it with the headset's gravity, "
       "found from the base stations' sightings. Delete to start over.\",\n", anchor.c_str());
   s += Fmt(" \"anchor\": \"%s\",\n \"anchor_p\": [%.6f, %.6f, %.6f],\n \"anchor_q\": [%.6f, %.6f, %.6f, %.6f],\n"
            " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"stations\": {", anchor.c_str(), anchor_p.x, anchor_p.y,
@@ -845,6 +862,109 @@ void Solver::Stations(std::vector<std::string> &keys, std::vector<V3> &S, std::v
   std::lock_guard<std::mutex> g(m_);
   keys.clear(); S.clear(); Z.clear();
   for (auto &kv : S_) { keys.push_back(kv.first); S.push_back(kv.second.first); Z.push_back(kv.second.second.col(2)); }
+}
+
+static bool Inv3(const M3 &a, M3 &o) {
+  const double(*m)[3] = a.m;
+  double c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1], c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2],
+         c02 = m[1][0] * m[2][1] - m[1][1] * m[2][0];
+  double det = m[0][0] * c00 + m[0][1] * c01 + m[0][2] * c02;
+  if (!(std::fabs(det) > 1e-300)) return false;
+  double k = 1 / det;
+  o.m[0][0] = c00 * k; o.m[1][0] = c01 * k; o.m[2][0] = c02 * k;
+  o.m[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * k;
+  o.m[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * k;
+  o.m[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * k;
+  o.m[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * k;
+  o.m[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * k;
+  o.m[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * k;
+  return true;
+}
+
+// Each station's place from its sightings alone (headset space): the point nearest their rays by angle (reweighted:
+// a ray kTriSig off counts half). The rays are the ones nearest it within GATE of where the alignment puts it, then
+// within kPick of the point itself: the alignment can be a degree off a station whose place is what's wrong, and a
+// narrow cone about it would pull the point its way (a recording: 4 cm in height). The covariance takes
+// kTriSig per ray, scaled up by the rays per 5 cm head cell: rays from one spot add no parallax, and a still head's
+// depth is barely known (recordings: windows a head mostly sat in came out 10-20 cm off, with a covariance saying so)
+bool Solver::Triangulate(std::map<std::string, Seen> &out) {
+  constexpr double kTriSig = 0.25 / kDeg, kPick = 1.0 / kDeg, kIn = 0.5, kCell = 0.05;
+  out.clear();
+  if (!has_x_) return false;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z, P, Zq;
+  Stations(keys, S, Z);
+  Rays r = GetRays(std::max(seen_ - kKeep, since_));
+  Predict(x_, S, Z, P, Zq);
+  bool dim = starved_;
+  std::vector<std::vector<size_t>> pick(S.size());
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!r.B[n] && !dim) continue;
+    int k;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < GATE) pick[k].push_back(n);
+  }
+  for (size_t k = 0; k < S.size(); k++) {
+    if (pick[k].size() < 20) continue;
+    V3 q = P[k];
+    bool ok = true;
+    for (int it = 0; it < 10 && ok; it++) {
+      M3 A;
+      A.m[0][0] = A.m[1][1] = A.m[2][2] = 0;
+      double bv[3] = {0, 0, 0};
+      for (size_t n : pick[k]) {
+        V3 u = q - r.O[n], d = r.D[n];
+        double rr = norm(u), ang = std::acos(std::max(-1.0, std::min(1.0, dot(u, d) / rr)));
+        if (it >= 2 && ang > kPick) continue;
+        double w = 1 / (1 + (ang / kTriSig) * (ang / kTriSig)) / (rr * rr);
+        double dv[3] = {d.x, d.y, d.z}, ov[3] = {r.O[n].x, r.O[n].y, r.O[n].z};
+        for (int i = 0; i < 3; i++)
+          for (int j = 0; j < 3; j++) {
+            double pij = (i == j ? 1 : 0) - dv[i] * dv[j];
+            A.m[i][j] += w * pij;
+            bv[i] += w * pij * ov[j];
+          }
+      }
+      M3 Ai;
+      if (!(ok = Inv3(A, Ai))) break;
+      q = Ai * V3{bv[0], bv[1], bv[2]};
+    }
+    if (!ok) continue;
+    M3 A;
+    A.m[0][0] = A.m[1][1] = A.m[2][2] = 0;
+    std::set<std::array<long long, 3>> cells;
+    int nin = 0;
+    double t0 = 1e300;
+    for (size_t n : pick[k]) {
+      V3 u = q - r.O[n], d = r.D[n];
+      double rr = norm(u), ang = std::acos(std::max(-1.0, std::min(1.0, dot(u, d) / rr)));
+      if (ang * kDeg >= kIn) continue;
+      double w = 1 / ((kTriSig * rr) * (kTriSig * rr));
+      double dv[3] = {d.x, d.y, d.z};
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) A.m[i][j] += w * ((i == j ? 1 : 0) - dv[i] * dv[j]);
+      cells.insert({(long long)std::floor(r.O[n].x / kCell), (long long)std::floor(r.O[n].y / kCell),
+                    (long long)std::floor(r.O[n].z / kCell)});
+      nin++;
+      t0 = std::min(t0, r.T[n]);
+    }
+    M3 C;
+    if (nin < 20 || !Inv3(A, C)) continue;
+    // and by how far the rays scatter about it, when more than kTriSig (lit rooms, an unlearned timing: up to twice)
+    std::vector<double> angs;
+    for (size_t n : pick[k]) {
+      V3 u = q - r.O[n];
+      double ang = std::acos(std::max(-1.0, std::min(1.0, dot(u, r.D[n]) / norm(u))));
+      if (ang < kPick) angs.push_back(ang);
+    }
+    double sig = std::max(kTriSig, Median(angs) / 1.177);  // the median of a 2D error's size: 1.177 sigma
+    double s = std::max(1.0, (double)nin / cells.size()) * (sig / kTriSig) * (sig / kTriSig);
+    for (int i = 0; i < 3; i++)
+      for (int j = 0; j < 3; j++) C.m[i][j] *= s;
+    out[keys[k]] = {q, C, nin, (int)cells.size(), t0};
+  }
+  return !out.empty();
 }
 
 void Solver::Predict(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, std::vector<V3> &P, std::vector<V3> &Zq) {
@@ -2029,6 +2149,13 @@ Sync::Sync(SyncConfig cfg, LogFn log)
   else
     log_("no stations.json yet: the reference frame is set the first time base stations show up");
   LoadState();
+  // a place kept by earlier sessions holds a little looser in this one: what this one sees can still move it
+  for (auto &kv : sfile_.place) {
+    StationsFile::Place p = kv.second;
+    p.sd_d = std::hypot(p.sd_d, kPlaceAge);
+    p.sd_h = std::hypot(p.sd_h, kPlaceAge);
+    place_prior_[kv.first] = p;
+  }
 }
 
 Sync::~Sync() {}
@@ -2314,8 +2441,8 @@ void Sync::OnLine(double pc, const char *line) {
     if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
-      fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f\n", t, cam, O.x, O.y, O.z, D.x, D.y,
-              D.z, p.x, p.y, p.z, w);
+      fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
+              D.y, D.z, p.x, p.y, p.z, w, b.peak);
     }
     if (w > wmax) { spots_.fast++; continue; }
     bool bright = b.peak >= kBright;
@@ -2446,6 +2573,92 @@ void Sync::LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, doubl
 
 // Two stations: the level the cameras see across them, against gravity's (gravity.h) about the same axis. Logged every
 // few minutes (and recorded), so the two can be compared; nothing is applied from it.
+// an automatic frame with the anchor and one other station in it (three or more: the layout fit places them)
+bool Sync::TwoStations(const std::map<std::string, std::pair<V3, M3>> &raw, std::string &other) const {
+  if (!sfile_.autogen || frame_.layout() || frame_.ok() != 1 || raw.size() != 2 || !raw.count(sfile_.anchor))
+    return false;
+  for (auto &kv : raw)
+    if (kv.first != sfile_.anchor) other = kv.first;
+  return true;
+}
+
+// The other station of an automatic two-station frame where the cameras see it from the anchor (Tick hands it to the
+// solver): this session's measurements (of windows that overlap, the better), with what earlier sessions kept unless
+// three in a row say the station moved
+void Sync::PlaceStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
+  std::string other;
+  if (!TwoStations(raw, other)) return;
+  std::map<std::string, Solver::Seen> seen;
+  if (!solver_.Triangulate(seen) || !seen.count(sfile_.anchor) || !seen.count(other)) return;
+  const Solver::Seen &a = seen[sfile_.anchor], &b = seen[other];
+  V3 v = b.q - a.q;
+  double d = std::hypot(v.x, v.z);
+  if (d < 1) return;
+  V3 hv{v.x / d, 0, v.z / d};
+  M3 C;
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) C.m[i][j] = a.C.m[i][j] + b.C.m[i][j];
+  double sd_d = std::sqrt(std::max(0.0, dot(hv, C * hv))), sd_h = std::sqrt(std::max(0.0, C.m[1][1]));
+  Rec(now, "I place %s %.4f %.4f %.4f %.4f %d %d", other.c_str(), d, v.y, sd_d, sd_h, a.cells, b.cells);
+  if (a.cells < kPlaceCells || b.cells < kPlaceCells || sd_d > kPlaceSdD || sd_h > kPlaceSdH) return;
+  auto info = [](const PlaceM &p) { return 1 / (p.sd_d * p.sd_d) + 1 / (p.sd_h * p.sd_h); };
+  auto &L = place_sess_[other];
+  PlaceM m{std::min(a.t0, b.t0), now, d, v.y, sd_d, sd_h};
+  if (!L.empty() && m.t0 < L.back().t1) {
+    if (info(m) > info(L.back())) L.back() = m;
+  } else {
+    L.push_back(m);
+  }
+  double wd = 0, wh = 0, md = 0, mh = 0;
+  for (const PlaceM &p : L) {
+    wd += 1 / (p.sd_d * p.sd_d); md += p.d / (p.sd_d * p.sd_d);
+    wh += 1 / (p.sd_h * p.sd_h); mh += p.h / (p.sd_h * p.sd_h);
+  }
+  StationsFile::Place s{md / wd, mh / wh, std::max(kPlaceSessD, 1 / std::sqrt(wd)),
+                        std::max(kPlaceSessH, 1 / std::sqrt(wh))}, use = s;
+  auto pr = place_prior_.find(other);
+  if (pr != place_prior_.end()) {
+    const StationsFile::Place &p = pr->second;
+    double gd = s.d - p.d, gh = s.h - p.h;
+    bool off = (std::fabs(gd) > kPlaceMoved && std::fabs(gd) > 4 * std::hypot(s.sd_d, p.sd_d)) ||
+               (std::fabs(gh) > kPlaceMoved && std::fabs(gh) > 4 * std::hypot(s.sd_h, p.sd_h));
+    int &n = place_off_[other];
+    n = off ? n + 1 : 0;
+    if (n >= 3) {
+      log_(Fmt("base station %s: the cameras see it %+.1f cm further from %s and %+.1f cm higher than measured "
+               "before: it moved; its place is measured again", other.c_str(), gd * 100, sfile_.anchor.c_str(), gh * 100));
+      place_prior_.erase(pr);
+      n = 0;
+    } else if (off) {
+      return;  // the kept place stays until it's clear
+    } else {
+      double pd = 1 / (p.sd_d * p.sd_d), ps = 1 / (s.sd_d * s.sd_d), qd = 1 / (p.sd_h * p.sd_h), qs = 1 / (s.sd_h * s.sd_h);
+      use = {(p.d * pd + s.d * ps) / (pd + ps), (p.h * qd + s.h * qs) / (qd + qs), 1 / std::sqrt(pd + ps),
+             1 / std::sqrt(qd + qs)};
+    }
+  }
+  use.sd_d = std::max(use.sd_d, kPlaceFloor);
+  use.sd_h = std::max(use.sd_h, kPlaceFloor);
+  auto it = sfile_.place.find(other);
+  bool had = it != sfile_.place.end() && it->second.sd_d <= kPlaceSdD && it->second.sd_h <= kPlaceSdH;
+  double moved = it == sfile_.place.end() ? 1 : std::hypot(use.d - it->second.d, use.h - it->second.h);
+  sfile_.place[other] = use;
+  if (!had || moved >= 0.01) {
+    V3 pa, pb;
+    M3 R;
+    frame_.Apply(raw.at(sfile_.anchor).first, raw.at(sfile_.anchor).second, pa, R);
+    frame_.Apply(raw.at(other).first, raw.at(other).second, pb, R);
+    V3 w = pb - pa;
+    log_(Fmt("base station %s: the cameras put it %.3f m from %s and %+.1f cm above it (within %.1f and %.1f cm), "
+             "SteamVR %.3f m and %+.1f cm: the alignment uses the cameras' place", other.c_str(), use.d,
+             sfile_.anchor.c_str(), use.h * 100, use.sd_d * 100, use.sd_h * 100, std::hypot(w.x, w.z), w.y * 100));
+  }
+  if (moved > 0.001 && (!had || now - place_saved_ >= 60)) {
+    place_saved_ = now;
+    sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
+  }
+}
+
 void Sync::LevelCheck(double now) {
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
@@ -2519,6 +2732,27 @@ Transform Sync::Tick(double now) {
     }
     frame_.Update(raw);
     LayoutStep(raw, now);
+    if (sfile_.autogen) {  // two stations: the other where the cameras measured it, in SteamVR's direction from the anchor
+      std::string other;
+      bool two = TwoStations(raw, other);
+      for (auto &kv : sfile_.place) {
+        const StationsFile::Place &pl = kv.second;
+        auto it = raw.find(kv.first);
+        if (!two || kv.first != other || it == raw.end() || pl.sd_d > kPlaceSdD || pl.sd_h > kPlaceSdH) {
+          solver_.DropFix(kv.first);
+          continue;
+        }
+        const auto &an = raw.at(sfile_.anchor);
+        V3 pa, pb;
+        M3 R;
+        frame_.Apply(an.first, an.second, pa, R);
+        frame_.Apply(it->second.first, it->second.second, pb, R);
+        V3 v = pb - pa;
+        double h = std::hypot(v.x, v.z);
+        if (h < 1) solver_.DropFix(kv.first);
+        else solver_.SetFix(kv.first, pa + V3{v.x / h * pl.d, pl.h, v.z / h * pl.d});
+      }
+    }
     std::map<std::string, V3> cs;
     for (auto &kv : raw) {
       V3 p; M3 R;
@@ -2634,6 +2868,10 @@ Transform Sync::Tick(double now) {
     if (now - last_level_ >= 10) {
       last_level_ = now;
       LevelStep(raw, now);
+    }
+    if (now - last_place_ >= kPlaceEvery && Locked(solver_.has_x(), st) && st.cond) {
+      last_place_ = now;
+      PlaceStep(raw, now);
     }
     if (now - last_check_ >= 60 && Locked(solver_.has_x(), st) && st.cond) {
       last_check_ = now;

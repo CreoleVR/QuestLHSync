@@ -51,11 +51,18 @@ constexpr double kSigTilt = 0.05, kTauTilt = 300;  // m/s^2 (0.3 deg), s
 constexpr double kSigGx = 0.5;                    // m/s^2: gravity's sideways part before any data (3 deg)
 constexpr double kKeepSd = 0.05;                  // m/s^2: offsets known this well are kept
 constexpr double kApplySd = 0.25;                 // deg: the tilt is applied once known this well
-constexpr double kMaxTilt = 3;                    // deg: more is something else
+// SteamVR's frame doesn't tilt under the anchor during a session: a level applied this long and known this well is
+// held from then on. The filter goes on (its offsets are kept), but a stretch of windows it fits poorly (devices
+// resting a long while, poses it hasn't seen) can't walk the level off any more: one did, 0.7 deg in half an hour.
+// Past the devices' warm-up (recordings: held after 10 min it sat 0.13 deg off the rest of the session, after 20 0.05)
+constexpr double kHoldAfter = 1200, kHoldSd = 0.12;  // s, deg
+// SteamVR's room has come up 5 deg off level and righted itself a minute later (a recording)
+constexpr double kMaxTilt = 10;                   // deg: more is something else
 constexpr double kMaxGErr = 0.02;                 // |G| within 2% of g
 constexpr double kSigG = 0.05;                    // m/s^2: |G| held near g this loosely (rests alone can't tell it
                                                   // from the offsets along it)
-constexpr double kSlew = 0.1 / kDeg;              // rad a step (1 s): a change eases in
+// a change eases in: kSlew a step (1 s), or kEase of what's left when that's more (a big one takes seconds)
+constexpr double kSlew = 0.1 / kDeg, kEase = 0.25;
 constexpr double kG = 9.80665;
 
 std::string Fmt(const char *fmt, ...) {
@@ -546,6 +553,8 @@ void Gravity::Process(double now) {
     t_first_ = 1e300;
     t_last_ = -1e300;
     key_ = ref.key;
+    held_ = false;
+    settle_since_ = -1;
     std::lock_guard<std::mutex> g(m_);
     fit_ = Fit();
     applying_ = false;
@@ -773,10 +782,21 @@ void Gravity::Report(double now) {
               : std::fabs(g / kG - 1) > kMaxGErr       ? 3
                                                        : 0;
   if (rec_) rec_(now, Fmt("I gravity %.5f %.5f %.4f %.4f %d %d", f.tx * kDeg, f.tz * kDeg, f.sd, g, f.devs, state));
+  if (!held_) {
+    if (state != 0) settle_since_ = -1;
+    else if (settle_since_ < 0) settle_since_ = now;
+    if (state == 0 && now - settle_since_ >= kHoldAfter && f.sd <= kHoldSd) {
+      held_ = true;
+      held_tx_ = f.tx;
+      held_tz_ = f.tz;
+      log_(Fmt("gravity: the level settled at %.2f deg (within %.2f): held for this session", deg, f.sd));
+    }
+  }
   {
     std::lock_guard<std::mutex> l(m_);
     fit_ = f;
-    fit_.ok = state == 0;
+    fit_.ok = held_ || state == 0;
+    if (held_) { fit_.tx = held_tx_; fit_.tz = held_tz_; }
     fit_.key = key_;
     applying_ = fit_.ok;
     fit_seq_++;
@@ -796,7 +816,8 @@ void Gravity::Report(double now) {
   said_tx_ = f.tx;
   said_tz_ = f.tz;
   last_log_ = now;
-  std::string why = state == 0   ? "levelling by it"
+  std::string why = held_        ? Fmt("levelling by the %.2f deg it settled at", std::hypot(held_tx_, held_tz_) * kDeg)
+                    : state == 0 ? "levelling by it"
                     : state == 1 ? "not applied yet: the devices moving and turning about tell their "
                                    "accelerometers' offsets"
                     : state == 2 ? "too far to be a level: not applied"
@@ -870,7 +891,8 @@ bool Gravity::Step(const Ref &ref, bool &on, M3 &tilt) {
   Quat target = ToQuat(Tilt(tx_, tz_));
   double d = QuatDeg(applied_, target) / kDeg;
   if (on_ && d < 1e-7) return false;
-  applied_ = d > kSlew ? Slerp(applied_, target, kSlew / d) : target;  // eases in
+  double step = std::max(kSlew, kEase * d);
+  applied_ = d > step ? Slerp(applied_, target, step / d) : target;  // eases in
   on_ = on = true;
   tilt = ToM3(applied_);
   return true;
