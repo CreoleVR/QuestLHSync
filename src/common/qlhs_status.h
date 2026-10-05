@@ -8,7 +8,7 @@
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
 #define QLHS_VERSION 2
-#define QLHS_RELEASE "1.13"  // magisk/build_module.py reads it
+#define QLHS_RELEASE "1.14"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
