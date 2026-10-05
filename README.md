@@ -2,7 +2,7 @@
 
 Lighthouse trackers, controllers and base stations aligned to a Quest's or a
 Steam Frame's own tracking, with nothing mounted on the headset. The headset's
-tracking cameras see the laser flashes of SteamVR 2.0 base stations, and
+tracking cameras see the laser flashes of SteamVR base stations, and
 QuestLHSync uses them to keep the lighthouse space lined up with the
 headset's while you play. No SpaceCalibrator, no tracker strapped to your head.
 
@@ -19,12 +19,10 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
 ## Requirements
 
 - A **Quest Pro, Quest 3 or Quest 3S**, rooted with
-  [Magisk](https://github.com/topjohnwu/Magisk). Tested on the Quest Pro. The
-  Quest 3 has the same tracking cameras but hasn't been tried yet, nor has
-  the 3S.
+  [Magisk](https://github.com/topjohnwu/Magisk).
 - Or a **Steam Frame**. No root, no developer password: everything installs as
   your user.
-- **SteamVR 2.0 base stations** (1.0 isn't supported).
+- **SteamVR base stations**, 1.0 or 2.0.
 - **Windows with SteamVR**, with the headset streamed by anything: Steam Link,
   Link, Air Link, Virtual Desktop, ALVR, CreoleCast...
 - The PC and the headset on the **same local network**.
