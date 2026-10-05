@@ -357,7 +357,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         if (!family.empty() || any_hmd_) {
           g_hmd = (int)i;
           g_kind[i] = kHmd;
-          link_->SetFamily(family);
+          // anyHmd not working fix
+          link_->SetFamily(any_hmd_ ? "" : family);
           std::lock_guard<std::mutex> g(hmd_m_);
           hmd_model_ = model.empty() ? "headset" : model;
           hmd_system_ = StreamerName(sys);
