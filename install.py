@@ -16,7 +16,7 @@ from build_module import VERSION  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVER = os.path.join(HERE, "driver", "questlhsync")
-MODULE = os.path.join(HERE, "out", f"QuestLHSync-magisk-{VERSION}.zip")
+MODULE = os.path.join(HERE, "out", f"QuestLHSync-quest-module-{VERSION.lstrip('v')}.zip")
 
 
 def vrpathreg():
@@ -81,7 +81,7 @@ def headset():
     d, name = quest[0]
     if "uid=0" not in adb("-s", d, "shell", "su -c id", check=False).stdout:
         sys.exit("su doesn't work on the headset (Magisk root needed; allow Shell in Magisk's superuser list)")
-    dst = "/sdcard/Download/QuestLHSync-magisk.zip"
+    dst = "/sdcard/Download/QuestLHSync-quest-module.zip"
     print(f"{name}: pushing the module")
     adb("-s", d, "push", MODULE, dst)
     r = adb("-s", d, "shell", f"su -c 'magisk --install-module {dst}'", check=False)

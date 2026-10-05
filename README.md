@@ -33,47 +33,46 @@ Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
 
 ## Install
 
-1. Download `QuestLHSync-<version>.zip` from
-   [Releases](https://github.com/CreoleVR/QuestLHSync/releases) and extract it.
-2. **Headset:**
-   - **Quest:** install `QuestLHSync-magisk-<version>.zip` in the Magisk app
-     (**Modules > Install from storage**) and reboot. Or over adb:
+Each device has its own file in
+[Releases](https://github.com/CreoleVR/QuestLHSync/releases).
+
+1. **Headset:**
+   - **Quest:** install `QuestLHSync-quest-module-<version>.zip` in the Magisk
+     app (**Modules > Install from storage**) and reboot. Or over adb:
 
      ```
-     adb push QuestLHSync-magisk-<version>.zip /sdcard/Download/
-     adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-magisk-<version>.zip"
+     adb push QuestLHSync-quest-module-<version>.zip /sdcard/Download/
+     adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-quest-module-<version>.zip"
      adb reboot
      ```
 
-   - **Steam Frame:** in Desktop Mode, open
-     `QuestLHSync-frame-installer-<version>.flatpak` from
-     [Releases](https://github.com/CreoleVR/QuestLHSync/releases) in Discover,
-     then start **QuestLHSync Installer** and click **Install**. Or copy
-     `QuestLHSync-frame-<version>.tar.gz` to the Frame and, in a terminal on it
-     or over ssh:
+   - **Steam Frame:** in Desktop Mode, open `QuestLHSync-frame-installer.flatpak`
+     in Discover, then start **QuestLHSync Installer** and click **Install**. Or
+     copy `QuestLHSync-frame-module-<version>.tar.gz` to the Frame and, in a
+     terminal on it or over ssh:
 
      ```
-     tar xzf QuestLHSync-frame-<version>.tar.gz
+     tar xzf QuestLHSync-frame-module-<version>.tar.gz
      QuestLHSync-frame/install.sh
      ```
 
      Either way, SteamVR on the headset restarts once to load its driver.
 
-3. **PC:** run `QuestLHSync-Installer.exe`, next to the zip in
-   [Releases](https://github.com/CreoleVR/QuestLHSync/releases). It downloads
-   the latest release, installs the driver to
-   `%LOCALAPPDATA%\QuestLHSync\questlhsync`, registers it with SteamVR (in
-   place of a copy you registered by hand) and offers an update whenever a
-   newer release is out. It closes SteamVR if it's running.
+2. **PC:** run `QuestLHSync-steamvr-installer.exe`. It downloads the latest
+   release, installs the driver to `%LOCALAPPDATA%\QuestLHSync\questlhsync`,
+   registers it with SteamVR (in place of a copy you registered by hand) and
+   offers an update whenever a newer release is out. It closes SteamVR if it's
+   running.
 
-   Or by hand: move the `questlhsync` folder from the zip somewhere permanent
-   and, with SteamVR closed, register it:
+   Or by hand: extract the `questlhsync` folder from
+   `QuestLHSync-steamvr-<version>.zip` somewhere permanent and, with SteamVR
+   closed, register it:
 
    ```
    "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "C:\path\to\questlhsync"
    ```
 
-4. Turn off SpaceCalibrator, OpenVR-SpaceSync or anything else that moves
+3. Turn off SpaceCalibrator, OpenVR-SpaceSync or anything else that moves
    lighthouse devices. Two tools correcting the same devices fight each other.
 
 ## Use
@@ -153,9 +152,9 @@ Python 3:
 ```
 build.bat                        SteamVR driver + dashboard app (SteamVR closed) + out\QuestLHSync-Installer.exe
 build.bat installer              only the installer
-python magisk\build_module.py    Magisk module, into out\
+python magisk\build_module.py    Quest module (Magisk), into out\
 python frame\build.py            Steam Frame package, into out\
-python release.py                out\QuestLHSync-<version>.zip
+python release.py                the release files, into out\release-<version>\
 python install.py                register driver\questlhsync with SteamVR
 python install.py headset        install the module over adb, no reboot
 ```
@@ -170,7 +169,8 @@ own architecture (so on the Frame, or any arm64 Linux) with
 `out/QuestLHSync-frame-installer-<version>.flatpak`. It needs flatpak-builder
 and the GNOME SDK:
 `flatpak install --user flathub org.flatpak.Builder org.gnome.Sdk//50`.
-`release.py` doesn't pack it: attach it to the release on its own.
+`release.py` adds it to the release files as `QuestLHSync-frame-installer.flatpak`
+when it's in `out/`.
 
 `lhsyncd`'s core (`src/headset/lhsyncd.c`) is shared by both headsets; each adds
 its own side behind `src/headset/headset.h` (`magisk/src/quest.c`,

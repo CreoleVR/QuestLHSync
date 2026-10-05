@@ -1,4 +1,4 @@
-"""Builds the QuestLHSync Magisk module: out/QuestLHSync-magisk-<version>.zip
+"""Builds the QuestLHSync Magisk module: out/QuestLHSync-quest-module-<version>.zip
 
   lhsyncd       ../src/headset/lhsyncd.c (shared with the Steam Frame) + src/quest.c, NDK clang for arm64 (Android 10+)
   lhsight.js    src/lhsight.js with src/lhsight.c inlined (Frida CModule), no time limit
@@ -73,7 +73,7 @@ def main():
     js = js.replace("@CSRC@", c).replace("@DUR@", "0")
     prop = open(os.path.join(HERE, "module", "module.prop.in"), encoding="utf-8").read()
     prop = prop.replace("@VERSION@", VERSION).replace("@CODE@", str(CODE))
-    zpath = os.path.join(OUT, f"QuestLHSync-magisk-{VERSION}.zip")
+    zpath = os.path.join(OUT, f"QuestLHSync-quest-module-{VERSION.lstrip('v')}.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         def add(name, data, mode=0o644):
             info = zipfile.ZipInfo(name, date_time=(2026, 10, 3, 0, 0, 0))

@@ -1,6 +1,6 @@
-// QuestLHSync-Installer.exe: installs and updates the SteamVR driver from the latest GitHub release.
+// QuestLHSync-steamvr-installer.exe: installs and updates the SteamVR driver from the latest GitHub release.
 // Looks like the dashboard page (same colours, fonts and layout), drawn with GDI at the screen's own resolution. Downloads
-// releases/download/<tag>/QuestLHSync-<ver>.zip with WinHTTP, unpacks its questlhsync/ folder to
+// releases/download/<tag>/QuestLHSync-steamvr-<ver>.zip with WinHTTP, unpacks its questlhsync/ folder to
 // %LOCALAPPDATA%\QuestLHSync\questlhsync, registers it with SteamVR (vrpathreg) and records the installed tag in
 // %LOCALAPPDATA%\QuestLHSync\installed.json so it can offer updates.
 #include <windows.h>
@@ -416,7 +416,7 @@ static std::wstring LatestTag() {
 }
 
 static std::wstring PackageName(const std::wstring &tag) {
-  return L"QuestLHSync-" + tag.substr(tag.size() && (tag[0] == L'v' || tag[0] == L'V') ? 1 : 0) + L".zip";
+  return L"QuestLHSync-steamvr-" + tag.substr(tag.size() && (tag[0] == L'v' || tag[0] == L'V') ? 1 : 0) + L".zip";
 }
 
 // ---------------------------------------------------------------- unpack the driver folder
