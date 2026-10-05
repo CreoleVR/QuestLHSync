@@ -38,7 +38,9 @@ constexpr double kExpoArrival = 0.020;  // s, grid -> exposure with the arrival-
 constexpr double kExpoDefault = 0.018;  // s, grid -> pose time with the round-trip clock, before it's learned
                                         // (CreoleCast learns 18.5, a replayed streamer 20.8)
 constexpr double kWmax = 60.0;          // deg/s: sightings while the head turns faster are skipped
-constexpr double kWmaxUntimed = 20.0;   // ... until the timing is learned
+constexpr double kWmaxUntimed = 20.0;   // ... until the timing is learned (a Quest's: the Frame stamps its frames
+                                        // itself, any timing from 10 to 30 ms fits it, and its few sightings are
+                                        // mostly from a turning head; the timing waits for a lock)
 constexpr double kNearDeg = 5.0;        // deg: a fast-head sighting this close to a base station counts for timing
 constexpr int kTimingFirstN = 200;      // such sightings before the first (wide) timing estimate
 constexpr int kTimingNextN = 40;        // ... before each later one

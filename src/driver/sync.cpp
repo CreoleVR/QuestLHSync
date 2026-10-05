@@ -2429,7 +2429,7 @@ void Sync::OnLine(double pc, const char *line) {
     prev = big;
   }
   if (still) { spots_.still += nb; return; }
-  double wmax = (cfg_.learn_timing && !timing_learned_) ? kWmaxUntimed : kWmax;
+  double wmax = (cfg_.learn_timing && !timing_learned_ && !optics_.exact_time()) ? kWmaxUntimed : kWmax;
   M3 Rc;
   V3 tc;
   if (have_lag && w <= wmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
