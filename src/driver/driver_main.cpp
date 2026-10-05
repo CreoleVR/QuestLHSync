@@ -354,17 +354,19 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         // actual driver name tells them apart ("oculus_virtualdesktop")
         std::string actual = GetStr(c, vr::Prop_ActualTrackingSystemName_String);
         if (!actual.empty()) sys = actual;
-        if (!family.empty() || any_hmd_) {
+        // Virtual Desktop names every headset newer than the Quest Pro "Meta Quest 3", ALVR the one it emulates (a
+        // Quest 2 unless set otherwise): neither name tells, so whichever headset answers is used
+        bool any = any_hmd_ || sys == "oculus_virtualdesktop" || sys == "alvr_server";
+        if (!family.empty() || any) {
           g_hmd = (int)i;
           g_kind[i] = kHmd;
-          // anyHmd not working fix
-          link_->SetFamily(any_hmd_ ? "" : family);
+          link_->SetFamily(any ? "" : family);
           std::lock_guard<std::mutex> g(hmd_m_);
           hmd_model_ = model.empty() ? "headset" : model;
           hmd_system_ = StreamerName(sys);
           g_sync->SetStreamer(sys);
-          Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), hmd_system_.c_str(),
-                  !family.empty() ? "" : " - not named a Quest Pro, 3, 3S or Steam Frame, used because anyHmd is set"));
+          Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), hmd_system_.c_str(), !family.empty() || !any_hmd_ ? "" :
+                  " - not named a Quest Pro, 3, 3S or Steam Frame, used because anyHmd is set"));
           continue;
         }
         std::lock_guard<std::mutex> g(hmd_m_);
