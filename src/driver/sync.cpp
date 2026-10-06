@@ -2622,40 +2622,48 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
            "%.2f deg", step, RotDeg(L), lv.stations, lv.med));
 }
 
-// An automatic frame takes its stations' poses in it once three show up (Frame::Layout follows them from then on), adds
-// new ones as they come, and moves a station's place when the fit has left it out for kLayoutMoved s (it was moved).
-// When no fit gets within kMoved for kLayoutMoved s, more than one was moved: the frame starts over from SteamVR's.
+// An automatic frame takes its stations' poses in it once three show up (Frame::Layout follows them from then on) and
+// adds new ones as they come. A known station's place is never retaken from a fit of the others: SteamVR re-solves
+// them tens of cm off at times, and that bent the layout for good. The frame starts over from SteamVR's (its level
+// found again) when for kLayoutMoved s the fit leaves a station out, no fit gets within kMoved, or the fit tilts the
+// frame over kMaxRot off level.
 void Sync::LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
   if (!sfile_.autogen || frame_.ok() != 1) return;
   bool was = frame_.layout();
   if (!was && raw.size() < 3) return;
   if (!was || frame_.miss() <= kMoved) bad_since_ = -1;
   else if (bad_since_ < 0) bad_since_ = now;
-  if (bad_since_ >= 0 && now - bad_since_ >= kLayoutMoved && raw.size() >= 3) {
+  double tilt = TiltDeg(frame_.Anchored());
+  if (!was || tilt <= kMaxRot) tilt_since_ = -1;
+  else if (tilt_since_ < 0) tilt_since_ = now;
+  std::string left = frame_.left();
+  if (left != left_seen_) { left_seen_ = left; left_since_ = now; }
+  std::string why;
+  if (bad_since_ >= 0 && now - bad_since_ >= kLayoutMoved)
+    why = Fmt("base stations moved (%.0f cm off the fit)", frame_.miss() * 100);
+  else if (was && !left.empty() && now - left_since_ >= kLayoutMoved)
+    why = "base station " + left + " moved";
+  else if (tilt_since_ >= 0 && now - tilt_since_ >= kLayoutMoved)
+    why = Fmt("the base stations' fit tilts it %.1f deg off SteamVR's level", tilt);
+  if (!why.empty() && raw.size() >= 3) {
     sfile_.ref.clear();
     sfile_.ref.insert(raw.begin(), raw.end());
     sfile_.level = M3();  // SteamVR's frame as it is now: its level is found again
     sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
-    bad_since_ = -1;
-    log_(Fmt("lighthouse frame: base stations moved (%.0f cm off the fit): reference frame reset",
-             frame_.miss() * 100));
+    bad_since_ = tilt_since_ = -1;
+    left_since_ = now;
+    log_("lighthouse frame: " + why + ": reference frame reset");
     frame_.Update(raw);
     return;
   }
-  std::string left = frame_.left();
-  if (left != left_seen_) { left_seen_ = left; left_since_ = now; }
   int n = 0;
   for (auto &kv : raw) {
-    bool known = sfile_.ref.count(kv.first) > 0;
-    bool moved = known && kv.first == left && now - left_since_ >= kLayoutMoved;
-    if (known && !moved) continue;
+    if (sfile_.ref.count(kv.first)) continue;
     V3 p; M3 R;
     frame_.Unlevelled(kv.second.first, kv.second.second, p, R);
     sfile_.ref[kv.first] = {p, R};
     n++;
-    if (was)
-      log_(Fmt("lighthouse frame: base station %s %s", kv.first.c_str(),
-               moved ? "was moved: its new place taken" : "added to the fit"));
+    if (was) log_(Fmt("lighthouse frame: base station %s added to the fit", kv.first.c_str()));
   }
   if (!n) return;
   if (!was) log_(Fmt("lighthouse frame: follows the fit of %d base stations from now on", n));

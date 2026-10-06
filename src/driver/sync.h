@@ -64,8 +64,8 @@ constexpr double kFrozen = 10.0;        // s: SteamVR's headset this still while
 constexpr double kKeep = 600.0;         // s of rays kept
 constexpr double kMoved = 0.25;         // m: SteamVR has a measured station this far off: it was moved
 constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much against the reference
-// an automatic frame's layout fit: a station kMoved off against the others for kLayoutMoved s takes its new place, and
-// no fit within kMoved for that long starts the frame over; stations within kLine of one line pin no tilt
+// an automatic frame's layout fit: a station kMoved off against the others, no fit within kMoved, or the frame tilted
+// kMaxRot off level, for kLayoutMoved s, starts the frame over; stations within kLine of one line pin no tilt
 constexpr double kLayoutMoved = 30.0, kLine = 0.3;  // s, m
 // an automatic frame of two stations: SteamVR places the second from what single devices saw, centimetres off and
 // moved as it goes, and with two stations its height and distance set where along the line between them the headset
@@ -534,7 +534,8 @@ class Sync {
   void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   void LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   std::string left_seen_;  // the station the layout fit leaves out, since left_since_
-  double left_since_ = 0, bad_since_ = -1;  // bad_since_: since when no fit holds (-1: one does)
+  // since when no fit holds, since when the frame tilts off level (-1: not)
+  double left_since_ = 0, bad_since_ = -1, tilt_since_ = -1;
   void LevelCheck(double now);
   double last_check_ = 0, check_said_ = -1e18;
   // automatic frames of two stations: the other station's place (StationsFile::place) from the cameras
