@@ -2522,10 +2522,9 @@ void Sync::Use(const Shot &f) {
     prev = big;
   }
   if (still) { spots_.still += nb; return; }
-  double wmax = (cfg_.learn_timing && !timing_learned_ && !optics_.exact_time()) ? kWmaxUntimed : kWmax;
   M3 Rc;
   V3 tc;
-  if (have_lag && w <= wmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
+  if (have_lag && w <= kWmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
   for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
     if (npx > kMaxPx) { spots_.big++; continue; }
@@ -2537,7 +2536,7 @@ void Sync::Use(const Shot &f) {
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
               D.y, D.z, p.x, p.y, p.z, w, b.peak);
     }
-    if (w > wmax) { spots_.fast++; continue; }
+    if (w > kWmax) { spots_.fast++; continue; }
     bool bright = b.peak >= kBright;
     solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
     if (bright || solver_.starved()) spots_.used++;
