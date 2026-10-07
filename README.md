@@ -107,6 +107,7 @@ Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`:
 | `anyHmd` | `false` | Use SteamVR's headset even when it isn't named a Quest Pro, 3, 3S or Steam Frame |
 | `record` | `false` | Record every session (same as the button) |
 | `gravity` | `true` | `false` turns levelling by the lighthouse devices' accelerometers off |
+| `steadyStations` | `true` | `false` lets SteamVR move base stations by each new measurement instead of their average |
 
 ## Troubleshooting
 

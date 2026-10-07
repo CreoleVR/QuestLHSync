@@ -31,6 +31,7 @@
 #include "gravity.h"
 #include "net.h"
 #include "openvr_driver.h"
+#include "relations.h"
 #include "sync.h"
 
 static const char *kSection = "driver_questlhsync";
@@ -41,6 +42,7 @@ static FILE *g_logf;
 static QlhsStatus *g_st;
 static std::unique_ptr<Sync> g_sync;
 static std::unique_ptr<Gravity> g_gravity;
+static std::unique_ptr<Relations> g_rel;
 
 static void PushStatusLog(const std::string &s);
 
@@ -289,6 +291,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     g_sync = std::make_unique<Sync>(cfg, [](const std::string &s) { Log(s); });
     g_gravity = std::make_unique<Gravity>(dir_, [](const std::string &s) { Log(s); });
     g_gravity->SetRecord([](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
+    g_rel = std::make_unique<Relations>(dir_, [](const std::string &s) { Log(s); });
     link_ = std::make_unique<HeadsetLink>(
         g_sync.get(), [](const std::string &s) { Log(s); },
         [](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
@@ -297,6 +300,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (MH_Initialize() != MH_OK) { Log("MH_Initialize failed"); return vr::VRInitError_None; }
     HookHost("IVRServerDriverHost_006", 0, (void *)&Detour<0>);
     HookHost("IVRServerDriverHost_005", 1, (void *)&Detour<1>);
+    rel_done_ = !steady_ || g_rel->Hook();  // the lighthouse driver loads first; if not, the worker retries
     link_->Start();
     run_ = true;
     worker_ = std::thread(&Provider::Worker, this);
@@ -310,6 +314,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (link_) link_->Stop();
     for (int j = 0; j < 2; j++)
       if (g_target[j]) MH_DisableHook(g_target[j]);
+    if (g_rel) { g_rel->Unhook(); g_rel->Flush(true); }
     MH_Uninitialize();
     if (g_sync) g_sync->SetRecord(nullptr);
     Log("QuestLHSync driver stopped");
@@ -417,7 +422,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   std::string hmd_model_, hmd_system_;
   std::string receiver_[vr::k_unMaxTrackedDeviceCount];
   double last_gravity_ = 0;
-  bool any_hmd_ = false, recording_ = false, overlay_started_ = false;
+  bool any_hmd_ = false, recording_ = false, overlay_started_ = false, steady_ = true, rel_done_ = true;
   int cmd_seen_ = 0;
   double started_ = 0, last_status_ = 0;
   Sync::Spots rec_spots_;  // when the recording started
@@ -443,6 +448,9 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (e == vr::VRSettingsError_None) link_->SetPreferred(pref);
     bool grav = s->GetBool(kSection, "gravity", &e);  // levelling by resting devices' gravity (gravity.h); on unset
     g_gravity->SetEnabled(e != vr::VRSettingsError_None || grav);
+    bool steady = s->GetBool(kSection, "steadyStations", &e);  // base station moves averaged (relations.h); on unset
+    steady_ = e != vr::VRSettingsError_None || steady;
+    g_rel->SetEnabled(steady_);
     bool rec = s->GetBool(kSection, "record", &e);
     SetRecording(e == vr::VRSettingsError_None && rec);
   }
@@ -624,6 +632,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         M3 tilt;
         if (g_gravity->Step(ref, on, tilt)) g_sync->SetGravity(on, tilt);
       }
+      if (!rel_done_ && now - started_ < 60) rel_done_ = g_rel->Hook();
+      g_rel->Flush();
       if (now - last_status_ >= 0.25) { last_status_ = now; Publish(now); }
       if (!overlay_started_ && now - started_ > 2 && !vr::VRServerDriverHost()->IsExiting()) {
         overlay_started_ = true;
