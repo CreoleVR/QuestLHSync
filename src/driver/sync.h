@@ -133,7 +133,8 @@ class FrameGrid {
   // s: a Quest's short frames, every third at 37.5 fps, or at 45 fps with its power line frequency set to 60 Hz
   static constexpr double kQuest50 = 3 / 37.5, kQuest60 = 3 / 45.0;
   static constexpr double WIN = 10.0, LEARN_WIN = 30.0;  // s: the grid's window, the period's
-  // quest: the period is whichever of the two the frames fold at; otherwise it's learned (the Frame)
+  // quest: the period is whichever of the two the frames fold at; otherwise it's learned (the Frame), and learned
+  // again when the camera's rate changes
   explicit FrameGrid(bool quest = true) : quest_(quest) {}
   bool Lag(int cam, double t, double &lag);  // t: a short frame's detection time (headset s), call for all
   double period(int cam) const;              // s, 0 while unknown
