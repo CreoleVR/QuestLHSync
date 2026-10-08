@@ -203,7 +203,7 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
 
 using PoseFn = void (*)(void *, uint32_t, const vr::DriverPose_t &, uint32_t);
 static PoseFn g_orig[2];
-static void *g_target[2];
+static void *g_target[2], *g_detour[2];
 
 template <int I>
 static void Detour(void *self, uint32_t id, const vr::DriverPose_t &pose, uint32_t size) {
@@ -226,7 +226,26 @@ static void HookHost(const char *version, int i, void *detour) {
     return;
   }
   g_target[i] = fn;
+  g_detour[i] = detour;
   Log(Fmt("hooked %s::TrackedDevicePoseUpdated", version));
+}
+
+// takes the pose hooks out, each only while its function still jumps straight to our detour (MinHook's jmp to a relay
+// holding the detour's address): one another driver has hooked over since stays, passing poses on untouched, as taking
+// it out would take theirs with it
+static void UnhookHost() {
+  for (int j = 0; j < 2; j++) {
+    if (!g_target[j]) continue;
+    auto *p = (const uint8_t *)g_target[j];
+    const uint8_t *relay = p[0] == 0xE9 ? p + 5 + *(const int32_t *)(p + 1) : nullptr;
+    if (relay && relay[0] == 0xFF && relay[1] == 0x25 && *(const int32_t *)(relay + 2) == 0 &&
+        *(void *const *)(relay + 6) == g_detour[j]) {
+      MH_DisableHook(g_target[j]);
+      Log("pose hook taken out");
+    } else {
+      Log("another driver hooked SteamVR's pose updates after QuestLHSync: its hook stays, passing poses on untouched");
+    }
+  }
 }
 
 // ---------------------------------------------------------------- status shared memory
@@ -326,7 +345,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   const char *const *GetInterfaceVersions() override { return vr::k_InterfaceVersions; }
 
   void RunFrame() override {
-    if (++tick_ % 45) return;  // classify devices about twice a second
+    if (wired_ || ++tick_ % 45) return;  // classify devices about twice a second
     auto *props = vr::VRProperties();
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
       int kind = g_kind[i].load();
@@ -395,7 +414,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     }
   }
 
-  // a headset that isn't streamed: nothing of QuestLHSync applies, and the dashboard closes
+  // a headset that isn't streamed: nothing of QuestLHSync applies, the worker stands down and the dashboard closes
   void SetWired(const std::string &sys, const std::string &model) {
     if (wired_.exchange(true)) return;
     g_off = true;
@@ -445,6 +464,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   double last_gravity_ = 0;
   std::atomic<bool> wired_{false};  // SteamVR's headset is wired (not streamed): everything here stays off
   bool any_hmd_ = false, recording_ = false, overlay_started_ = false, steady_ = true, rel_done_ = true;
+  bool stood_down_ = false;  // the worker's, once wired: hooks out, search and levelling stopped
   int cmd_seen_ = 0;
   double started_ = 0, last_status_ = 0;
   Sync::Spots rec_spots_;  // when the recording started
@@ -639,10 +659,26 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     InterlockedIncrement((volatile LONG *)&t->seq);
   }
 
+  // a wired headset: the hooks come out, the headset search and levelling stop, as close to the add-on being off as
+  // a loaded driver gets
+  void StandDown() {
+    stood_down_ = true;
+    link_->Stop();
+    g_gravity->Stop();
+    g_rel->Unhook();
+    UnhookHost();
+  }
+
   void Worker() {
     started_ = QpcNow();
     while (run_) {
       double now = QpcNow();
+      if (wired_) {  // only the status goes on, which closes a dashboard already open
+        if (!stood_down_) StandDown();
+        if (now - last_status_ >= 0.25) { last_status_ = now; Publish(now); }
+        Sleep(50);
+        continue;
+      }
       link_->SetWanted(g_hmd.load() >= 0);
       Stations();
       Commands();
