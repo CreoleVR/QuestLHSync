@@ -112,6 +112,7 @@ static bool ReadXf(Xf &x) {
 enum Kind { kUnknown = 0, kLighthouse = 1, kOther = 2, kHmd = 3 };
 static std::atomic<int> g_kind[vr::k_unMaxTrackedDeviceCount];
 static std::atomic<int> g_hmd{-1};             // the eligible HMD's index
+static std::atomic<bool> g_off{false};         // a wired headset: poses pass untouched
 struct StationPose {
   char serial[32];
   int cls;
@@ -149,7 +150,7 @@ static void RawPose(const vr::DriverPose_t &p, double pos[3], vr::HmdQuaternion_
 
 static bool Apply(uint32_t id, vr::DriverPose_t &p) {
   g_hooked.fetch_add(1, std::memory_order_relaxed);
-  if (id >= vr::k_unMaxTrackedDeviceCount) return false;
+  if (g_off.load(std::memory_order_relaxed) || id >= vr::k_unMaxTrackedDeviceCount) return false;
   int kind = g_kind[id].load(std::memory_order_relaxed);
   if (kind == kHmd) {
     if ((int)id == g_hmd.load(std::memory_order_relaxed) && p.poseIsValid && g_sync) {
@@ -339,6 +340,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       vr::ETrackedPropertyError e = vr::TrackedProp_Success;
       int32_t cls = props->GetInt32Property(c, vr::Prop_DeviceClass_Int32, &e);
       std::string serial = GetStr(c, vr::Prop_SerialNumber_String), model = GetStr(c, vr::Prop_ModelNumber_String);
+      if (cls == vr::TrackedDeviceClass_HMD && sys == "lighthouse" && g_hmd.load() < 0) {  // an Index, a Vive, ...
+        SetWired(sys, model);
+        g_kind[i] = kOther;  // not moved: its own lighthouse tracking is the truth
+        continue;
+      }
       if (sys == "lighthouse") {
         Copy(g_dev[i].serial, sizeof g_dev[i].serial, serial);
         g_dev[i].cls = cls;
@@ -362,6 +368,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         // Virtual Desktop names every headset newer than the Quest Pro "Meta Quest 3", ALVR the one it emulates (a
         // Quest 2 unless set otherwise): neither name tells, so whichever headset answers is used
         bool any = any_hmd_ || sys == "oculus_virtualdesktop" || sys == "alvr_server";
+        if (family.empty() && !any && StreamerName(sys) == sys) {  // no streamer's driver: a headset on a cable
+          SetWired(sys, model);
+          g_kind[i] = kOther;
+          continue;
+        }
         if (!family.empty() || any) {
           g_hmd = (int)i;
           g_kind[i] = kHmd;
@@ -382,6 +393,16 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       }
       g_kind[i] = kOther;
     }
+  }
+
+  // a headset that isn't streamed: nothing of QuestLHSync applies, and the dashboard closes
+  void SetWired(const std::string &sys, const std::string &model) {
+    if (wired_.exchange(true)) return;
+    g_off = true;
+    g_gravity->SetEnabled(false);
+    g_rel->SetEnabled(false);
+    Log(Fmt("HMD: %s (%s) isn't streamed, it's a wired headset: QuestLHSync is off", model.empty() ? "headset" : model.c_str(),
+            sys.c_str()));
   }
 
   // a 2.0 base station's mode label is its channel, "1".."16"
@@ -422,6 +443,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   std::string hmd_model_, hmd_system_;
   std::string receiver_[vr::k_unMaxTrackedDeviceCount];
   double last_gravity_ = 0;
+  std::atomic<bool> wired_{false};  // SteamVR's headset is wired (not streamed): everything here stays off
   bool any_hmd_ = false, recording_ = false, overlay_started_ = false, steady_ = true, rel_done_ = true;
   int cmd_seen_ = 0;
   double started_ = 0, last_status_ = 0;
@@ -560,7 +582,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     }
     int state;
     auto ls = link_->state();
-    if (hmd < 0) state = QLHS_NO_HMD;
+    if (wired_) state = QLHS_WIRED;
+    else if (hmd < 0) state = QLHS_NO_HMD;
     else if (ls == HeadsetLink::kSearching || ls == HeadsetLink::kIdle) state = QLHS_SEARCHING;
     else if (ls == HeadsetLink::kConnecting) state = QLHS_CONNECTING;
     else if (now - link_->last_frame() > 3 && now - link_->connected_at() > 5) state = QLHS_NO_CAMERAS;
@@ -635,7 +658,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       if (!rel_done_ && now - started_ < 60) rel_done_ = g_rel->Hook();
       g_rel->Flush();
       if (now - last_status_ >= 0.25) { last_status_ = now; Publish(now); }
-      if (!overlay_started_ && now - started_ > 2 && !vr::VRServerDriverHost()->IsExiting()) {
+      if (!overlay_started_ && !wired_ && now - started_ > 2 && !vr::VRServerDriverHost()->IsExiting()) {
         overlay_started_ = true;
         LaunchOverlay();
       }

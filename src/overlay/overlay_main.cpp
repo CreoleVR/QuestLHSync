@@ -704,6 +704,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
     bool have = ReadStatus(st);
     if (!have) memset(&st, 0, sizeof st);
+    if (st.state == QLHS_WIRED) break;  // a wired headset: nothing to show, and no dashboard page to join
     if (!vr_up && have && st.hmd[0] && now >= next_try) {
       vr::EVRInitError err = vr::VRInitError_None;
       vr::VR_Init(&err, vr::VRApplication_Overlay);

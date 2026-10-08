@@ -20,6 +20,7 @@ enum QlhsState : int32_t {
   QLHS_ACQUIRING,
   QLHS_LOCKED,
   QLHS_DISABLED,     // driver_questlhsync.enable is false
+  QLHS_WIRED,        // SteamVR's headset is wired, not streamed: the driver is off and the dashboard closes
 };
 
 enum QlhsCmd : int32_t {
