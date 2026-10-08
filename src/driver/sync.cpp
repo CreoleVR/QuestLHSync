@@ -318,12 +318,21 @@ bool FrameGrid::Lag(int cam, double t, double &lag) {
     else c.learn = true;
   }
   // learned: from the frames so far once the grid's window is full, then refined every WIN over up to LEARN_WIN (a
-  // longer stretch pins the period closer). A camera's rate doesn't change, so a stretch too messy to fold (frames
-  // misread as short ones) keeps the period found before
+  // longer stretch pins the period closer). A stretch too messy to fold (frames misread as short ones) keeps the period
+  // found before, unless the camera's rate changed: the Frame's flicker mode (automatic by default) can switch between
+  // 50 and 60 Hz mid-session. Then the last WIN alone no longer folds at the old period, but does at a new one, found
+  // afresh, and the frames from before the switch go
   if (!quest_ || c.learn) {
     if (t >= c.next && h.back() - h.front() >= 0.9 * WIN) {
       double p = Learn(lh, c.p);
       if (p > 0) c.p = p;
+      else if (c.p > 0 && FoldSpread(h, c.p) > 0.5 * c.p) {
+        double q = Learn(h, 0);
+        if (q > 0 && std::fabs(q - c.p) > 0.005 * c.p) {
+          c.p = q;
+          lh = h;
+        }
+      }
       c.next = t + WIN;
     }
   }
