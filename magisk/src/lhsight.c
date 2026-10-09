@@ -32,12 +32,17 @@ struct st {
   int adj[MAXC], late[MAXC], slept;            // how much earlier to wake for it (us), its frame waited for us
   int cyes[MAXC], cno[MAXC];                   // clearly darker frames the cycle took for short ones, and didn't
   int ph[MAXC], phn[MAXC];                     // the short frame's k % 3, and its net votes (frame())
+  int em[MAXC][3], nem[MAXC];                  // running mean (* 10) per k % 3, and the frames in it (frame())
 };
 // the place: trusted from PH_LOCK net votes, held to PH_MAX, PH_MISS off per vote elsewhere; lost after a PH_GAP (ns)
 #define PH_LOCK 10
 #define PH_MAX 60
 #define PH_MISS 5
 #define PH_GAP 75000000ull
+// the brightness vote: a place whose running mean (EM_TAU frames) is over 15% off the other two's average, while those
+// two are within half that difference of each other, votes for itself once there are EM_WARM frames in the means
+#define EM_TAU 8
+#define EM_WARM 10
 extern struct st S;
 static u64 now(void) { struct ts t; clock_gettime(1, &t); return (u64)t.s * 1000000000ull + (u64)t.ns; }
 void set_bufs(u8 *scratch, u16 *cells, int *lab, char *out, int thr) {
@@ -188,6 +193,8 @@ static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *
 static void frame(int i, u64 t) {
   int w = S.sw[i], h = S.sh[i], c = S.cam[i];
   // a gap this long (frames come at most 39 ms apart) could have let a frame go by unseen: the count's place is lost
+  // (the brightness means stay: frames picked up together after a stall can come in out of order, and a mean started
+  // over from one of those took a long frame for the odd one; kept, such a frame counts 1/EM_TAU)
   if (S.last_t[c] && t - S.last_t[c] > PH_GAP) S.phn[c] = 0;
   predict(c, t);
   S.last_t[c] = t;
@@ -212,14 +219,33 @@ static void frame(int i, u64 t) {
   // whose frames are found late, two at a time, hides the cycle in its found times, and a lit room the darker frame
   // (a recording: the right camera searched 8% of its short frames, the left 94%); the count keeps the place. One
   // that wanders (another cycle) never gathers PH_LOCK votes
-  if (strict || cyc == 1) {
-    int p = (int)(k % 3);
+  int p = (int)(k % 3);
+  // Brightness tells it better: the short frame is the odd one of the three, darker in a dim room and brighter in a lit
+  // one (the long frames' exposure drops under the short one's: means 130-145 against 104-108), the long two alike.
+  // That holds however late frames are found (recordings: 62,472 odd ones, none a long frame), while the cycle test,
+  // on a camera found late, names the wrong frame in bursts. So while a place is odd, it decides and votes, and the
+  // cycle test stays out; the held place and the cycle test take over when brightness can't tell (the first frames,
+  // a room lit to where short and long frames look alike). Another cycle has no odd place
+  int *e = S.em[c];
+  if (S.nem[c] < 3) e[p] = mean;
+  else e[p] += (mean - e[p]) / EM_TAU;
+  if (S.nem[c] < 1000000) S.nem[c]++;
+  int oddp = -1;
+  for (int j = 0; j < 3 && S.nem[c] >= EM_WARM; j++) {
+    int q = e[(j + 1) % 3], r = e[(j + 2) % 3], sum = q + r, d = 2 * e[j] - sum, qr = q - r;
+    if (d < 0) d = -d;
+    if (qr < 0) qr = -qr;
+    if (20 * d > 3 * sum && 4 * qr < d) oddp = j;
+  }
+  if (oddp >= 0) cyc = -1;
+  if (strict || cyc == 1 || oddp == p) {
     if (S.phn[c] > 0 && S.ph[c] != p) S.phn[c] -= PH_MISS;
     else { S.ph[c] = p; if (S.phn[c] < PH_MAX) S.phn[c]++; }
     if (S.phn[c] <= 0) { S.ph[c] = p; S.phn[c] = 1; }
   }
-  int place = S.phn[c] >= PH_LOCK ? (int)(k % 3) == S.ph[c] : -1;
-  int is_short = strict || (cyc >= 0 ? cyc : place >= 0 ? place : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
+  // the odd place, else a held place, before the cycle test: found late, it names the wrong frame now and then
+  int place = oddp >= 0 ? p == oddp : S.phn[c] >= PH_LOCK ? p == S.ph[c] : -1;
+  int is_short = strict || (place >= 0 ? place : cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
   char line[2400]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);
