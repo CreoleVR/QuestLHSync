@@ -31,7 +31,13 @@ struct st {
   u64 ft[MAXC][HIST]; u32 nft[MAXC];           // its last frame times (ns)
   int adj[MAXC], late[MAXC], slept;            // how much earlier to wake for it (us), its frame waited for us
   int cyes[MAXC], cno[MAXC];                   // clearly darker frames the cycle took for short ones, and didn't
+  int ph[MAXC], phn[MAXC];                     // the short frame's k % 3, and its net votes (frame())
 };
+// the place: trusted from PH_LOCK net votes, held to PH_MAX, PH_MISS off per vote elsewhere; lost after a PH_GAP (ns)
+#define PH_LOCK 10
+#define PH_MAX 60
+#define PH_MISS 5
+#define PH_GAP 75000000ull
 extern struct st S;
 static u64 now(void) { struct ts t; clock_gettime(1, &t); return (u64)t.s * 1000000000ull + (u64)t.ns; }
 void set_bufs(u8 *scratch, u16 *cells, int *lab, char *out, int thr) {
@@ -181,6 +187,8 @@ static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *
 }
 static void frame(int i, u64 t) {
   int w = S.sw[i], h = S.sh[i], c = S.cam[i];
+  // a gap this long (frames come at most 39 ms apart) could have let a frame go by unseen: the count's place is lost
+  if (S.last_t[c] && t - S.last_t[c] > PH_GAP) S.phn[c] = 0;
   predict(c, t);
   S.last_t[c] = t;
   u32 n = (u32)(w * h);
@@ -200,7 +208,18 @@ static void frame(int i, u64 t) {
   int cyc = cycle_short(c);
   if (strict && cyc >= 0 && S.cyes[c] + S.cno[c] < 1000000) { if (cyc) S.cyes[c]++; else S.cno[c]++; }
   if (S.cno[c] * 4 > S.cyes[c] + 4) cyc = -1;
-  int is_short = strict || (cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
+  // the short frame's place in the frame count: the short frames the two tests find vote for their k % 3. A camera
+  // whose frames are found late, two at a time, hides the cycle in its found times, and a lit room the darker frame
+  // (a recording: the right camera searched 8% of its short frames, the left 94%); the count keeps the place. One
+  // that wanders (another cycle) never gathers PH_LOCK votes
+  if (strict || cyc == 1) {
+    int p = (int)(k % 3);
+    if (S.phn[c] > 0 && S.ph[c] != p) S.phn[c] -= PH_MISS;
+    else { S.ph[c] = p; if (S.phn[c] < PH_MAX) S.phn[c]++; }
+    if (S.phn[c] <= 0) { S.ph[c] = p; S.phn[c] = 1; }
+  }
+  int place = S.phn[c] >= PH_LOCK ? (int)(k % 3) == S.ph[c] : -1;
+  int is_short = strict || (cyc >= 0 ? cyc : place >= 0 ? place : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
   char line[2400]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);
