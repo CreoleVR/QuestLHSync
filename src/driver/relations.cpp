@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include <windows.h>
 
 #include "relations.h"
@@ -11,6 +12,22 @@
 
 #include "MinHook.h"
 #include "json.h"
+#else
+// Linux: the averaging core is portable; the hook into SteamVR's lighthouse driver (a Windows PE binary-pattern
+// match plus MinHook) isn't: base stations are placed as SteamVR places them, no relationships averaged.
+#include "relations.h"
+
+#include "plat.h"  // GetTickCount64, for the log-rate limiting
+
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+
+#include "json.h"
+#endif
 
 namespace {
 
@@ -24,6 +41,7 @@ constexpr uint64_t kSaveMs = 10000;                 // relations.json written at
 
 // the relationship step's log line, and its arguments as it takes them: mov r13, r9 (the pose); mov r15d, r8d and
 // mov r12d, edx (the two stations' serials)
+#ifdef _WIN32
 const char kMoving[] = "Moving base %08X %.0fmm and %.1f deg because of relationship with %08X";
 const uint8_t kArgs[] = {0x4D, 0x8B, 0xE9, 0x45, 0x8B, 0xF8, 0x44, 0x8B, 0xE2};
 
@@ -43,6 +61,7 @@ uint64_t Detour(void *self, uint64_t a, uint64_t b, const float *rel, uint64_t s
   }
   return g_orig(self, a, b, use ? avg : rel, s5, s6, s7, s8);
 }
+#endif
 
 std::string Fmt(const char *fmt, ...) {
   char buf[512];
@@ -90,6 +109,7 @@ Relations::Pose Relations::Mean(const std::vector<Pose> &v) {
   return {{s.w / n, s.x / n, s.y / n, s.z / n}, t * (1.0 / v.size())};
 }
 
+#ifdef _WIN32
 void *Relations::Find(void *module, std::string &why) {
   auto *base = (uint8_t *)module;
   auto *dos = (IMAGE_DOS_HEADER *)base;
@@ -141,7 +161,15 @@ void *Relations::Find(void *module, std::string &why) {
   why = "its relationship step takes other arguments";
   return nullptr;
 }
+#else
+void *Relations::Find(void *module, std::string &why) {
+  (void)module;
+  why = "no hooking of SteamVR's lighthouse driver on Linux";
+  return nullptr;
+}
+#endif
 
+#ifdef _WIN32
 bool Relations::Hook() {
   if (target_) return true;
   HMODULE mod = GetModuleHandleW(L"driver_lighthouse.dll");
@@ -167,10 +195,13 @@ bool Relations::Hook() {
   log_(Fmt("base stations: SteamVR places them by the average of its measurements (%zu kept)", known));
   return true;
 }
+#endif
 
+#ifdef _WIN32
 void Relations::Unhook() {
   if (target_) MH_DisableHook(target_);
 }
+#endif
 
 bool Relations::Average(uint32_t a, uint32_t b, const float rel[7], float out[7]) {
   if (!enabled_ || a == b || !a || !b) return false;
@@ -266,7 +297,12 @@ void Relations::Flush(bool now) {
   if (!f) return;
   fwrite(s.data(), 1, s.size(), f);
   fclose(f);
+#ifdef _WIN32
   MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+#else
+  // rename(2) replaces atomically, the same guarantee MOVEFILE_REPLACE_EXISTING gives
+  if (rename(tmp.c_str(), path.c_str()) != 0) log_("relations: saving failed: rename of " + tmp);
+#endif
 }
 
 void Relations::Load() {
