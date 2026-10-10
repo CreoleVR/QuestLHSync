@@ -22,8 +22,14 @@ class Relations {
   void SetEnabled(bool on) { enabled_ = on; }
   // hooks driver_lighthouse.dll's relationship step (MinHook initialised). True once there's nothing more to try
   // (hooked, or code this doesn't know), false while that DLL isn't loaded yet
+#ifdef _WIN32
   bool Hook();
   void Unhook();
+#else
+  // Linux: no hooking of SteamVR's lighthouse .so — returns true (nothing more to try)
+  bool Hook() { log_("relations: base stations placed as SteamVR places them (no relationships averaged on Linux)"); return true; }
+  void Unhook() {}
+#endif
   // SteamVR's relationship of stations a and b (qx qy qz qw tx ty tz; a = rel * b) -> out, the one it gets instead;
   // false: it keeps its own. Runs on SteamVR's tracking thread
   bool Average(uint32_t a, uint32_t b, const float rel[7], float out[7]);
@@ -34,7 +40,7 @@ class Relations {
   struct Pose { Quat q; V3 t; };
   static Pose Inv(const Pose &p);
   static Pose Mean(const std::vector<Pose> &v);
-  // the relationship step in a loaded driver_lighthouse.dll, or null and why
+  // the relationship step in a loaded driver_lighthouse.dll, or null and why (Linux: always null)
   static void *Find(void *module, std::string &why);
 
  private:

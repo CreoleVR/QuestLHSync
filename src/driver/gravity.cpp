@@ -1,7 +1,14 @@
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #include <setupapi.h>
 #include <shlobj.h>
+#else
+#include "plat.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
 
 #include "gravity.h"
 
@@ -18,11 +25,13 @@
 #include "json.h"
 #include "net.h"
 
+#ifdef _WIN32
 extern "C" {
 void __stdcall HidD_GetHidGuid(GUID *guid);
 BOOLEAN __stdcall HidD_GetSerialNumberString(HANDLE device, PVOID buffer, ULONG length);
 BOOLEAN __stdcall HidD_SetNumInputBuffers(HANDLE device, ULONG n);
 }
+#endif
 
 namespace {
 constexpr double kKeepS = 20;                      // s of IMU samples and poses kept
@@ -163,11 +172,18 @@ double Interp(const std::vector<double> &t, const std::vector<double> &v, double
 
 Gravity::Gravity(std::string dir, LogFn log, bool live) : dir_(std::move(dir)), log_(std::move(log)), live_(live) {
   // SteamVR's config folder: each lighthouse device's config, with its IMU calibration
+#ifdef _WIN32
   PWSTR p = nullptr;
   std::filesystem::path paths;
   if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p)))
     paths = std::filesystem::path(p) / "openvr" / "openvrpaths.vrpath";
   CoTaskMemFree(p);
+#else
+  // Linux: ~/.config/openvr/openvrpaths.vrpath (the same JSON; "config" [0] holds the folder with lighthouse/)
+  std::filesystem::path paths;
+  if (const char *home = getenv("HOME"); home && *home)
+    paths = std::filesystem::path(home) / ".config" / "openvr" / "openvrpaths.vrpath";
+#endif
   std::string text;
   JVal root;
   if (ReadText(paths.string(), text) && JParse(text, root))
@@ -231,6 +247,7 @@ bool Gravity::LoadConfig(Dev &d) {
   return true;
 }
 
+#ifdef _WIN32
 // the receiver's HID interface: Valve's (vid_28de) whose serial is the receiver's
 bool Gravity::FindPath(const std::string &receiver, std::wstring &path) {
   GUID guid;
@@ -260,6 +277,52 @@ bool Gravity::FindPath(const std::string &receiver, std::wstring &path) {
   SetupDiDestroyDeviceInfoList(set);
   return found;
 }
+#else
+// Linux: the same receiver through /dev/hidraw*, found by walking /sys/class/hidraw: each entry's device chain leads
+// to its USB device, whose idVendor (Valve's 28de) and serial decide. Read access needs the user in the right group
+// (often input or plugdev); the read-only open matches Windows' sharing.
+bool Gravity::FindPath(const std::string &receiver, std::string &path) {
+  DIR *d = opendir("/sys/class/hidraw");
+  if (!d) return false;
+  std::string found;
+  struct dirent *de;
+  while (found.empty() && (de = readdir(d))) {
+    if (de->d_name[0] == '.') continue;
+    // /sys/class/hidraw/hidrawN -> its hid device -> its usb device (idVendor, serial)
+    std::string base = std::string("/sys/class/hidraw/") + de->d_name;
+    std::string p = base + "/device";
+    char *real_hid = realpath(p.c_str(), nullptr);
+    if (!real_hid) continue;
+    std::string hid = real_hid;
+    free(real_hid);
+    // walk up to the usb_device parent
+    std::string usb;
+    std::string cur = hid;
+    for (int up = 0; up < 6 && usb.empty(); up++) {
+      size_t s = cur.rfind('/');
+      if (s == std::string::npos) break;
+      cur = cur.substr(0, s);
+      // a usb_device's sysfs name holds a bus-port: config:interface tail (e.g. "3-2.4:1.0"), or is plain when it's
+      // the device itself; check the attribute files instead of guessing the shape
+      std::ifstream vid(cur + "/idVendor");
+      std::string v;
+      if (vid && (vid >> v, v == "28de")) { usb = cur; break; }
+    }
+    if (usb.empty()) continue;
+    std::ifstream sf(usb + "/serial");
+    std::string ser;
+    if (sf && (sf >> ser) && ser == receiver) found = base + "/dev";  // the devnode is recorded in "dev"
+  }
+  closedir(d);
+  if (found.empty()) return false;
+  // /sys/.../dev says "major:minor": the devnode is /dev/hidrawN, matching this entry's name
+  path = "/dev/" + std::string(found.substr(found.rfind('/') + 1));  // .../hidrawN/dev -> /dev/hidrawN
+  path.resize(path.size() - 2);  // drop the trailing "dev"
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return false;
+  return true;
+}
+#endif
 
 // A receiver's input reports, read only (another reader of the same interface, with its own queue: nothing is sent).
 // Reports: 0x23 one Watchman packet, 0x24 two (the second 29 bytes on). A packet: time MSB, size, time LSB, then
@@ -267,6 +330,7 @@ bool Gravity::FindPath(const std::string &receiver, std::wstring &path) {
 // The sample's time: the packet's two bytes and its own, the top 24 bits of the device's 48 MHz clock. libsurvive's
 // driver_vive.c (survive_handle_watchman, handle_watchman_v2, read_imu_data).
 void Gravity::ReadLoop(std::string receiver, Reader *rd) {
+#ifdef _WIN32
   std::wstring path;
   HANDLE h = INVALID_HANDLE_VALUE;
   if (FindPath(receiver, path))
@@ -310,6 +374,42 @@ void Gravity::ReadLoop(std::string receiver, Reader *rd) {
   CloseHandle(ov.hEvent);
   CloseHandle(h);
   rd->done = true;
+#else
+  // hidraw: reads deliver a report id byte first (the 0x23/0x24 the Windows code saw); a plain read blocks until a
+  // report, so the loop's stop check rides on short polls of the fd instead (no blocking past 200 ms).
+  std::string path;
+  int fd = -1;
+  if (FindPath(receiver, path)) fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) { rd->done = true; return; }
+  unsigned char r[512];
+  while (run_ && enabled_ && !rd->stop) {
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(fd, &rf);
+    timeval tv{0, 200000};  // 200 ms: the same poll Windows' overlapped wait gave
+    if (select(fd + 1, &rf, nullptr, nullptr, &tv) <= 0) continue;
+    int n = (int)read(fd, r, sizeof r);
+    if (n <= 0) break;
+    double t = QpcNow();
+    if (n < 2 || (r[0] != 0x23 && r[0] != 0x24)) continue;
+    for (size_t off : {size_t(1), size_t(30)}) {
+      if (off == 30 && r[0] != 0x24) break;
+      if (off + 3 > (size_t)n) break;
+      const unsigned char *p = r + off;
+      size_t size = p[1];
+      if (size < 15 || off + 3 + size - 1 > (size_t)n) continue;
+      const unsigned char *pay = p + 3;
+      if (!(pay[0] & 0x80)) continue;
+      int16_t v[6];
+      for (int i = 0; i < 6; i++) v[i] = (int16_t)(pay[2 + 2 * i] | (pay[3 + 2 * i] << 8));
+      uint32_t tick = (uint32_t)p[0] << 24 | (uint32_t)p[2] << 16 | (uint32_t)pay[1] << 8;
+      OnImu(receiver, t, tick, v, v + 3);
+      rd->n++;
+    }
+  }
+  close(fd);
+  rd->done = true;
+#endif
 }
 
 void Gravity::Worker() {
@@ -862,7 +962,12 @@ void Gravity::Save() {
   if (!f) return;
   fwrite(s.data(), 1, s.size(), f);
   fclose(f);
+#ifdef _WIN32
   MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+#else
+  // rename(2) replaces atomically, the same guarantee MOVEFILE_REPLACE_EXISTING gives
+  if (rename(tmp.c_str(), path.c_str()) != 0) log_("gravity: saving failed: rename of " + tmp);
+#endif
 }
 
 bool Gravity::Step(const Ref &ref, bool &on, M3 &tilt) {
