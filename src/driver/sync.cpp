@@ -1049,11 +1049,14 @@ void Solver::Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3
   }
 }
 
-int Solver::Score(const std::vector<int> &c) {  // yaw needs two stations: the second-best count
+// yaw needs two stations: every station's support but the best seen one's. Only the second best's, a fit of two
+// stations scored the same as one a third station's sightings agree with too (a Steam Frame recording: the sightings
+// of a third station told the true fit from one 5 deg and 0.7 m off it, which two stations fit as well)
+int Solver::Score(const std::vector<int> &c) {
   if (c.size() < 2) return 0;
-  std::vector<int> v = c;
-  std::sort(v.begin(), v.end());
-  return v[v.size() - 2];
+  int best = 0, sum = 0;
+  for (int n : c) { sum += n; best = std::max(best, n); }
+  return sum - best;
 }
 
 struct CellKey {
@@ -1386,14 +1389,11 @@ Solver::Rays Solver::Thin(const Rays &r) {
   return o;
 }
 
-static int SecondBest(const int *c, size_t K) {
+static int SecondBest(const int *c, size_t K) {  // Solver::Score's: all but the best
   if (K < 2) return 0;
-  int a = -1, b = -1;  // best, second
-  for (size_t k = 0; k < K; k++) {
-    if (c[k] > a) { b = a; a = c[k]; }
-    else if (c[k] > b) b = c[k];
-  }
-  return b;
+  int best = 0, sum = 0;
+  for (size_t k = 0; k < K; k++) { sum += c[k]; best = std::max(best, c[k]); }
+  return sum - best;
 }
 
 // best hypothesis from scratch on the last ACQ_WIN s: score = thinned support, tight = the same within TIGHT_DEG
