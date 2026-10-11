@@ -2,9 +2,11 @@
 // XRService's camera buffers and writes nothing: the buffer list comes from VIDIOC_QUERYBUF on the cameras' own nodes
 // (anyone may query a queue), the buffers themselves from the questlhsync_frame driver in the Frame's vrserver (see
 // frame/driver/xrfds.cpp). Every new frame: its mean (exposure class), and on short-exposure frames (the controller
-// LED frames, 8.4 ms after each long one, every 30 ms) the saturated blobs, then dimmer ones. Lines on stdout:
+// LED frames, 8.4 ms after each long one, every 30 ms) the saturated blobs, then dimmer ones. Only the short frames are
+// reported, and only of the cameras lhsyncd names (the two upper ones, which see the base stations): ~67 lines a second
+// where all frames of all four cameras were ~270. Lines on stdout:
 //   F cam seq t_us mean nblobs [x y npx peak]...   t: the frame's own timestamp on CLOCK_MONOTONIC, mean * 10,
-//                                                  nblobs -1 on long frames, x y in pixels * 10 (pixel centres at .5)
+//                                                  x y in pixels * 10 (pixel centres at .5)
 //   T t_us scans n scan_us u torn n polls n lag_us l   once a second
 //   I/W/E messages
 // Exits when XRService or its buffers change (lhsyncd starts it again).
@@ -435,15 +437,17 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   c->m1 = mean;
   // short exposure: well under the brighter of the previous two (long and short frames alternate)
   int is_short = kk >= 2 && mean * 10 < hi * 6;
+  if (!is_short) {  // the long frames only tell the short ones apart: nothing to send
+    cpu_access(c->fd[i], 1);
+    return;
+  }
   u64 t0 = now_ns();
-  if (is_short)
-    for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y * c->w, p + (size_t)y * c->stride, c->w);
+  for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y * c->w, p + (size_t)y * c->stride, c->w);
   cpu_access(c->fd[i], 1);
   if (torn(c, i, b)) return;
   char line[2400];
   int L = snprintf(line, sizeof line, "F %d %u %llu %d", k, b->sequence, (unsigned long long)t_us, mean);
-  if (!is_short) L += snprintf(line + L, sizeof line - L, " -1");
-  else {
+  {
     // saturated blobs (base station dots, lamps), then dimmer ones in the cells they leave alone
     u64 sx[MAXB], sy[MAXB];
     u32 np[MAXB];
@@ -495,7 +499,8 @@ static double due(const struct cam *c, double t) {
   return d > c->polled + 0.001 ? d : c->polled + 0.001;
 }
 
-int lhsight_main(void) {
+int lhsight_main(unsigned cameras) {
+  if (!(cameras & ((1u << NCAM) - 1))) cameras = (1u << NCAM) - 1;  // none named: all
   pid_t xr = xrservice_pid();
   if (!xr) { out("E XRService (the Frame's tracking) isn't running"); return 2; }
   if (camera_nodes(xr) != NCAM) { out("E XRService's log doesn't say which nodes its %d cameras stream from", NCAM); return 2; }
@@ -517,10 +522,18 @@ int lhsight_main(void) {
     L += snprintf(desc + L, sizeof desc - L, "%s%d %s %dx%d bpl %d %zu B x%d", k ? ", " : "", k, C[k].dev, C[k].w, C[k].h,
                   C[k].bpl, C[k].len[0], C[k].nb);
   out("I lhsight: XRService %d, cameras %s", (int)xr, desc);
+  {
+    char rd[40];
+    int n = 0;
+    for (int k = 0; k < NCAM; k++)
+      if (cameras >> k & 1) n += snprintf(rd + n, sizeof rd - n, "%s%d", n ? ", " : "", k);
+    out("I lhsight: reading cameras %s, short frames only", rd);
+  }
   double next_beat = now_s(CLOCK_MONOTONIC) + 1;
   for (;;) {
     double t = now_s(CLOCK_MONOTONIC), wake = t + 0.02;
     for (int k = 0; k < NCAM; k++) {
+      if (!(cameras >> k & 1)) continue;
       struct cam *c = &C[k];
       if (t >= due(c, t)) {
         poll_camera(k);

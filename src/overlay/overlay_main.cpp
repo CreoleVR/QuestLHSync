@@ -288,6 +288,7 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
                         s.paused ? L"Resume corrections" : L"Pause corrections", s.paused != 0});
   pg.buttons.push_back({304, by, 210, bh, s.recording ? QLHS_CMD_RECORD_OFF : QLHS_CMD_RECORD_ON,
                         s.recording ? L"Stop recording" : L"Record session", false});
+  pg.buttons.push_back({530, by, 240, bh, QLHS_CMD_RECALIBRATE, L"Force recalibrate", false});
   for (size_t i = 0; i < pg.buttons.size(); i++) {
     auto &b = pg.buttons[i];
     bool hov = (int)i == pg.hover;

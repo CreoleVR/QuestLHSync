@@ -96,10 +96,12 @@ constexpr double kBodyNear = 1.0, kBodyGap = 1.0;  // m
 constexpr double kBodyMoved = 2.0, kBodyCorr = 0.2;  // m, correlation
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
+constexpr double kUpward = 0.1;        // a camera whose axis climbs this much (of 1) looks up: the Frame's upper pair
 
 // ---------------------------------------------------------------- optics
 struct CamCal {
   bool valid = false;
+  bool use = true;  // the cameras that look where base stations hang (the Frame's two upper ones); all on a Quest
   int w = 0, h = 0;
   double ir = 1.0;  // near-IR laser image scale about the centre: kIR for the Quest side cameras
   M3 R;  // device <- camera
@@ -117,6 +119,8 @@ class Optics {
   bool Ray(int cam, double x, double y, V3 &o, V3 &d) const;  // device frame
   bool Pose(int cam, M3 &R, V3 &t) const;                     // device <- camera
   bool InImage(int cam, V3 dc, double margin) const;          // a camera-frame direction lands on the image
+  bool Used(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && cams_[cam].use; }  // sightings count
+  std::string Unused() const;  // "0, 1": the calibrated cameras left out, "" for none
   const std::string &device() const { return device_; }       // "Seacliff" (Quest Pro), "Eureka" (Quest 3), ...
   bool exact_time() const { return exact_time_; }  // frame times are the frames' own, no poll lag to take off
 
@@ -231,6 +235,7 @@ class Frame {
   M3 Anchored() const { return f_.level * Cs_; }  // SteamVR's frame -> the reference frame, before gravity's tilt
   int ok() const { return ok_; }
   double deg() const { return deg_; }
+  void Reset();  // forgets the last update: the reference frame is new (Sync::ForceRecalibrate)
 
  private:
   const StationsFile &f_;
@@ -283,6 +288,7 @@ class Solver {
   using MotionFn = std::function<double(const X4 &, double &)>;
   void SetMotion(MotionFn f) { motion_ = std::move(f); }
   void Reset(const X4 &x);
+  void Clear();  // forgets the sightings, the alignment and what hung on them; the stations stay (Sync::ForceRecalibrate)
   // g: the frame's time on the headset's clock (NaN until the frame grid is known)
   void Add(double t, V3 o, V3 d, double g, int cam, bool bright);
   void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
@@ -408,6 +414,7 @@ class Timing {
 // ---------------------------------------------------------------- the app
 struct SyncConfig {
   std::string dir;         // state files (stations.json, state.json)
+  bool per_headset = false;    // the driver: state.json per headset (Sync::SetHeadset); the tools keep it in dir
   bool arrival_clock = false;  // old logs: no round trips, fixed EXPO
   bool learn_timing = true;
   bool learn_grid = false;     // tools: learn the frame period even on a Quest Pro
@@ -430,6 +437,9 @@ class Sync {
   void SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw);
   void SetChannels(const std::map<std::string, int> &ch);
   void SetStreamer(const std::string &system);
+  // the headset this session talks to (its serial and model from its hello): state.json is kept per headset. Safe from
+  // any thread; Tick takes it up
+  void SetHeadset(const std::string &serial, const std::string &model);
   // 20 Hz; returns the transform for the lighthouse devices
   Transform Tick(double now);
   bool WillStep(double now) const { return now - last_step_ >= 1.0; }
@@ -440,6 +450,9 @@ class Sync {
   bool GravityFrame(M3 &C, M3 &turn, std::string &key);
   void SetGravity(bool on, const M3 &tilt) { frame_.SetGravity(on, tilt); }  // the driver's worker thread, as Tick
   void SetPaused(bool p) { paused_ = p; }
+  // forgets everything learned about the alignment and starts over: the sightings, the fit, the saved alignment and
+  // pose timing of this headset, and an automatic reference frame. Call from Tick's thread
+  void ForceRecalibrate();
   bool paused() const { return paused_; }
   // status
   struct Status {
@@ -531,6 +544,15 @@ class Sync {
   double BodyMotion(const X4 &x, double &moved);
 
   void LoadState();
+  // state.json lives in headsets/<model>-<serial hash>/ once the headset is known (before that, and for the tools,
+  // directly in dir); the one of earlier versions goes to the first headset that connects
+  std::string state_path_;
+  std::mutex hs_m_;
+  std::string hs_pending_, hs_key_;  // the headset SetHeadset named, Tick's current one
+  std::atomic<bool> hs_new_{false};
+  void ApplyHeadset();
+  void ApplyTiming();  // expo_ for the current streamer from timings_, the default if it has none (st_m_ held)
+  void ClearAlignment();
   void Retime(double old_e, double new_e);
   void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   void LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
@@ -547,6 +569,6 @@ class Sync {
   std::map<std::string, StationsFile::Place> place_prior_;  // kept by earlier sessions
   std::map<std::string, int> place_off_;  // measurements in a row far off the kept place
   double last_place_ = 0, place_saved_ = -1e18;
-  void SaveState(const X4 &x, const std::map<std::string, V3> &cs);
+  void SaveState(const X4 &x, const std::map<std::string, V3> &cs, bool force = false);  // force: even if unmoved
   bool Seed(const std::map<std::string, V3> &raw, X4 &x, double &miss);
 };

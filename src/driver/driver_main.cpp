@@ -308,6 +308,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     Log("QuestLHSync " QLHS_RELEASE " driver starting, data in %LOCALAPPDATA%\\QuestLHSync");
     SyncConfig cfg;
     cfg.dir = dir_;
+    cfg.per_headset = true;
     g_sync = std::make_unique<Sync>(cfg, [](const std::string &s) { Log(s); });
     g_gravity = std::make_unique<Gravity>(dir_, [](const std::string &s) { Log(s); });
     g_gravity->SetRecord([](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
@@ -587,6 +588,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       case QLHS_CMD_RESUME: g_sync->SetPaused(false); Log("corrections resumed"); break;
       case QLHS_CMD_RECORD_ON: SetRecording(true); break;
       case QLHS_CMD_RECORD_OFF: SetRecording(false); break;
+      case QLHS_CMD_RECALIBRATE: g_sync->ForceRecalibrate(); break;
     }
   }
 

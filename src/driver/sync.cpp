@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -202,11 +203,25 @@ bool Optics::LoadFrame(const JVal &root, std::string *err) {
     if (err) *err = "no usable camera in xrservice.json (KB4 intrinsics, extrinsics)";
     return false;
   }
+  // The lower pair looks down and forward, at the floor and the hands; the base stations hang above. In two Frame
+  // recordings only the two looking up ever matched a station, while the others sent most of the bright spots (lamps,
+  // glints). They're left out, whatever their index
+  int up = 0;
+  for (int i = 0; i < kMaxCam; i++) up += out[i].valid && out[i].R.m[1][2] > kUpward;
+  if (up)
+    for (int i = 0; i < kMaxCam; i++) out[i].use = out[i].valid && out[i].R.m[1][2] > kUpward;
   for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
   const JVal *model = dc->get("model_number");
   device_ = model && model->t == JVal::Str ? model->s : "Steam Frame";
   exact_time_ = true;
   return true;
+}
+
+std::string Optics::Unused() const {
+  std::string s;
+  for (int i = 0; i < kMaxCam; i++)
+    if (cams_[i].valid && !cams_[i].use) s += (s.empty() ? "" : ", ") + std::to_string(i);
+  return s;
 }
 
 bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
@@ -791,6 +806,14 @@ void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
   }
 }
 
+void Frame::Reset() {
+  Cs_ = C_ = GC_ = M3();
+  o_ = oref_ = V3{};
+  ok_ = -1;
+  deg_ = miss_ = 0;
+  left_.clear();
+}
+
 // ================================================================ solver
 Solver::Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix)
     : fix_(std::move(fix)), log_(std::move(log)), rng_(seed) {}
@@ -800,6 +823,22 @@ void Solver::Reset(const X4 &x) {
   resets_++;
   anchor_ = x; has_anchor_ = true;
   id_said_.clear();
+}
+
+void Solver::Clear() {
+  std::lock_guard<std::mutex> g(m_);
+  rt_.clear(); rg_.clear(); ro_.clear(); rd_.clear(); rc_.clear(); rb_.clear();
+  frames_.clear();
+  has_x_ = has_anchor_ = has_acq_x_ = false;
+  x_ = anchor_ = acq_x_ = X4{};
+  since_ = brk_ = last_acq_ = seen_ = last_id_ = -1e18;
+  id_said_.clear();
+  stat_ = StepStat();
+  has_stat_ = false;
+  acq_forced_ = acq_dim_ = false;
+  starved_ = false;
+  amb_state_ = 0;
+  kept_said_ = -1e18;
 }
 
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
@@ -1451,20 +1490,33 @@ static std::string Meters(double d) { return std::isfinite(d) ? Fmt("%.1f m", d)
 // Their motion first: worn or held, they go where the head goes, and a fit and its mirror (turned 180 deg) move them
 // opposite ways, wherever one stands and whatever lies about. Then how near the head they stay.
 int Solver::BodyFavours(const X4 &a, const X4 &b, double &da, double &db, std::string &how) const {
+  how.clear();
   da = body_ ? body_(a) : NAN;
   db = body_ ? body_(b) : NAN;
   double moved = 0, ma = motion_ ? motion_(a, moved) : NAN, mb = motion_ ? motion_(b, moved) : NAN;
+  int by_motion = 0, by_place = 0;
+  std::string how_motion, how_place;
   if (std::isfinite(ma) && std::isfinite(mb) && moved >= kBodyMoved && std::max(ma, mb) >= kBodyCorr &&
       std::fabs(ma - mb) >= 2 * kBodyCorr) {
-    how = Fmt("the lighthouse devices worn or held move with the head one way (%+.2f against %+.2f)", std::max(ma, mb),
-              std::min(ma, mb));
-    return ma > mb ? 1 : 2;
+    by_motion = ma > mb ? 1 : 2;
+    how_motion = Fmt("the lighthouse devices worn or held move with the head one way (%+.2f against %+.2f)",
+                     std::max(ma, mb), std::min(ma, mb));
   }
-  if (!std::isfinite(da) || !std::isfinite(db) || std::min(da, db) >= kBodyNear || std::fabs(da - db) <= kBodyGap)
+  if (std::isfinite(da) && std::isfinite(db) && std::min(da, db) < kBodyNear && std::fabs(da - db) > kBodyGap) {
+    by_place = da < db ? 1 : 2;
+    how_place = Fmt("the lighthouse devices worn or held stay near the head one way (%s from it, %s the other way)",
+                    Meters(std::min(da, db)).c_str(), Meters(std::max(da, db)).c_str());
+  }
+  // the two kinds of evidence pointing opposite ways say neither is to be trusted (devices carried about without the
+  // head, or lying in the room: their motion correlates by chance, +0.23 against -0.24 flipped a well supported fit to
+  // its mirror, seven metres away, for a minute): the current fit stays
+  if (by_motion && by_place && by_motion != by_place) {
+    how = Fmt("the lighthouse devices worn or held disagree with themselves (their motion %+.2f against %+.2f, their "
+              "distance from the head %s against %s)", ma, mb, Meters(da).c_str(), Meters(db).c_str());
     return 0;
-  how = Fmt("the lighthouse devices worn or held stay near the head one way (%s from it, %s the other way)",
-            Meters(std::min(da, db)).c_str(), Meters(std::max(da, db)).c_str());
-  return da < db ? 1 : 2;
+  }
+  how = by_motion ? how_motion : how_place;
+  return by_motion ? by_motion : by_place;
 }
 
 // Two stations facing each other at about the same height look the same with their places swapped: the fit turned
@@ -1509,11 +1561,13 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
     why = how + (pick_m ? ": the mirror" : ": the fit");
   } else if (has_x_) {
     pick_m = Apart(m, x_, S) < Apart(best, x_, S);
-    state = 3;
-    why = "no lighthouse device near the head tells them apart: the current fit stays";
+    state = how.empty() ? 3 : 5;
+    why = (how.empty() ? std::string("no lighthouse device near the head tells them apart") : how) +
+          ": the current fit stays";
   } else {
-    state = 4;
-    why = "no lighthouse device near the head tells them apart: wear or hold one";
+    state = how.empty() ? 4 : 6;
+    why = (how.empty() ? std::string("no lighthouse device near the head tells them apart") : how) +
+          ": wear or hold one";
   }
   if (state != amb_state_)
     log_(Fmt("mirror check: yaw %+.1f (support %d, devices %s from the head) and its mirror yaw %+.1f (support %d, %s) "
@@ -2231,7 +2285,12 @@ Sync::Sync(SyncConfig cfg, LogFn log)
              frame_.layout() ? Fmt(", the fit of %d stations", (int)sfile_.ref.size()).c_str() : ""));
   else
     log_("no stations.json yet: the reference frame is set the first time base stations show up");
-  LoadState();
+  if (cfg_.per_headset) {
+    seeded_ = true;  // this headset's state.json is read once it's known (ApplyHeadset)
+  } else {
+    state_path_ = Join(cfg_.dir, "state.json");
+    LoadState();
+  }
   // a place kept by earlier sessions holds a little looser in this one: what this one sees can still move it
   for (auto &kv : sfile_.place) {
     StationsFile::Place p = kv.second;
@@ -2244,10 +2303,18 @@ Sync::Sync(SyncConfig cfg, LogFn log)
 Sync::~Sync() {}
 
 void Sync::LoadState() {
+  quest_.clear();
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    timings_.clear();
+  }
+  saved_cs_.clear();
+  saved_timings_.clear();
+  has_saved_ = false;
   seeded_ = true;
   std::string text;
   JVal d;
-  if (!ReadFile(Join(cfg_.dir, "state.json"), text) || !JParse(text, d)) return;
+  if (state_path_.empty() || !ReadFile(state_path_, text) || !JParse(text, d)) return;
   if (const JVal *q = d.get("quest_stations"))
     for (auto &kv : q->o) {
       auto v = kv.second.nums();
@@ -2255,14 +2322,17 @@ void Sync::LoadState() {
     }
   // timings checked as Timing::Estimate does since 1.13 ("timing", before, could be a camera's error or noise: one sat
   // at -6.2 ms for a Frame and kept it from ever finding the base stations)
-  if (const JVal *t = d.get("pose_timing"))
+  if (const JVal *t = d.get("pose_timing")) {
+    std::lock_guard<std::mutex> g(st_m_);
     for (auto &kv : t->o)
       if (kv.second.t == JVal::Num) timings_[kv.first] = kv.second.n;
+  }
   seeded_ = quest_.empty();
 }
 
-void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs) {
-  bool moved = !has_saved_ || std::fabs(x[0] - saved_x_[0]) * kDeg > 0.01 || cs.size() != saved_cs_.size() ||
+void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs, bool force) {
+  if (state_path_.empty()) return;  // the headset isn't known yet
+  bool moved = force || !has_saved_ || std::fabs(x[0] - saved_x_[0]) * kDeg > 0.01 || cs.size() != saved_cs_.size() ||
                timings_.size() != saved_timings_.size();
   for (int i = 1; i < 4; i++) moved = moved || std::fabs(x[i] - saved_x_[i]) > 0.001;
   for (auto &kv : cs) {
@@ -2286,11 +2356,11 @@ void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs) {
     s += Fmt("%s\n  \"%s\": [%.5f, %.5f, %.5f]", first ? "" : ",", kv.first.c_str(), q.x, q.y, q.z);
     first = false;
   }
-  s += Fmt("\n },\n \"x\": [%.9f, %.9f, %.9f, %.9f],\n \"pose_timing\": {", x[0], x[1], x[2], x[3]);
+  s += Fmt("%s},\n \"x\": [%.9f, %.9f, %.9f, %.9f],\n \"pose_timing\": {", cs.empty() ? "" : "\n ", x[0], x[1], x[2], x[3]);
   first = true;
   for (auto &kv : timings_) { s += Fmt("%s\n  \"%s\": %.5f", first ? "" : ",", kv.first.c_str(), kv.second); first = false; }
-  s += Fmt("\n },\n \"saved\": \"%s\"\n}\n", Now().c_str());
-  WriteFileAtomic(Join(cfg_.dir, "state.json"), s);
+  s += Fmt("%s},\n \"saved\": \"%s\"\n}\n", timings_.empty() ? "" : "\n ", Now().c_str());
+  WriteFileAtomic(state_path_, s);
 }
 
 // 4-DOF fit raw -> Quest from the stations both know
@@ -2312,6 +2382,8 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
+  std::string left_out = optics_.Unused();
+  if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
   // a Quest's frame period is one of two, the Frame's is learned from its frames
   grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
   grid_ = FrameGrid(grid_quest_);
@@ -2337,6 +2409,116 @@ void Sync::SetStreamer(const std::string &system) {
     timing_learned_ = true;
     log_(Fmt("timing for %s: %.1f ms (learned before)", system.c_str(), it->second * 1000));
   }
+}
+
+// "Steam-Frame-1a2b3c4d": the model for the eye, a hash of the serial to tell two of a kind apart
+void Sync::SetHeadset(const std::string &serial, const std::string &model) {
+  std::string name;
+  for (char c : model.substr(0, 32)) {
+    if (std::isalnum((unsigned char)c)) name += c;
+    else if (!name.empty() && name.back() != '-') name += '-';
+  }
+  while (!name.empty() && name.back() == '-') name.pop_back();
+  if (name.empty()) name = "headset";
+  uint32_t h = 2166136261u;  // FNV-1a
+  for (unsigned char c : serial) { h ^= c; h *= 16777619u; }
+  std::string key = serial.empty() || serial == "unknown" ? name : Fmt("%s-%08x", name.c_str(), h);
+  std::lock_guard<std::mutex> g(hs_m_);
+  hs_pending_ = key;
+  hs_new_ = true;
+}
+
+// A headset other than the one before has its own state.json (headsets/<key>/): what the last one's cameras saw says
+// nothing of this one's tracking space, or of how its streamer times its poses. The single state.json of earlier
+// versions goes to the first headset that connects.
+void Sync::ApplyHeadset() {
+  if (!hs_new_.exchange(false)) return;
+  std::string key;
+  {
+    std::lock_guard<std::mutex> g(hs_m_);
+    key = hs_pending_;
+  }
+  if (key == hs_key_) return;  // the same headset again: it reconnected
+  namespace fs = std::filesystem;
+  const bool first = hs_key_.empty();
+  hs_key_ = key;
+  std::error_code ec;
+  fs::path dir = fs::path(cfg_.dir) / "headsets" / key, legacy = fs::path(cfg_.dir) / "state.json";
+  fs::create_directories(dir, ec);
+  const std::string path = (dir / "state.json").string();
+  bool adopted = false;
+  if (first && !fs::exists(path, ec) && fs::exists(legacy, ec)) {
+    fs::rename(legacy, path, ec);
+    adopted = !ec;
+  }
+  state_path_ = path;
+  LoadState();
+  if (!first) ClearAlignment();  // the last headset's sightings and fit mean nothing to this one
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    ApplyTiming();
+  }
+  log_(Fmt("state for %s: headsets\\%s\\state.json%s", key.c_str(), key.c_str(),
+           adopted ? " (the state.json of earlier versions, moved there)"
+                   : quest_.empty() ? " (nothing saved yet)" : Fmt(" (%d base stations saved)", (int)quest_.size()).c_str()));
+}
+
+// expo_ for the current streamer from timings_ (st_m_ held); the default when it has none
+void Sync::ApplyTiming() {
+  auto it = timings_.find(streamer_);
+  if (!streamer_.empty() && it != timings_.end() && cfg_.learn_timing) {
+    expo_ = it->second;
+    timing_learned_ = true;
+    log_(Fmt("timing for %s: %.1f ms (learned before)", streamer_.c_str(), it->second * 1000));
+  } else {
+    expo_ = cfg_.arrival_clock ? kExpoArrival : kExpoDefault;
+    timing_learned_ = false;
+  }
+}
+
+// the sightings, the fit and what hung on them: gone, the lighthouse devices uncorrected until the next acquisition
+void Sync::ClearAlignment() {
+  solver_.Clear();
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    last_st_ = StepStat();
+    has_last_st_ = false;
+  }
+  have_applied_ = false;
+  applied_ = X4{};
+  lock_time_ = -1;
+  resets_seen_ = solver_.resets();
+  sum_t_ = -1;
+  sum_n_ = 0;
+}
+
+void Sync::ForceRecalibrate() {
+  ClearAlignment();
+  quest_.clear();
+  seeded_ = true;
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    timings_.clear();
+    ApplyTiming();
+  }
+  // an automatic reference frame is pinned again from SteamVR's stations as they are now (and its level found again);
+  // a measured one is the user's own and stays
+  if (sfile_.autogen || !sfile_.loaded) {
+    for (auto &kv : sfile_.place) solver_.DropFix(kv.first);
+    sfile_ = StationsFile();
+    frame_.Reset();
+    std::remove(Join(cfg_.dir, "stations.json").c_str());
+    place_prior_.clear();
+    place_sess_.clear();
+    place_off_.clear();
+    left_seen_.clear();
+    left_since_ = 0;
+    bad_since_ = tilt_since_ = -1;
+    place_saved_ = -1e18;
+  }
+  SaveState(X4{}, {}, true);  // the saved alignment goes too, or a restart would seed from it
+  Rec(last_step_, "I recalibrate");
+  log_("force recalibrate: everything learned about the alignment is dropped, starting over");
 }
 
 void Sync::OnHmdPose(double t, const Quat &q, V3 p) {
@@ -2456,8 +2638,9 @@ void Sync::OnLine(double pc, const char *line) {
   long long tus;
   int mean, off = 0;
   if (sscanf(line, "F %d %u %lld %d %d%n", &cam, &k, &tus, &mean, &nb, &off) < 5) return;
-  nframes_++;
   std::lock_guard<std::mutex> g(net_);
+  if (have_optics_ && !optics_.Used(cam)) return;  // a camera that can't see the base stations: not worth a frame grid
+  nframes_++;
   double hs = tus / 1e6;
   if (cfg_.arrival_clock) clock_.AddArrival(pc, hs);
   double lag = 0;
@@ -2803,6 +2986,7 @@ static bool Locked(bool has_x, const StepStat &st) {
 }
 
 Transform Sync::Tick(double now) {
+  ApplyHeadset();
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
     int b = poses_.brk_id();
@@ -2976,7 +3160,10 @@ Transform Sync::Tick(double now) {
           std::lock_guard<std::mutex> g(st_m_);
           sys = streamer_;
         }
-        if (!sys.empty()) timings_[sys] = e;
+        if (!sys.empty()) {
+          std::lock_guard<std::mutex> g(st_m_);
+          timings_[sys] = e;
+        }
         if (first || std::fabs(best - cur) > 0.002)
           log_(Fmt("timing%s%s: %.1f ms (best fit %.1f ms within %.1f, on %d fast-head sightings: %.1f turning left, "
                    "%.1f right)", sys.empty() ? "" : " for ", sys.c_str(), e * 1000, best * 1000, sp.ci * 1000, n,

@@ -84,6 +84,23 @@ int hs_calibration(char **data, size_t *len, char *name, size_t n) {
   return 0;
 }
 
+// The cameras the base stations are seen by: those xrservice.json calls "upper_left" / "upper_right" (sourceCamera), by
+// their place in "cameras". The lower pair ("slam_left" / "slam_right") looks down and forward. Bit k set: camera k;
+// 0 when the file doesn't say, which reads them all
+static unsigned upper_cameras(void) {
+  size_t len;
+  char *xr = slurp(XRSERVICE_JSON, &len);
+  unsigned mask = 0;
+  const char *s = xr, *q;
+  for (int k = 0; s && k < 4 && (s = strstr(s, "\"sourceCamera\"")); k++) {
+    s += strlen("\"sourceCamera\"");
+    if (!(q = strchr(s, ':')) || !(q = strchr(q, '"'))) break;
+    if (!strncmp(q + 1, "upper", 5)) mask |= 1u << k;
+  }
+  free(xr);
+  return mask;
+}
+
 pid_t hs_capture_start(int out_fd, char *msg, size_t n) {
   pid_t parent = getpid(), pid = fork();
   if (pid == 0) {
@@ -95,7 +112,7 @@ pid_t hs_capture_start(int out_fd, char *msg, size_t n) {
     dup2(out_fd, 1);
     dup2(out_fd, 2);
     for (int fd = 3; fd < 1024; fd++) close(fd);
-    _exit(lhsight_main());
+    _exit(lhsight_main(upper_cameras()));
   }
   if (pid < 0) return -1;
   snprintf(msg, n, "lhsight started");
