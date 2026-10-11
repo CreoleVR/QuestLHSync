@@ -861,7 +861,8 @@ void Solver::Clear() {
   acq_forced_ = acq_dim_ = false;
   starved_ = false;
   amb_state_ = 0;
-  kept_said_ = -1e18;
+  kept_said_ = far_said_ = -1e18;
+  body_wait_ = 1e18;
   held_h_.clear();  // another headset, or a reference frame pinned anew: the height held means nothing now
   held_t_ = -1e18;
 }
@@ -1441,6 +1442,20 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   Rays t = Thin(r);
   std::vector<X4> H;
   Hypotheses(t, S, H);
+  const std::vector<BodyBin> bins = body_bins_ ? body_bins_() : std::vector<BodyBin>();
+  if (!bins.empty() && !BodyTells(bins)) {  // devices worn or held, the head hasn't moved enough for them to tell yet
+    if (body_wait_ > now) body_wait_ = now;
+    if (now - body_wait_ < kBodyWait) return false;
+  } else {
+    body_wait_ = 1e18;
+  }
+  const double turn = BodyTurn();
+  {  // the hypotheses the worn or held devices allow, if they allow any
+    std::vector<X4> ok;
+    for (const X4 &h : H)
+      if (BodyOk(h, bins, turn)) ok.push_back(h);
+    if (!ok.empty()) H.swap(ok);
+  }
   std::vector<X4> cand;
   if (has_acq_x_) cand.push_back(acq_x_);
   size_t K = S.size();
@@ -1473,7 +1488,9 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     for (size_t i = 0; i < n2; i++) cand.push_back(top[o2[i]]);
   }
   bs = -1;
-  bool have = false;
+  bool have = false, have_near = false;
+  X4 far_x{};
+  int far_s = -1;
   for (X4 x : cand) {
     for (double gate : {1.5, 0.6}) {
       FitR f = Fit(x, S, Z, r, now, gate, nullptr);
@@ -1483,15 +1500,61 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     std::vector<int> c;
     Support(x, S, Z, t, INLIER, c);
     int sc = Score(c);
-    if (sc > bs) { best = x; bs = sc; have = true; }
+    if (BodyOk(x, bins, turn)) {
+      if (!have_near || sc > bs) { best = x; bs = sc; have = have_near = true; }
+    } else {
+      if (sc > far_s) { far_x = x; far_s = sc; }
+      if (!have_near && sc > bs) { best = x; bs = sc; have = true; }
+    }
   }
   if (!have) return false;
+  if (have_near && far_s > bs && now - far_said_ > 60) {
+    far_said_ = now;
+    log_(Fmt("acquisition: yaw %+.1f deg (support %d) would put the lighthouse devices worn or held %.1f m from the head: "
+             "yaw %+.1f deg (support %d, %.1f m) instead", far_x[0] * kDeg, far_s, BodyFar(far_x, bins), best[0] * kDeg, bs,
+             BodyFar(best, bins)));
+  }
   CheckMirror(best, bs, S, Z, r, t, now);
   acq_x_ = best; has_acq_x_ = true;
   std::vector<int> c;
   Support(best, S, Z, t, TIGHT_DEG, c);
   tight = Score(c);
   return true;
+}
+
+double Solver::BodyTurn() const {
+  double coh = 0, turn = body_turn_ ? body_turn_(coh) : NAN;
+  return std::isfinite(turn) && coh >= kBodyCoh ? turn : NAN;
+}
+
+bool Solver::BodyOk(const X4 &x, const std::vector<BodyBin> &bins, double turn) const {
+  if (std::isfinite(turn) && std::fabs(Wrap(x[0] - turn)) * kDeg > kBodyTurn) return false;
+  return BodyAllows(x, bins);
+}
+
+bool Solver::BodyTells(const std::vector<BodyBin> &b) {
+  if (b.size() < (size_t)kBodyMinBins) return false;
+  double path = 0;
+  for (size_t i = 1; i < b.size(); i++) path += std::hypot(b[i].head.x - b[i - 1].head.x, b[i].head.z - b[i - 1].head.z);
+  return path >= kBodyPath;
+}
+
+double Solver::BodyFar(const X4 &x, const std::vector<BodyBin> &b) {
+  if (!BodyTells(b)) return NAN;
+  double c = std::cos(x[0]), s = std::sin(x[0]);
+  std::vector<double> d;
+  d.reserve(b.size());
+  for (const BodyBin &e : b) {
+    double m = kInf;
+    for (const V3 &p : e.dev) {
+      V3 q = RyMul(c, s, p) + V3{x[1], x[2], x[3]};
+      m = std::min(m, std::hypot(q.x - e.head.x, q.z - e.head.z));
+    }
+    d.push_back(m);
+  }
+  size_t k = std::min(d.size() - 1, (size_t)(kBodyShare * d.size()));
+  std::nth_element(d.begin(), d.begin() + k, d.end());
+  return d[k];
 }
 
 bool Solver::KeptHeight(double &h) const {
@@ -2232,8 +2295,26 @@ StepStat Solver::Step(double /*now*/) {
       std::string how;
       bool far = has_x_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
       int fav = far ? BodyFavours(xa, x_, dn, dc, how) : 0;
+      if (far && fav != 1 && body_bins_) {  // a candidate the devices allow, a current fit they don't
+        const std::vector<BodyBin> bins = body_bins_();
+        double turn = BodyTurn(), fa = BodyFar(xa, bins), fc = BodyFar(x_, bins);
+        if (BodyOk(xa, bins, turn) && !BodyOk(x_, bins, turn) && (std::isfinite(turn) || std::isfinite(fa))) {
+          fav = 1;
+          how = std::isfinite(turn)
+                    ? Fmt("the lighthouse devices worn or held step as the head does turned by %+.1f deg", turn * kDeg)
+                    : Fmt("the lighthouse devices worn or held stay within %.1f m of the head one way, %.1f m the other",
+                          fa, fc);
+        }
+      }
       int need = far && !fav ? 2 * ACQ : ACQ;
-      bool enough = sa >= k * need || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2);
+      // the devices' steps tell the turn, and it agrees (Acquire only offers such candidates then): evidence besides the
+      // rays, as the mirror check's is, and half the support will do
+      bool body = false;
+      if (body_bins_ && body_turn_) {
+        double turn = BodyTurn();
+        body = std::isfinite(turn) && BodyOk(xa, body_bins_(), turn);
+      }
+      bool enough = sa >= k * need || tight >= k * TIGHT_N || ((acq_forced_ || body) && sa >= k * ACQ / 2);
       // The height decides first: a candidate off the kept height doesn't take over without the worn devices for it
       // (lamps line up with a wrong alignment at any height; a head that sat still leaves the held fit's thinned
       // support a handful), and if a wrong fit got in, one at the kept height takes it back on plain support
@@ -2670,6 +2751,8 @@ Sync::Sync(SyncConfig cfg, LogFn log)
   if (cfg_.arrival_clock) expo_ = kExpoArrival;
   solver_.SetBody([this](const X4 &x) { return BodyDist(x); });
   solver_.SetMotion([this](const X4 &x, double &moved) { return BodyMotion(x, moved); });
+  solver_.SetBodyBins([this]() { return BodyBins(); });
+  solver_.SetBodyTurn([this](double &coh) { return BodyTurn(coh); });
   solver_.SetInImage([this](int cam, V3 d) {
     std::lock_guard<std::mutex> g(net_);
     return have_optics_ && optics_.InImage(cam, d, 8.0);
@@ -2968,6 +3051,66 @@ double Sync::BodyDist(const X4 &x) {
 // How the worn or held lighthouse devices' horizontal motion follows the head's, were x the alignment: the
 // correlation of their steps (about 0.3 s each) with the head's over the same times, all devices together. +1 every
 // step along, -1 every step against; devices left lying add nothing. moved: the head's own path meanwhile (m).
+std::vector<BodyBin> Sync::BodyBins() {
+  std::vector<BodyS> b;
+  {
+    std::lock_guard<std::mutex> g(body_m_);
+    b.assign(body_.begin(), body_.end());
+  }
+  M3 C;
+  V3 tc;
+  frame_.Rotation(C, tc);
+  std::map<long long, BodyBin> per;  // 0.1 s moments
+  for (const BodyS &e : b) {
+    M3 R;
+    V3 h;
+    if (!poses_.At(e.t, R, h)) continue;
+    auto it = per.find((long long)std::floor(e.t * 10));
+    if (it == per.end()) it = per.emplace((long long)std::floor(e.t * 10), BodyBin{h, {}}).first;
+    it->second.dev.push_back(C * e.p + tc);
+  }
+  std::vector<BodyBin> out;
+  out.reserve(per.size());
+  for (auto &kv : per) out.push_back(std::move(kv.second));
+  return out;
+}
+
+double Sync::BodyTurn(double &coh) {
+  std::vector<BodyS> b;
+  {
+    std::lock_guard<std::mutex> g(body_m_);
+    b.assign(body_.begin(), body_.end());
+  }
+  coh = 0;
+  M3 C;
+  V3 tc;
+  frame_.Rotation(C, tc);
+  std::map<int, std::vector<const BodyS *>> per;
+  for (const BodyS &e : b) per[e.dev].push_back(&e);
+  double sn = 0, cs = 0, mag = 0, path = 0;
+  int n = 0;
+  for (auto &kv : per) {  // each device's 0.25 s steps against the head's
+    const std::vector<const BodyS *> &v = kv.second;
+    for (size_t i = 0, j = 0; i < v.size(); i = j) {
+      for (j = i + 1; j < v.size() && v[j]->t - v[i]->t < 0.25; j++) {}
+      if (j >= v.size()) break;
+      if (v[j]->t - v[i]->t > 0.5) continue;
+      M3 R;
+      V3 h0, h1;
+      if (!poses_.At(v[i]->t, R, h0) || !poses_.At(v[j]->t, R, h1)) continue;
+      V3 a = C * (v[j]->p - v[i]->p), h = h1 - h0;  // RyMul(yaw) a ~ h
+      sn += a.z * h.x - a.x * h.z;
+      cs += a.z * h.z + a.x * h.x;
+      mag += std::hypot(a.x, a.z) * std::hypot(h.x, h.z);
+      path += std::hypot(h.x, h.z);
+      n++;
+    }
+  }
+  if (n < 40 || !(mag > 0) || path / per.size() < kBodyPath) return NAN;
+  coh = std::hypot(sn, cs) / mag;
+  return std::atan2(sn, cs);
+}
+
 double Sync::BodyMotion(const X4 &x, double &moved) {
   std::vector<BodyS> b;
   {
@@ -3131,6 +3274,7 @@ void Sync::Use(const Shot &f) {
     else spots_.dim++;
   }
 }
+
 
 std::string Sync::Describe(const Spots &a, const Spots &b) {
   long n = b.seen - a.seen;
@@ -3421,6 +3565,10 @@ Transform Sync::Tick(double now) {
       double gap, dy;
       poses_.brk_jump(gap, dy);
       solver_.PoseBreak(poses_.brk_t(), gap < kBrkJumpGap ? dy : NAN);
+      {  // the devices' places before it go with the head's older space
+        std::lock_guard<std::mutex> g(body_m_);
+        while (!body_.empty() && body_.front().t < poses_.brk_t()) body_.pop_front();
+      }
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
     }
     std::map<std::string, std::pair<V3, M3>> raw;
