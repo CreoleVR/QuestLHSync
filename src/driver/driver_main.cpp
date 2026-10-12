@@ -75,6 +75,17 @@ static std::string DataDir() {
   std::filesystem::path d;
   if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p))) d = std::filesystem::path(p) / "QuestLHSync";
   CoTaskMemFree(p);
+  // Keep a new headset's station geometry and timing separate from old headsets.
+  char profile[64] = {};
+  vr::EVRSettingsError error;
+  vr::VRSettings()->GetString(kSection, "profile", profile, sizeof(profile), &error);
+  if (error == vr::VRSettingsError_None && profile[0]) {
+    bool valid = true;
+    for (const char *c = profile; *c; c++)
+      if (!( (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+             (*c >= '0' && *c <= '9') || *c == '-' || *c == '_' )) valid = false;
+    if (valid) d /= std::filesystem::path("profiles") / profile;
+  }
   std::error_code ec;
   std::filesystem::create_directories(d, ec);
   return d.string();
@@ -318,7 +329,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       g_st->version = QLHS_VERSION;
       g_st->magic = QLHS_MAGIC;
     }
-    Log("QuestLHSync " QLHS_RELEASE " driver starting, data in %LOCALAPPDATA%\\QuestLHSync");
+    Log("QuestLHSync " QLHS_RELEASE " driver starting, data in " + dir_);
     SyncConfig cfg;
     cfg.dir = dir_;
     cfg.per_headset = true;
