@@ -107,7 +107,8 @@ bool Optics::Load(const std::string &json, std::string *err) {
   if (kind && kind->t == JVal::Str && kind->s == "steam_frame") return LoadFrame(root, err);
   // A separate root key makes older PC drivers reject Galaxy XR profiles
   // instead of silently interpreting [fx,fy,cx,cy] as Meta's [f,cx,cy].
-  bool gxr = kind && kind->t == JVal::Str && kind->s == "galaxy_xr";
+  bool gxr_sensor = kind && kind->t == JVal::Str && kind->s == "galaxy_xr_sensor";
+  bool gxr = gxr_sensor || (kind && kind->t == JVal::Str && kind->s == "galaxy_xr");
   const JVal *cams = root.get(gxr ? "GxrCameraCalibration" : "CameraCalibration");
   if (!cams || cams->t != JVal::Arr) { if (err) *err = "no CameraCalibration"; return false; }
   CamCal out[kMaxCam];
@@ -152,7 +153,7 @@ bool Optics::Load(const std::string &json, std::string *err) {
   for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
   const JVal *dev = root.get("Device"), *type = dev ? dev->get("DeviceType") : nullptr;
   device_ = type && type->t == JVal::Str ? type->s : "";
-  exact_time_ = false;
+  exact_time_ = gxr_sensor;  // Backend converted QVR sensor BOOTTIME to daemon MONOTONIC.
   return true;
 }
 

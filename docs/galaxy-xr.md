@@ -13,6 +13,19 @@ new format. `Projection.Model: "PinholeXY"` has four coefficients
 Both focal lengths must be positive and all four coefficients finite. Existing
 Meta calibration and Steam Frame formats retain their current interpretation.
 
+Sensor-stamped backends use `kind: "galaxy_xr_sensor"` with the same camera
+array. Their frame timestamps must already be in the daemon's CLOCK_MONOTONIC
+timebase. This selects the existing sensor-timestamp path: no estimated polling
+lag is subtracted, while automatic pose timing remains active. The QVR backend
+converts its BOOTTIME sensor stamps to MONOTONIC using a freshly sampled clock
+offset, including after suspend. Backends reporting delivery timestamps must
+continue to use `galaxy_xr`. Older compatibility drivers reject the new kind
+because they do not find a legacy `CameraCalibration` array.
+
+The wire format places pixel centres at `n + 0.5`. A backend that converts blob
+coordinates through an optical map must remove that half pixel before lookup
+and restore it afterward; the driver already removes it when constructing rays.
+
 Enable `driver_questlhsync.anyHmd` for the external backend. An optional
 `driver_questlhsync.profile` string isolates state under
 `%LOCALAPPDATA%\QuestLHSync\profiles\NAME`; allowed characters are ASCII letters,
