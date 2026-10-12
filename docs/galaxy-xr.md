@@ -2,9 +2,9 @@
 
 An experimental external KernelSU backend supplies observations from Galaxy XR's
 four outward-facing tracking cameras using the existing daemon protocol. Live
-alignment through Virtual Desktop has been confirmed with measured per-device
-calibration; generic factory calibration and firmware support are not supplied
-by this PC change.
+alignment through Virtual Desktop has been validated with a private factory-map
+trial, including sensor timestamps and cold-start timing learning. Factory
+preparation and firmware support are supplied by the separate backend.
 
 The calibration JSON uses `kind: "galaxy_xr"` and `GxrCameraCalibration` in place
 of `CameraCalibration`. The distinct root key ensures older drivers reject the
