@@ -5,6 +5,7 @@
 		"headset" : "",
 		"anyHmd" : false,
 		"record" : false,
-		"gravity" : true
+		"gravity" : true,
+		"steadyStations" : true
 	}
 }

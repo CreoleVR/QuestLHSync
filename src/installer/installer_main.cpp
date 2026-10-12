@@ -542,6 +542,117 @@ static std::vector<fs::path> OtherCopies() {
   return v;
 }
 
+static void Say(const std::wstring &m, uint32_t accent = 0);
+
+// ---- steamvr.vrsettings: "steamvr"."activateMultipleDrivers" must be true or SteamVR won't load the driver alongside
+// the headset's own. Edited as text so the rest of the file stays byte for byte as SteamVR wrote it.
+static size_t SkipWs(const std::string &t, size_t i) {
+  while (i < t.size() && isspace((unsigned char)t[i])) i++;
+  return i;
+}
+
+static size_t SkipStr(const std::string &t, size_t i) {  // t[i] is '"'; returns the index after the closing quote
+  for (i++; i < t.size() && t[i] != '"'; i++)
+    if (t[i] == '\\') i++;
+  return std::min(i + 1, t.size());
+}
+
+static size_t SkipValue(const std::string &t, size_t i) {
+  if (i >= t.size()) return i;
+  if (t[i] == '"') return SkipStr(t, i);
+  if (t[i] == '{' || t[i] == '[') {
+    int depth = 0;
+    while (i < t.size()) {
+      if (t[i] == '"') { i = SkipStr(t, i); continue; }
+      if (t[i] == '{' || t[i] == '[') depth++;
+      else if (t[i] == '}' || t[i] == ']') { if (--depth == 0) return i + 1; }
+      i++;
+    }
+    return i;
+  }
+  while (i < t.size() && !isspace((unsigned char)t[i]) && t[i] != ',' && t[i] != '}' && t[i] != ']') i++;
+  return i;
+}
+
+// Looks for `key` among the members of the object opening at t[open]. On a hit sets [vs, ve) to its value. Returns
+// false when absent (hasMembers tells whether the object has any) or the text is malformed (ok = false).
+static bool ObjMember(const std::string &t, size_t open, const char *key, size_t &vs, size_t &ve, bool &hasMembers,
+                      bool &ok) {
+  ok = true;
+  hasMembers = false;
+  size_t i = open + 1;
+  for (;;) {
+    i = SkipWs(t, i);
+    while (i < t.size() && t[i] == ',') i = SkipWs(t, i + 1);
+    if (i >= t.size()) { ok = false; return false; }
+    if (t[i] == '}') return false;
+    if (t[i] != '"') { ok = false; return false; }
+    hasMembers = true;
+    size_t ks = i;
+    i = SkipStr(t, i);
+    std::string name = t.substr(ks + 1, i - ks - 2);
+    i = SkipWs(t, i);
+    if (i >= t.size() || t[i] != ':') { ok = false; return false; }
+    i = SkipWs(t, i + 1);
+    vs = i;
+    ve = SkipValue(t, i);
+    if (name == key) return true;
+    i = ve;
+  }
+}
+
+static std::string InsertMember(const std::string &t, size_t open, bool hasMembers, const std::string &member) {
+  return t.substr(0, open + 1) + "\n\t" + member + (hasMembers ? "," : "\n") + t.substr(open + 1);
+}
+
+// returns true when the file was changed
+static bool EnsureMultipleDrivers(const fs::path &file) {
+  static const char *kKey = "activateMultipleDrivers";
+  std::string t = Slurp(file);
+  size_t root = SkipWs(t, 0);
+  if (root >= t.size()) {  // missing or empty
+    std::ofstream(file, std::ios::binary) << "{\n\t\"steamvr\" : {\n\t\t\"" << kKey << "\" : true\n\t}\n}\n";
+    return true;
+  }
+  const Fail bad{L"steamvr.vrsettings isn't valid JSON"};
+  if (t[root] != '{') throw bad;
+  size_t vs, ve;
+  bool has, ok;
+  std::string out;
+  if (!ObjMember(t, root, "steamvr", vs, ve, has, ok)) {
+    if (!ok) throw bad;
+    out = InsertMember(t, root, has, std::string("\"steamvr\" : {\n\t\t\"") + kKey + "\" : true\n\t}");
+  } else if (t[vs] != '{') {
+    out = t.substr(0, vs) + "{\n\t\t\"" + kKey + "\" : true\n\t}" + t.substr(ve);
+  } else {
+    size_t ms, me;
+    bool shas;
+    if (!ObjMember(t, vs, kKey, ms, me, shas, ok)) {
+      if (!ok) throw bad;
+      out = InsertMember(t, vs, shas, std::string("\"") + kKey + "\" : true");
+    } else if (t.compare(ms, me - ms, "true") == 0) {
+      return false;
+    } else {
+      out = t.substr(0, ms) + "true" + t.substr(me);
+    }
+  }
+  std::ofstream(file, std::ios::binary | std::ios::trunc) << out;
+  return true;
+}
+
+static void EnsureSteamVrSettings() {
+  try {
+    for (const fs::path &dir : VrPaths("config")) {
+      fs::path f = dir / L"steamvr.vrsettings";
+      if (EnsureMultipleDrivers(f)) Say(L"Set activateMultipleDrivers to true in " + f.wstring());
+      return;
+    }
+    Say(L"Couldn't find SteamVR's config folder: set \"activateMultipleDrivers\": true under \"steamvr\" in steamvr.vrsettings", col::amber);
+  } catch (const Fail &e) {
+    Say(e.msg + L": couldn't set activateMultipleDrivers", col::amber);
+  }
+}
+
 static bool SteamVrRunning() {
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (snap == INVALID_HANDLE_VALUE) return false;
@@ -600,7 +711,7 @@ static void Touch() {
   if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-static void Say(const std::wstring &m, uint32_t accent = 0) {
+static void Say(const std::wstring &m, uint32_t accent) {
   SYSTEMTIME t;
   GetLocalTime(&t);
   {
@@ -726,6 +837,7 @@ static void Install(const std::wstring &tag) {
     fs::create_directories(g_root, ec);
     ExtractDriver(zip);
     RunReg(L"adddriver");
+    EnsureSteamVrSettings();  // SteamVR is stopped, so it won't overwrite the file on exit
     for (const fs::path &old : OtherCopies()) {  // SteamVR would load one of the two: this one only from now on
       RunReg(L"removedriver", old);
       Say(L"Unregistered the older copy in " + old.wstring() + L" (its files are left as they are)");

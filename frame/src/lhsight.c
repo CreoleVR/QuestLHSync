@@ -2,9 +2,11 @@
 // XRService's camera buffers and writes nothing: the buffer list comes from VIDIOC_QUERYBUF on the cameras' own nodes
 // (anyone may query a queue), the buffers themselves from the questlhsync_frame driver in the Frame's vrserver (see
 // frame/driver/xrfds.cpp). Every new frame: its mean (exposure class), and on short-exposure frames (the controller
-// LED frames, 8.4 ms after each long one, every 30 ms) the saturated blobs, then dimmer ones. Lines on stdout:
+// LED frames, 8.4 ms after each long one, every 30 ms) the saturated blobs, then dimmer ones. Only the short frames are
+// reported, and only of the cameras lhsyncd names (the two upper ones, which see the base stations): ~67 lines a second
+// where all frames of all four cameras were ~270. Lines on stdout:
 //   F cam seq t_us mean nblobs [x y npx peak]...   t: the frame's own timestamp on CLOCK_MONOTONIC, mean * 10,
-//                                                  nblobs -1 on long frames, x y in pixels * 10 (pixel centres at .5)
+//                                                  x y in pixels * 10 (pixel centres at .5)
 //   T t_us scans n scan_us u torn n polls n lag_us l   once a second
 //   I/W/E messages
 // Exits when XRService or its buffers change (lhsyncd starts it again).
@@ -42,9 +44,18 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+#define NPITCH 8  // row pitches a camera's buffers might have
+#define PITCH_VOTES 3     // frames in a row that must pick the same pitch
+#define PITCH_PATIENCE 300  // frames without a pick before warning (~5 s)
+
 struct cam {
   char dev[64];
-  int vfd, w, h, stride, nb;
+  int vfd, w, h, nb;
+  int stride;              // the luma's row pitch, 0 until the frames have told it (pick_pitch)
+  int bpl;                 // V4L2's bytesperline
+  int pitch[NPITCH], npitch;  // the pitches it might be
+  int vote, votes;         // the pitch the last clear frames picked, how many in a row
+  u32 tries;               // frames looked at for it
   int xfd[NBUF];  // XRService's fd numbers
   int fd[NBUF];   // ours
   u8 *map[NBUF];
@@ -160,6 +171,13 @@ static int querybuf(struct cam *c, int i, struct v4l2_buffer *b, struct v4l2_pla
   return ioctl(c->vfd, VIDIOC_QUERYBUF, b);
 }
 
+static void add_pitch(struct cam *c, size_t s, size_t len) {
+  if (s < (size_t)c->w || s * (c->h - 1) + c->w > len || c->npitch == NPITCH) return;
+  for (int i = 0; i < c->npitch; i++)
+    if (c->pitch[i] == (int)s) return;
+  c->pitch[c->npitch++] = (int)s;
+}
+
 static int open_camera(struct cam *c) {
   c->vfd = open(c->dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
   if (c->vfd < 0) { out("E can't open %s: %s", c->dev, strerror(errno)); return -1; }
@@ -167,7 +185,9 @@ static int open_camera(struct cam *c) {
   if (ioctl(c->vfd, VIDIOC_G_FMT, &f)) { out("E %s: VIDIOC_G_FMT: %s", c->dev, strerror(errno)); return -1; }
   c->w = f.fmt.pix_mp.width;
   c->h = f.fmt.pix_mp.height;
+  c->bpl = f.fmt.pix_mp.plane_fmt[0].bytesperline;
   if (c->w % 16 || c->h % 16 || c->w > 2048 || c->h > 2048) { out("E %s: unexpected size %dx%d", c->dev, c->w, c->h); return -1; }
+  size_t len = 0;
   for (c->nb = 0; c->nb < NBUF; c->nb++) {
     struct v4l2_buffer b;
     struct v4l2_plane pl[VIDEO_MAX_PLANES];
@@ -176,13 +196,22 @@ static int open_camera(struct cam *c) {
     c->xfd[c->nb] = pl[0].m.fd;
     c->len[c->nb] = pl[0].length;
     c->seq[c->nb] = b.sequence;
+    if (!len || pl[0].length < len) len = pl[0].length;
   }
   if (!c->nb) { out("E %s: no buffers (is XRService streaming?)", c->dev); return -1; }
-  // The planes are laid out as NV12 (luma, then half as many rows for chroma that a mono camera leaves empty), so the
-  // luma's row pitch is the buffer over 1.5 heights: 1152 for the 1056-wide cameras, where V4L2 reports 1056.
-  size_t rows = (size_t)c->h * 3 / 2;
-  c->stride = c->len[0] % rows == 0 && c->len[0] / rows >= (size_t)c->w ? (int)(c->len[0] / rows) : c->w;
-  if ((size_t)c->stride * (c->h - 1) + c->w > c->len[0]) { out("E %s: buffer too small", c->dev); return -1; }
+  // The row pitch the camera writes isn't always the one V4L2 reports, and the buffers (XRService's, sized for NV12:
+  // luma, then half as many rows of chroma that a mono camera leaves empty) don't tell it either: one Frame's
+  // 1056-wide cameras write rows 1152 apart where V4L2 says 1056, another's 1056 apart in buffers of the same size. So
+  // every pitch it might be (V4L2's, the buffer over 1.5 or 1 heights, the width aligned up to 32-256 bytes), and the
+  // frames pick one (pick_pitch)
+  c->npitch = 0;
+  if (c->bpl > 0) add_pitch(c, (size_t)c->bpl, len);
+  if (len % ((size_t)c->h * 3 / 2) == 0) add_pitch(c, len / ((size_t)c->h * 3 / 2), len);
+  if (len % (size_t)c->h == 0) add_pitch(c, len / (size_t)c->h, len);
+  for (size_t a = 32; a <= 256; a *= 2) add_pitch(c, ((size_t)c->w + a - 1) / a * a, len);
+  if (!c->npitch) { out("E %s: buffers of %zu bytes too small for %dx%d", c->dev, len, c->w, c->h); return -1; }
+  c->stride = c->npitch == 1 ? c->pitch[0] : 0;
+  c->vote = -1;
   return 0;
 }
 
@@ -329,6 +358,61 @@ static void pick_clock(double ts) {
       (ts_clock == CLOCK_MONOTONIC_RAW ? mono : raw) * 1e3);
 }
 
+// rows s bytes apart: how much each differs from the next (mean |difference| over a grid of samples) in its first
+// rows. The true pitch puts each row over the next in the image; a wrong one shears them apart
+static double row_step(const struct cam *c, const u8 *p, int s, int rows) {
+  u32 sum = 0, n = 0;
+  for (int y = 0; y + 1 < rows; y += 4)
+    for (int x = 0; x < c->w; x += 4) {
+      int d = p[(size_t)y * s + x] - p[(size_t)(y + 1) * s + x];
+      sum += (u32)(d < 0 ? -d : d);
+      n++;
+    }
+  return n ? (double)sum / n : 0;
+}
+
+// the pitch a frame clearly reads best at (rows differing least, by a margin), -1 if none (a dark short frame, nothing
+// in view); why: each pitch's row step. Only over the rows every pitch reads inside the image: a pitch wider than the
+// true one runs off the luma into the empty chroma, as even as a sharp image
+static int pick_pitch(const struct cam *c, const u8 *p, char *why, size_t n) {
+  int lo = c->pitch[0], hi = c->pitch[0];
+  for (int i = 1; i < c->npitch; i++) {
+    if (c->pitch[i] < lo) lo = c->pitch[i];
+    if (c->pitch[i] > hi) hi = c->pitch[i];
+  }
+  int rows = (int)((long)(c->h - 1) * lo / hi), best = -1, L = 0;
+  double d[NPITCH], second = 0;
+  for (int i = 0; i < c->npitch; i++) {
+    d[i] = row_step(c, p, c->pitch[i], rows);
+    L += snprintf(why + L, n - L, "%s%d: %.1f", i ? ", " : "", c->pitch[i], d[i]);
+    if (best < 0 || d[i] < d[best]) best = i;
+  }
+  for (int i = 0, first = 1; i < c->npitch; i++)
+    if (i != best && (first || d[i] < second)) second = d[i], first = 0;
+  return second >= 1.3 * d[best] && second - d[best] >= 2 ? best : -1;
+}
+
+// a frame's pick (pick_pitch): PITCH_VOTES clear frames in a row picking the same pitch settle it
+static void count_pitch(struct cam *c, int v, const char *why) {
+  if (++c->tries == PITCH_PATIENCE)
+    out("W %s: can't tell its row pitch from its frames yet (too dark? nothing in view?): V4L2 says %d, row steps %s",
+        c->dev, c->bpl, why);
+  if (v < 0) return;
+  if (v != c->vote) c->vote = v, c->votes = 0;
+  if (++c->votes < PITCH_VOTES) return;
+  c->stride = c->pitch[v];
+  out("I %s: rows %d bytes apart, V4L2 says %d (row steps %s)", c->dev, c->stride, c->bpl, why);
+}
+
+// XRService may have queued it again while this read it: then the camera may have been writing into it
+static int torn(struct cam *c, int i, const struct v4l2_buffer *b) {
+  struct v4l2_buffer b2;
+  struct v4l2_plane pl[VIDEO_MAX_PLANES];
+  if (!querybuf(c, i, &b2, pl) && !(b2.flags & V4L2_BUF_FLAG_QUEUED) && b2.sequence == b->sequence) return 0;
+  ntorn++;
+  return 1;
+}
+
 static void frame(int k, int i, const struct v4l2_buffer *b) {
   struct cam *c = &C[k];
   double ts = b->timestamp.tv_sec + b->timestamp.tv_usec / 1e6;
@@ -339,6 +423,13 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   lag_n++;
   cpu_access(c->fd[i], 0);
   const u8 *p = c->map[i];
+  if (!c->stride) {  // the row pitch isn't known yet: the frame only tells it
+    char why[200];
+    int v = pick_pitch(c, p, why, sizeof why);
+    cpu_access(c->fd[i], 1);
+    if (!torn(c, i, b)) count_pitch(c, v, why);
+    return;
+  }
   int mean = smean(c, p);
   u32 kk = c->k++;
   int hi = c->m1 > c->m2 ? c->m1 : c->m2;
@@ -346,21 +437,17 @@ static void frame(int k, int i, const struct v4l2_buffer *b) {
   c->m1 = mean;
   // short exposure: well under the brighter of the previous two (long and short frames alternate)
   int is_short = kk >= 2 && mean * 10 < hi * 6;
-  u64 t0 = now_ns();
-  if (is_short)
-    for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y * c->w, p + (size_t)y * c->stride, c->w);
-  cpu_access(c->fd[i], 1);
-  // XRService may have queued it again while this read it: then the camera may have been writing into it
-  struct v4l2_buffer b2;
-  struct v4l2_plane pl[VIDEO_MAX_PLANES];
-  if (querybuf(c, i, &b2, pl) || (b2.flags & V4L2_BUF_FLAG_QUEUED) || b2.sequence != b->sequence) {
-    ntorn++;
+  if (!is_short) {  // the long frames only tell the short ones apart: nothing to send
+    cpu_access(c->fd[i], 1);
     return;
   }
+  u64 t0 = now_ns();
+  for (int y = 0; y < c->h; y++) memcpy(scratch + (size_t)y * c->w, p + (size_t)y * c->stride, c->w);
+  cpu_access(c->fd[i], 1);
+  if (torn(c, i, b)) return;
   char line[2400];
   int L = snprintf(line, sizeof line, "F %d %u %llu %d", k, b->sequence, (unsigned long long)t_us, mean);
-  if (!is_short) L += snprintf(line + L, sizeof line - L, " -1");
-  else {
+  {
     // saturated blobs (base station dots, lamps), then dimmer ones in the cells they leave alone
     u64 sx[MAXB], sy[MAXB];
     u32 np[MAXB];
@@ -412,7 +499,8 @@ static double due(const struct cam *c, double t) {
   return d > c->polled + 0.001 ? d : c->polled + 0.001;
 }
 
-int lhsight_main(void) {
+int lhsight_main(unsigned cameras) {
+  if (!(cameras & ((1u << NCAM) - 1))) cameras = (1u << NCAM) - 1;  // none named: all
   pid_t xr = xrservice_pid();
   if (!xr) { out("E XRService (the Frame's tracking) isn't running"); return 2; }
   if (camera_nodes(xr) != NCAM) { out("E XRService's log doesn't say which nodes its %d cameras stream from", NCAM); return 2; }
@@ -431,12 +519,21 @@ int lhsight_main(void) {
   char desc[400];
   int L = 0;
   for (int k = 0; k < NCAM; k++)
-    L += snprintf(desc + L, sizeof desc - L, "%s%d %s %dx%d/%d x%d", k ? ", " : "", k, C[k].dev, C[k].w, C[k].h, C[k].stride, C[k].nb);
+    L += snprintf(desc + L, sizeof desc - L, "%s%d %s %dx%d bpl %d %zu B x%d", k ? ", " : "", k, C[k].dev, C[k].w, C[k].h,
+                  C[k].bpl, C[k].len[0], C[k].nb);
   out("I lhsight: XRService %d, cameras %s", (int)xr, desc);
+  {
+    char rd[40];
+    int n = 0;
+    for (int k = 0; k < NCAM; k++)
+      if (cameras >> k & 1) n += snprintf(rd + n, sizeof rd - n, "%s%d", n ? ", " : "", k);
+    out("I lhsight: reading cameras %s, short frames only", rd);
+  }
   double next_beat = now_s(CLOCK_MONOTONIC) + 1;
   for (;;) {
     double t = now_s(CLOCK_MONOTONIC), wake = t + 0.02;
     for (int k = 0; k < NCAM; k++) {
+      if (!(cameras >> k & 1)) continue;
       struct cam *c = &C[k];
       if (t >= due(c, t)) {
         poll_camera(k);

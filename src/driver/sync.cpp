@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -217,11 +218,25 @@ bool Optics::LoadFrame(const JVal &root, std::string *err) {
     if (err) *err = "no usable camera in xrservice.json (KB4 intrinsics, extrinsics)";
     return false;
   }
+  // The lower pair looks down and forward, at the floor and the hands; the base stations hang above. In two Frame
+  // recordings only the two looking up ever matched a station, while the others sent most of the bright spots (lamps,
+  // glints). They're left out, whatever their index
+  int up = 0;
+  for (int i = 0; i < kMaxCam; i++) up += out[i].valid && out[i].R.m[1][2] > kUpward;
+  if (up)
+    for (int i = 0; i < kMaxCam; i++) out[i].use = out[i].valid && out[i].R.m[1][2] > kUpward;
   for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
   const JVal *model = dc->get("model_number");
   device_ = model && model->t == JVal::Str ? model->s : "Steam Frame";
   exact_time_ = true;
   return true;
+}
+
+std::string Optics::Unused() const {
+  std::string s;
+  for (int i = 0; i < kMaxCam; i++)
+    if (cams_[i].valid && !cams_[i].use) s += (s.empty() ? "" : ", ") + std::to_string(i);
+  return s;
 }
 
 bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
@@ -333,12 +348,21 @@ bool FrameGrid::Lag(int cam, double t, double &lag) {
     else c.learn = true;
   }
   // learned: from the frames so far once the grid's window is full, then refined every WIN over up to LEARN_WIN (a
-  // longer stretch pins the period closer). A camera's rate doesn't change, so a stretch too messy to fold (frames
-  // misread as short ones) keeps the period found before
+  // longer stretch pins the period closer). A stretch too messy to fold (frames misread as short ones) keeps the period
+  // found before, unless the camera's rate changed: the Frame's flicker mode (automatic by default) can switch between
+  // 50 and 60 Hz mid-session. Then the last WIN alone no longer folds at the old period, but does at a new one, found
+  // afresh, and the frames from before the switch go
   if (!quest_ || c.learn) {
     if (t >= c.next && h.back() - h.front() >= 0.9 * WIN) {
       double p = Learn(lh, c.p);
       if (p > 0) c.p = p;
+      else if (c.p > 0 && FoldSpread(h, c.p) > 0.5 * c.p) {
+        double q = Learn(h, 0);
+        if (q > 0 && std::fabs(q - c.p) > 0.005 * c.p) {
+          c.p = q;
+          lh = h;
+        }
+      }
       c.next = t + WIN;
     }
   }
@@ -797,6 +821,14 @@ void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
   }
 }
 
+void Frame::Reset() {
+  Cs_ = C_ = GC_ = M3();
+  o_ = oref_ = V3{};
+  ok_ = -1;
+  deg_ = miss_ = 0;
+  left_.clear();
+}
+
 // ================================================================ solver
 Solver::Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix)
     : fix_(std::move(fix)), log_(std::move(log)), rng_(seed) {}
@@ -806,6 +838,23 @@ void Solver::Reset(const X4 &x) {
   resets_++;
   anchor_ = x; has_anchor_ = true;
   id_said_.clear();
+  last_id_ = -1e18;  // a new alignment: its stations' rotors are checked at the next step
+}
+
+void Solver::Clear() {
+  std::lock_guard<std::mutex> g(m_);
+  rt_.clear(); rg_.clear(); ro_.clear(); rd_.clear(); rc_.clear(); rb_.clear();
+  frames_.clear();
+  has_x_ = has_anchor_ = has_acq_x_ = false;
+  x_ = anchor_ = acq_x_ = X4{};
+  since_ = brk_ = last_acq_ = seen_ = last_id_ = last_layout_ = -1e18;
+  id_said_.clear();
+  stat_ = StepStat();
+  has_stat_ = false;
+  acq_forced_ = acq_dim_ = false;
+  starved_ = false;
+  amb_state_ = 0;
+  kept_said_ = -1e18;
 }
 
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
@@ -1016,11 +1065,14 @@ void Solver::Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3
   }
 }
 
-int Solver::Score(const std::vector<int> &c) {  // yaw needs two stations: the second-best count
+// yaw needs two stations: every station's support but the best seen one's. Only the second best's, a fit of two
+// stations scored the same as one a third station's sightings agree with too (a Steam Frame recording: the sightings
+// of a third station told the true fit from one 5 deg and 0.7 m off it, which two stations fit as well)
+int Solver::Score(const std::vector<int> &c) {
   if (c.size() < 2) return 0;
-  std::vector<int> v = c;
-  std::sort(v.begin(), v.end());
-  return v[v.size() - 2];
+  int best = 0, sum = 0;
+  for (int n : c) { sum += n; best = std::max(best, n); }
+  return sum - best;
 }
 
 struct CellKey {
@@ -1105,8 +1157,10 @@ static bool Solve(double A[kMaxDof][kMaxDof], const double *b, double *x, int n)
 // about the station centroid. A (head, direction) cell weighs one sighting however many it holds, so a still head adds
 // nothing by looking longer. xa: the prior's center (default x0). cond: the sightings alone pin every DOF.
 // 4 DOF; with a pivot 6: the stations also tilt about it (Tilt(y[4], y[5])), and the prior holds only the tilt.
+// who: each sighting's station as told (-1: left out), no gate.
 Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now,
-                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate, const V3 *axis) {
+                         double gate, const X4 *xa_in, const V3 *pivot, double dim_gate, const V3 *axis,
+                         const std::vector<int> *who) {
   FitR out;
   std::vector<V3> P, Zq;
   Predict(x0, S, Z, P, Zq);
@@ -1115,6 +1169,12 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
   int m = 0;
   for (size_t n = 0; n < r.size(); n++) {
     double a;
+    if (who) {
+      if ((*who)[n] < 0) continue;
+      kk[n] = (*who)[n];
+      use[n] = 1; m++;
+      continue;
+    }
     Nearest(P, Zq, r.O[n], r.D[n], kk[n], a);
     if (a < (r.B.empty() || r.B[n] ? gate : std::min(gate, dim_gate))) { use[n] = 1; m++; }
   }
@@ -1353,14 +1413,11 @@ Solver::Rays Solver::Thin(const Rays &r) {
   return o;
 }
 
-static int SecondBest(const int *c, size_t K) {
+static int SecondBest(const int *c, size_t K) {  // Solver::Score's: all but the best
   if (K < 2) return 0;
-  int a = -1, b = -1;  // best, second
-  for (size_t k = 0; k < K; k++) {
-    if (c[k] > a) { b = a; a = c[k]; }
-    else if (c[k] > b) b = c[k];
-  }
-  return b;
+  int best = 0, sum = 0;
+  for (size_t k = 0; k < K; k++) { sum += c[k]; best = std::max(best, c[k]); }
+  return sum - best;
 }
 
 // best hypothesis from scratch on the last ACQ_WIN s: score = thinned support, tight = the same within TIGHT_DEG
@@ -1457,20 +1514,33 @@ static std::string Meters(double d) { return std::isfinite(d) ? Fmt("%.1f m", d)
 // Their motion first: worn or held, they go where the head goes, and a fit and its mirror (turned 180 deg) move them
 // opposite ways, wherever one stands and whatever lies about. Then how near the head they stay.
 int Solver::BodyFavours(const X4 &a, const X4 &b, double &da, double &db, std::string &how) const {
+  how.clear();
   da = body_ ? body_(a) : NAN;
   db = body_ ? body_(b) : NAN;
   double moved = 0, ma = motion_ ? motion_(a, moved) : NAN, mb = motion_ ? motion_(b, moved) : NAN;
+  int by_motion = 0, by_place = 0;
+  std::string how_motion, how_place;
   if (std::isfinite(ma) && std::isfinite(mb) && moved >= kBodyMoved && std::max(ma, mb) >= kBodyCorr &&
       std::fabs(ma - mb) >= 2 * kBodyCorr) {
-    how = Fmt("the lighthouse devices worn or held move with the head one way (%+.2f against %+.2f)", std::max(ma, mb),
-              std::min(ma, mb));
-    return ma > mb ? 1 : 2;
+    by_motion = ma > mb ? 1 : 2;
+    how_motion = Fmt("the lighthouse devices worn or held move with the head one way (%+.2f against %+.2f)",
+                     std::max(ma, mb), std::min(ma, mb));
   }
-  if (!std::isfinite(da) || !std::isfinite(db) || std::min(da, db) >= kBodyNear || std::fabs(da - db) <= kBodyGap)
+  if (std::isfinite(da) && std::isfinite(db) && std::min(da, db) < kBodyNear && std::fabs(da - db) > kBodyGap) {
+    by_place = da < db ? 1 : 2;
+    how_place = Fmt("the lighthouse devices worn or held stay near the head one way (%s from it, %s the other way)",
+                    Meters(std::min(da, db)).c_str(), Meters(std::max(da, db)).c_str());
+  }
+  // the two kinds of evidence pointing opposite ways say neither is to be trusted (devices carried about without the
+  // head, or lying in the room: their motion correlates by chance, +0.23 against -0.24 flipped a well supported fit to
+  // its mirror, seven metres away, for a minute): the current fit stays
+  if (by_motion && by_place && by_motion != by_place) {
+    how = Fmt("the lighthouse devices worn or held disagree with themselves (their motion %+.2f against %+.2f, their "
+              "distance from the head %s against %s)", ma, mb, Meters(da).c_str(), Meters(db).c_str());
     return 0;
-  how = Fmt("the lighthouse devices worn or held stay near the head one way (%s from it, %s the other way)",
-            Meters(std::min(da, db)).c_str(), Meters(std::max(da, db)).c_str());
-  return da < db ? 1 : 2;
+  }
+  how = by_motion ? how_motion : how_place;
+  return by_motion ? by_motion : by_place;
 }
 
 // Two stations facing each other at about the same height look the same with their places swapped: the fit turned
@@ -1515,11 +1585,13 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
     why = how + (pick_m ? ": the mirror" : ": the fit");
   } else if (has_x_) {
     pick_m = Apart(m, x_, S) < Apart(best, x_, S);
-    state = 3;
-    why = "no lighthouse device near the head tells them apart: the current fit stays";
+    state = how.empty() ? 3 : 5;
+    why = (how.empty() ? std::string("no lighthouse device near the head tells them apart") : how) +
+          ": the current fit stays";
   } else {
-    state = 4;
-    why = "no lighthouse device near the head tells them apart: wear or hold one";
+    state = how.empty() ? 4 : 6;
+    why = (how.empty() ? std::string("no lighthouse device near the head tells them apart") : how) +
+          ": wear or hold one";
   }
   if (state != amb_state_)
     log_(Fmt("mirror check: yaw %+.1f (support %d, devices %s from the head) and its mirror yaw %+.1f (support %d, %s) "
@@ -1556,15 +1628,16 @@ static double Drift(double tau, double P) {
   return std::min(f, 1 - f) / P;
 }
 
-// How much seeing a station (in the frames it was in view of, sorted by camera, time) follows the phase at each
-// period, over fake periods near it. Both on the same per-camera windows of whole turns of the slower drift. False if
-// too few frames.
-static bool SeenScores(const std::vector<InView> &s, double tau1, double tau2, double P, double &s1, double &s2) {
+// How much seeing a station (in the frames it was in view of, sorted by camera, time) follows the phase at each of
+// the periods, over fake periods near it. All on the same per-camera windows of whole turns of the slowest drift.
+// False if too few frames.
+static bool SeenScores(const std::vector<InView> &s, const std::vector<double> &tau, double P, std::vector<double> &sc) {
   const double kTurns = 2, kEps[] = {0.0015, 0.0025, 0.0035, 0.0045, 0.0055, 0.0065, 0.0075, 0.0085};
   const int kMinN = 60, kMinSeen = 20;
-  s1 = s2 = 0;
-  double rate = std::min(Drift(tau1, P), Drift(tau2, P));
-  if (!(rate > 0)) return false;
+  sc.assign(tau.size(), 0.0);
+  double rate = kInf;
+  for (double t : tau) rate = std::min(rate, Drift(t, P));
+  if (tau.empty() || !(rate > 0)) return false;
   double W = std::max(20.0, (kTurns + 1) / rate);
   struct Win { size_t a, b; double p; };  // frames [a, b), share seen
   std::vector<Win> win;
@@ -1604,8 +1677,7 @@ static bool SeenScores(const std::vector<InView> &s, double tau1, double tau2, d
     for (double e : kEps) null += R(tau * (1 + e)) + R(tau * (1 - e));
     return std::max(0.0, R(tau) - null / (2 * (sizeof kEps / sizeof kEps[0])));
   };
-  s1 = score(tau1);
-  s2 = score(tau2);
+  for (size_t i = 0; i < tau.size(); i++) sc[i] = score(tau[i]);
   return true;
 }
 
@@ -1625,8 +1697,50 @@ static X4 YawFit(const std::vector<V3> &S, const std::vector<V3> &Q) {
   return {yaw, t.x, t.y, t.z};
 }
 
-// A pair of stations whose sightings follow each other's rotor periods better than their own is swapped: switch to
-// the alignment with the two exchanged if it fits the rays about as well.
+// The columns to give the rows, each one of its own, for the largest sum of w[row][column] (rows <= columns): the
+// Hungarian method
+static std::vector<int> Assign(const std::vector<std::vector<double>> &w) {
+  int n = (int)w.size(), m = n ? (int)w[0].size() : 0;
+  std::vector<double> u(n + 1, 0.0), v(m + 1, 0.0);
+  std::vector<int> p(m + 1, 0), way(m + 1, 0);
+  for (int i = 1; i <= n; i++) {
+    p[0] = i;
+    int j0 = 0;
+    std::vector<double> minv(m + 1, kInf);
+    std::vector<char> used(m + 1, 0);
+    do {
+      used[j0] = 1;
+      int i0 = p[j0], j1 = 0;
+      double delta = kInf;
+      for (int j = 1; j <= m; j++) {
+        if (used[j]) continue;
+        double cur = -w[i0 - 1][j - 1] - u[i0] - v[j];
+        if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+        if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+      }
+      for (int j = 0; j <= m; j++) {
+        if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
+        else minv[j] -= delta;
+      }
+      j0 = j1;
+    } while (p[j0]);
+    do {
+      int j1 = way[j0];
+      p[j0] = p[j1];
+      j0 = j1;
+    } while (j0);
+  }
+  std::vector<int> c(n, -1);
+  for (int j = 1; j <= m; j++)
+    if (p[j]) c[p[j] - 1] = j - 1;
+  return c;
+}
+
+// The sightings at each station's place are scored against every station's rotor period, and the stations given the
+// places whose sightings follow their rotors best (each station one place). Where that names other places than the
+// alignment's by kSwapGain in all, the stations are mixed up: two swapped, or four in a square turned by 90 deg, which
+// no swap of two puts right. The alignment with the stations at the places their rotors name is taken if it fits the
+// rays about as well and its stations follow their own rotors then.
 void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S,
                            const std::vector<V3> &Z) {
   double P = frame_p_;
@@ -1640,6 +1754,200 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
     }
   }
   if (!in_image_) return;
+  std::vector<size_t> u;  // the stations with a channel of their own
+  std::vector<double> tu;
+  for (size_t k = 0; k < keys.size(); k++)
+    if (tau[k] && std::count(tau.begin(), tau.end(), tau[k]) == 1) { u.push_back(k); tu.push_back(tau[k]); }
+  if (u.size() < 2) return;
+  Rays r = Bright(GetRays(since_));
+  std::vector<CamFrame> fr;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &f : frames_)
+      if (f.t >= since_) fr.push_back(f);
+  }
+  // under an alignment: the places it puts the stations at, the ones (of u) seen enough to score, their scores for
+  // each of u's rotors, the station (of u) each one's sightings name, and how much better that naming scores in all
+  struct Id {
+    std::vector<V3> Pq, Zq;
+    std::vector<size_t> at;
+    std::vector<std::vector<double>> sc;
+    std::vector<int> is;
+    double gain = 0;
+  };
+  auto identify = [&](const X4 &x, Id &o) {
+    std::vector<V3> &Zq = o.Zq;
+    Predict(x, S, Z, o.Pq, Zq);
+    std::vector<std::set<std::pair<int, double>>> saw(keys.size());  // (camera, frame) with a sighting within 1 deg
+    for (size_t n = 0; n < r.size(); n++) {
+      if (!std::isfinite(r.G[n])) continue;
+      int k;
+      double a;
+      Nearest(o.Pq, Zq, r.O[n], r.D[n], k, a);
+      if (a < 1.0) saw[k].insert({r.C[n], r.G[n]});
+    }
+    std::vector<std::vector<InView>> in(keys.size());
+    for (auto &f : fr)
+      for (size_t k = 0; k < keys.size(); k++) {
+        V3 U = o.Pq[k] - f.o;
+        double d = norm(U);
+        if (!(dot(U, Zq[k]) >= 0.2 * d) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
+        in[k].push_back({f.cam, f.g, saw[k].count({f.cam, f.g}) > 0});
+      }
+    for (auto &v : in)
+      std::sort(v.begin(), v.end(), [](const InView &a, const InView &b) { return a.cam != b.cam ? a.cam < b.cam : a.g < b.g; });
+    o.at.clear();
+    o.sc.clear();
+    for (size_t i = 0; i < u.size(); i++) {
+      std::vector<double> sc;
+      if (!SeenScores(in[u[i]], tu, P, sc)) continue;
+      o.at.push_back(i);
+      o.sc.push_back(sc);
+    }
+    if (o.at.empty()) return false;
+    std::vector<std::vector<double>> w = o.sc;
+    for (size_t n = 0; n < w.size(); n++) w[n][o.at[n]] += 1e-9;  // a tie: its own
+    o.is = Assign(w);
+    o.gain = 0;
+    for (size_t n = 0; n < o.at.size(); n++) o.gain += o.sc[n][o.is[n]] - o.sc[n][o.at[n]];
+    return true;
+  };
+  Id cur;
+  if (!identify(x_, cur)) return;
+  auto say = [&](const std::string &key, const std::string &s) {  // once per alignment
+    if (key == id_said_) return;
+    id_said_ = key;
+    log_(s);
+  };
+  size_t N = cur.at.size();
+  std::vector<size_t> moved;
+  for (size_t n = 0; n < N; n++)
+    if (cur.is[n] != (int)cur.at[n]) moved.push_back(n);
+  if (!moved.empty() && cur.gain > kSwapGain) {
+    // the places whose sightings name a rotor by kNamed over the others. Fewer than two such: every scored place as
+    // the naming has it (of two stations swapped, one's sightings may tell and the other's not: a slow drift)
+    std::vector<char> clear(N, 0);
+    for (size_t n = 0; n < N; n++) {
+      double other = 0;
+      for (size_t i = 0; i < u.size(); i++)
+        if ((int)i != cur.is[n]) other = std::max(other, cur.sc[n][i]);
+      clear[n] = cur.sc[n][cur.is[n]] - other >= kNamed;
+    }
+    if (std::count(clear.begin(), clear.end(), 1) < 2) clear.assign(N, 1);
+    std::vector<std::pair<size_t, size_t>> pr;  // (station, the station whose place it's at), by station
+    std::vector<int> named(keys.size(), -1);    // by place: the station there
+    for (size_t n = 0; n < N; n++)
+      if (clear[n]) {
+        pr.push_back({u[cur.is[n]], u[cur.at[n]]});
+        named[u[cur.at[n]]] = (int)u[cur.is[n]];
+      }
+    std::sort(pr.begin(), pr.end());
+    std::string who, what;  // "<who> were|look <what>"
+    if (moved.size() == 2 && cur.is[moved[0]] == (int)cur.at[moved[1]] && cur.is[moved[1]] == (int)cur.at[moved[0]]) {
+      who = keys[u[cur.at[moved[0]]]] + " and " + keys[u[cur.at[moved[1]]]];
+      what = "the wrong way round";
+    } else {
+      who = "the base stations";
+      for (size_t n : moved)
+        what += (what.empty() ? "mixed up: " : ", ") + keys[u[cur.is[n]]] + " at " + keys[u[cur.at[n]]] + "'s place";
+    }
+    what += Fmt(" (by %.2f)", cur.gain);
+    auto told = [&](const char *verb) { return who + " " + verb + " " + what; };
+    if (pr.size() < 2) {
+      say("one " + who, "channel check: " + told("look") + ", but no second station was seen enough to place them by");
+      return;
+    }
+    std::vector<V3> Ss, Qs;
+    for (auto &e : pr) {
+      Ss.push_back(S[e.first]);
+      Qs.push_back(cur.Pq[e.second]);
+    }
+    // The places only start it off: the alignment put them within a degree of the stations seen there, tens of cm off
+    // in depth. Then the sightings that named the rotors, each on the station it named, and all of them at last
+    X4 xs = YawFit(Ss, Qs);
+    std::vector<int> whose(r.size(), -1);
+    for (size_t n = 0; n < r.size(); n++) {
+      int k;
+      double a;
+      Nearest(cur.Pq, cur.Zq, r.O[n], r.D[n], k, a);
+      if (a < 1.0) whose[n] = named[k];
+    }
+    for (int i = 0; i < 4; i++) {  // the fit holds on to where it starts: a few rounds
+      FitR f = Fit(xs, S, Z, r, now, 0, nullptr, nullptr, 180, nullptr, &whose);
+      if (!f.ok) break;
+      xs = f.x;
+    }
+    for (double gate : {1.5, 0.6}) {
+      FitR f = Fit(xs, S, Z, r, now, gate, nullptr);
+      if (!f.ok) break;
+      xs = f.x;
+    }
+    int sc = ThinnedScore(x_, now), sw = ThinnedScore(xs, now);
+    // the devices worn or held are the stronger evidence, and the mirror check goes by them: a switch against them
+    // would only be switched back
+    double dc, ds;
+    std::string how;
+    Id nw;
+    if (BodyFavours(x_, xs, dc, ds, how) == 1) {
+      say("body " + who, "channel check: " + told("look") + ", but " + how + ": kept as it is");
+    } else if (Apart(xs, x_, S) < 0.3) {
+      say("same " + who, "channel check: " + told("look") + ", but the rays fit no alignment that way: kept as it is");
+    } else if (!(sc > 0 && sw >= kSwapFit * sc)) {
+      say("kept " + who, "channel check: " + told("look") +
+                              Fmt(", but the rays fit that way worse (support %d vs %d): kept as it is", sw, sc));
+    } else if (identify(xs, nw) && nw.gain > kSwapGain) {
+      say("still " + who, "channel check: " + told("look") +
+                               ", but put that way they follow each other's rotors as well: kept as it is");
+    } else {
+      log_("channel check: " + told("were") + Fmt(": yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)", xs[0] * kDeg,
+                                                   xs[1], xs[2], xs[3], sw, sc));
+      Reset(xs);
+      has_acq_x_ = false;
+    }
+    return;
+  }
+  // the next best naming: one station at another's place, or two swapped
+  double alt = -kInf;
+  for (size_t n = 0; n < N; n++)
+    for (size_t i = 0; i < u.size(); i++) {
+      if (i == cur.at[n]) continue;
+      double g = cur.sc[n][i] - cur.sc[n][cur.at[n]];
+      for (size_t m = 0; m < N; m++)
+        if (cur.at[m] == i) g += cur.sc[m][cur.at[n]] - cur.sc[m][i];
+      alt = std::max(alt, g);
+    }
+  if (N >= 2 && alt < -kSwapGain) {
+    std::string who;
+    for (size_t n = 0; n < N; n++) who += (n == 0 ? "" : n + 1 == N ? " and " : ", ") + keys[u[cur.at[n]]];
+    say("ok " + who, Fmt("channel check: %s are %s (by %.2f)", who.c_str(),
+                         N == 2 ? "the right way round" : "all at their own places", -alt));
+  }
+}
+
+// SteamVR's map of its base stations against the cameras, with three or more (two are measured: Sync::PlaceStep). A
+// station in view of 200 short frames but seen at its place in under 2% of them, while two or more follow their own
+// rotors at theirs, is looked for among the bright sightings no station's place explains: where they cross (each one
+// votes for the cells it passes 0.6-7 m out, then the point nearest the rays about the best cell) and whose rotor
+// they follow. Its distances from the stations seen at their places, kMoved or more off SteamVR's: logged. Nothing
+// else changes
+void Solver::CheckLayout(const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z) {
+  constexpr double kVox = 0.10, kNear = 1.0, kPar = 10.0;
+  constexpr int kView = 200, kLight = 60;
+  double P = frame_p_;
+  if (!has_x_ || !(P > 0) || keys.size() < 3 || !in_image_) return;
+  std::vector<double> tau(keys.size(), 0.0);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (size_t k = 0; k < keys.size(); k++) {
+      auto it = ch_.find(keys[k]);
+      if (it != ch_.end()) tau[k] = RotorPeriod(it->second);
+    }
+  }
+  std::vector<size_t> u;  // the stations with a channel of their own
+  std::vector<double> tu;
+  for (size_t k = 0; k < keys.size(); k++)
+    if (tau[k] && std::count(tau.begin(), tau.end(), tau[k]) == 1) { u.push_back(k); tu.push_back(tau[k]); }
+  if (u.size() < 3) return;
   Rays r = Bright(GetRays(since_));
   std::vector<CamFrame> fr;
   {
@@ -1649,70 +1957,148 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
   }
   std::vector<V3> Pq, Zq;
   Predict(x_, S, Z, Pq, Zq);
-  std::vector<std::set<std::pair<int, double>>> saw(keys.size());  // (camera, frame) with a sighting within 1 deg
+  std::vector<int> at(r.size(), -1);  // the station whose place a sighting is within kNear deg of; -2: none within GATE
   for (size_t n = 0; n < r.size(); n++) {
     if (!std::isfinite(r.G[n])) continue;
     int k;
     double a;
     Nearest(Pq, Zq, r.O[n], r.D[n], k, a);
-    if (a < 1.0) saw[k].insert({r.C[n], r.G[n]});
+    if (a < kNear) at[n] = k;
+    else if (!(a < GATE)) at[n] = -2;
   }
-  std::vector<std::vector<InView>> in(keys.size());
-  for (auto &f : fr)
-    for (size_t k = 0; k < keys.size(); k++) {
-      V3 U = Pq[k] - f.o;
+  // the short frames a place was in view of (facing z, if given), and which of them saw it
+  auto view = [&](V3 q, const V3 *z, const std::set<std::pair<int, double>> &saw) {
+    std::vector<InView> v;
+    for (auto &f : fr) {
+      V3 U = q - f.o;
       double d = norm(U);
-      if (!(dot(U, Zq[k]) >= 0.2 * d) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
-      in[k].push_back({f.cam, f.g, saw[k].count({f.cam, f.g}) > 0});
+      if ((z && !(dot(U, *z) >= 0.2 * d)) || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
+      v.push_back({f.cam, f.g, saw.count({f.cam, f.g}) > 0});
     }
-  for (auto &v : in)
     std::sort(v.begin(), v.end(), [](const InView &a, const InView &b) { return a.cam != b.cam ? a.cam < b.cam : a.g < b.g; });
-  double worst = 0, best = 0;
-  size_t wa = 0, wb = 0, ba = 0, bb = 0;
-  for (size_t a = 0; a < keys.size(); a++)
-    for (size_t b = a + 1; b < keys.size(); b++) {
-      if (!tau[a] || !tau[b] || tau[a] == tau[b]) continue;
-      double aa, ab, bb_, ba_;
-      if (!SeenScores(in[a], tau[a], tau[b], P, aa, ab) || !SeenScores(in[b], tau[b], tau[a], P, bb_, ba_)) continue;
-      double gain = ab + ba_ - aa - bb_;
-      if (gain > worst) { worst = gain; wa = a; wb = b; }
-      if (gain < best) { best = gain; ba = a; bb = b; }
-    }
-  auto say = [&](const std::string &key, const std::string &s) {  // once per alignment
-    if (key == id_said_) return;
-    id_said_ = key;
-    log_(s);
+    return v;
   };
-  if (worst > kSwapGain) {
-    std::vector<V3> Q = Pq;
-    std::swap(Q[wa], Q[wb]);
-    X4 xs = YawFit(S, Q);
-    for (double gate : {1.5, 0.6}) {
-      FitR f = Fit(xs, S, Z, r, now, gate, nullptr);
-      if (!f.ok) break;
-      xs = f.x;
+  auto named = [&](const std::vector<double> &sc) {  // the rotor (of u) followed by kNamed over the others, or -1
+    int b = (int)(std::max_element(sc.begin(), sc.end()) - sc.begin());
+    double other = 0;
+    for (size_t i = 0; i < sc.size(); i++)
+      if ((int)i != b) other = std::max(other, sc[i]);
+    return sc[b] - other >= kNamed ? b : -1;
+  };
+  std::vector<std::set<std::pair<int, double>>> saw(keys.size());
+  for (size_t n = 0; n < r.size(); n++)
+    if (at[n] >= 0) saw[at[n]].insert({r.C[n], r.G[n]});
+  std::vector<size_t> ok, gone;  // of u: seen at their places, following their own rotors; in view there, unseen
+  for (size_t i = 0; i < u.size(); i++) {
+    std::vector<InView> v = view(Pq[u[i]], &Zq[u[i]], saw[u[i]]);
+    int seen = 0;
+    for (auto &e : v) seen += e.seen;
+    std::vector<double> sc;
+    if ((int)v.size() >= kView && seen * 50 <= (int)v.size()) gone.push_back(i);
+    else if (SeenScores(v, tu, P, sc) && named(sc) == (int)i) ok.push_back(i);
+  }
+  if (ok.size() < 2 || gone.empty()) return;
+  std::vector<size_t> fn, vn;  // the sightings no place explains; one of them per (head, direction) cell votes
+  {
+    std::unordered_map<CellKey, int, CellHash> cells;
+    for (size_t n = 0; n < r.size(); n++)
+      if (at[n] == -2) {
+        fn.push_back(n);
+        if (cells.emplace(KeyOf(r.O[n], r.D[n]), 0).second) vn.push_back(n);
+      }
+  }
+  if ((int)fn.size() < kLight) return;
+  auto off = [&](V3 q, size_t n) {  // deg
+    V3 w = q - r.O[n];
+    double d = norm(w);
+    return d > 0.4 ? std::acos(std::max(-1.0, std::min(1.0, dot(w, r.D[n]) / d))) * kDeg : kInf;
+  };
+  const int64_t kO = 1 << 20;  // cells: 21 bits a coordinate
+  std::vector<char> left(r.size(), 0);
+  for (size_t n : fn) left[n] = 1;
+  for (int it = 0; it < 6; it++) {
+    std::unordered_map<int64_t, int> vote;
+    for (size_t n : vn) {
+      if (!left[n]) continue;
+      int64_t last = -1;
+      for (double d = 0.6; d < 7.0; d += kVox / 2) {
+        V3 p = r.O[n] + r.D[n] * d;
+        int64_t c = ((int64_t)std::floor(p.x / kVox) + kO) << 42 | ((int64_t)std::floor(p.y / kVox) + kO) << 21 |
+                    ((int64_t)std::floor(p.z / kVox) + kO);
+        if (c != last) vote[c]++;
+        last = c;
+      }
     }
-    int cur = ThinnedScore(x_, now), sw = ThinnedScore(xs, now);
-    std::string pair = keys[wa] + " and " + keys[wb];
-    // the devices worn or held are the stronger evidence, and the mirror check goes by them: a switch against them
-    // would only be switched back
-    double dc, ds;
-    std::string how;
-    if (BodyFavours(x_, xs, dc, ds, how) == 1) {
-      say("body " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but %s: kept as it is",
-                              pair.c_str(), worst, how.c_str()));
-    } else if (cur > 0 && sw >= kSwapFit * cur) {
-      log_(Fmt("channel check: %s were the wrong way round (by %.2f): yaw %+.2f deg t [%.3f %.3f %.3f] support %d (was %d)",
-               pair.c_str(), worst, xs[0] * kDeg, xs[1], xs[2], xs[3], sw, cur));
-      Reset(xs);
-      has_acq_x_ = false;
-    } else {
-      say("kept " + pair, Fmt("channel check: %s look the wrong way round (by %.2f), but the rays fit that way worse "
-                              "(support %d vs %d): kept as it is", pair.c_str(), worst, sw, cur));
+    int64_t best = -1;
+    int bv = 0;
+    for (auto &kv : vote)
+      if (kv.second > bv || (kv.second == bv && kv.first < best)) { best = kv.first; bv = kv.second; }
+    if (bv < 10) break;
+    V3 q{((best >> 42) - kO + 0.5) * kVox, (((best >> 21) & 0x1FFFFF) - kO + 0.5) * kVox, ((best & 0x1FFFFF) - kO + 0.5) * kVox};
+    std::vector<size_t> near;
+    for (int rep = 0; rep < 6; rep++) {
+      near.clear();
+      for (size_t n : fn)
+        if (left[n] && off(q, n) < (rep < 3 ? 2.0 : 0.7)) near.push_back(n);
+      if (near.size() < 10) break;
+      M3 A;
+      A.m[0][0] = A.m[1][1] = A.m[2][2] = 0;
+      double bq[3] = {0, 0, 0};
+      for (size_t n : near) {
+        double dv[3] = {r.D[n].x, r.D[n].y, r.D[n].z}, ov[3] = {r.O[n].x, r.O[n].y, r.O[n].z};
+        for (int i = 0; i < 3; i++)
+          for (int j = 0; j < 3; j++) {
+            double pij = (i == j ? 1 : 0) - dv[i] * dv[j];
+            A.m[i][j] += pij;
+            bq[i] += pij * ov[j];
+          }
+      }
+      M3 Ai;
+      if (!Inv3(A, Ai)) { near.clear(); break; }
+      q = Ai * V3{bq[0], bq[1], bq[2]};
     }
-  } else if (best < -kSwapGain) {
-    say("ok " + keys[ba] + keys[bb], Fmt("channel check: %s are the right way round (by %.2f)",
-                                         (keys[ba] + " and " + keys[bb]).c_str(), -best));
+    for (size_t n : fn)
+      if (left[n] && off(q, n) < 2.0) left[n] = 0;
+    if ((int)near.size() < kLight) continue;
+    // seen from directions kPar apart or more: its depth is known
+    V3 m{};
+    std::vector<V3> w;
+    for (size_t n : near) {
+      V3 e = r.O[n] - q;
+      w.push_back(e * (1 / norm(e)));
+      m += w.back();
+    }
+    m = m * (1 / norm(m));
+    std::vector<double> pa;
+    for (auto &e : w) pa.push_back(std::acos(std::max(-1.0, std::min(1.0, dot(e, m)))) * kDeg);
+    std::sort(pa.begin(), pa.end());
+    double par = pa[pa.size() * 9 / 10];
+    std::set<std::pair<int, double>> sq;
+    for (size_t n : fn)
+      if (off(q, n) < kNear) sq.insert({r.C[n], r.G[n]});
+    std::vector<double> sc;
+    bool scored = SeenScores(view(q, nullptr, sq), tu, P, sc);
+    int i = scored ? named(sc) : -1;
+    if (i < 0 || par < kPar || std::find(gone.begin(), gone.end(), (size_t)i) == gone.end()) continue;
+    size_t k = u[i];
+    double worst = 0, moved = norm(q - Pq[k]);
+    std::string js, ds, dc;
+    for (size_t j = 0; j < ok.size(); j++) {
+      size_t kj = u[ok[j]];
+      double a = norm(S[k] - S[kj]), b = norm(q - Pq[kj]);
+      worst = std::max(worst, std::fabs(b - a));
+      const char *sep = j == 0 ? "" : j + 1 == ok.size() ? " and " : ", ";
+      js += sep + keys[kj];
+      ds += sep + Fmt("%.2f", a);
+      dc += sep + Fmt("%.2f", b);
+    }
+    if (worst < kMoved) continue;
+    auto said = layout_said_.find(keys[k]);
+    if (said != layout_said_.end() && std::fabs(said->second - moved) < kMoved) continue;
+    layout_said_[keys[k]] = moved;
+    log_("base station layout: SteamVR has " + keys[k] + " " + ds + " m from " + js + "; the cameras see it " + dc +
+         " m from them" + Fmt(" (%.2f m from where SteamVR has it)", moved) +
+         ": SteamVR's map of its base stations is off");
   }
 }
 
@@ -1782,6 +2168,10 @@ StepStat Solver::Step(double /*now*/) {
   if (has_x_ && now - last_id_ >= kIdEvery) {
     last_id_ = now;
     CheckIdentity(now, keys, S, Z);
+  }
+  if (has_x_ && now - last_layout_ >= kLayoutEvery) {
+    last_layout_ = now;
+    CheckLayout(keys, S, Z);
   }
   bool locked = false;
   if (has_x_ && st.has_per) {
@@ -2237,7 +2627,12 @@ Sync::Sync(SyncConfig cfg, LogFn log)
              frame_.layout() ? Fmt(", the fit of %d stations", (int)sfile_.ref.size()).c_str() : ""));
   else
     log_("no stations.json yet: the reference frame is set the first time base stations show up");
-  LoadState();
+  if (cfg_.per_headset) {
+    seeded_ = true;  // this headset's state.json is read once it's known (ApplyHeadset)
+  } else {
+    state_path_ = Join(cfg_.dir, "state.json");
+    LoadState();
+  }
   // a place kept by earlier sessions holds a little looser in this one: what this one sees can still move it
   for (auto &kv : sfile_.place) {
     StationsFile::Place p = kv.second;
@@ -2250,10 +2645,18 @@ Sync::Sync(SyncConfig cfg, LogFn log)
 Sync::~Sync() {}
 
 void Sync::LoadState() {
+  quest_.clear();
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    timings_.clear();
+  }
+  saved_cs_.clear();
+  saved_timings_.clear();
+  has_saved_ = false;
   seeded_ = true;
   std::string text;
   JVal d;
-  if (!ReadFile(Join(cfg_.dir, "state.json"), text) || !JParse(text, d)) return;
+  if (state_path_.empty() || !ReadFile(state_path_, text) || !JParse(text, d)) return;
   if (const JVal *q = d.get("quest_stations"))
     for (auto &kv : q->o) {
       auto v = kv.second.nums();
@@ -2261,14 +2664,17 @@ void Sync::LoadState() {
     }
   // timings checked as Timing::Estimate does since 1.13 ("timing", before, could be a camera's error or noise: one sat
   // at -6.2 ms for a Frame and kept it from ever finding the base stations)
-  if (const JVal *t = d.get("pose_timing"))
+  if (const JVal *t = d.get("pose_timing")) {
+    std::lock_guard<std::mutex> g(st_m_);
     for (auto &kv : t->o)
       if (kv.second.t == JVal::Num) timings_[kv.first] = kv.second.n;
+  }
   seeded_ = quest_.empty();
 }
 
-void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs) {
-  bool moved = !has_saved_ || std::fabs(x[0] - saved_x_[0]) * kDeg > 0.01 || cs.size() != saved_cs_.size() ||
+void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs, bool force) {
+  if (state_path_.empty()) return;  // the headset isn't known yet
+  bool moved = force || !has_saved_ || std::fabs(x[0] - saved_x_[0]) * kDeg > 0.01 || cs.size() != saved_cs_.size() ||
                timings_.size() != saved_timings_.size();
   for (int i = 1; i < 4; i++) moved = moved || std::fabs(x[i] - saved_x_[i]) > 0.001;
   for (auto &kv : cs) {
@@ -2292,11 +2698,11 @@ void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs) {
     s += Fmt("%s\n  \"%s\": [%.5f, %.5f, %.5f]", first ? "" : ",", kv.first.c_str(), q.x, q.y, q.z);
     first = false;
   }
-  s += Fmt("\n },\n \"x\": [%.9f, %.9f, %.9f, %.9f],\n \"pose_timing\": {", x[0], x[1], x[2], x[3]);
+  s += Fmt("%s},\n \"x\": [%.9f, %.9f, %.9f, %.9f],\n \"pose_timing\": {", cs.empty() ? "" : "\n ", x[0], x[1], x[2], x[3]);
   first = true;
   for (auto &kv : timings_) { s += Fmt("%s\n  \"%s\": %.5f", first ? "" : ",", kv.first.c_str(), kv.second); first = false; }
-  s += Fmt("\n },\n \"saved\": \"%s\"\n}\n", Now().c_str());
-  WriteFileAtomic(Join(cfg_.dir, "state.json"), s);
+  s += Fmt("%s},\n \"saved\": \"%s\"\n}\n", timings_.empty() ? "" : "\n ", Now().c_str());
+  WriteFileAtomic(state_path_, s);
 }
 
 // 4-DOF fit raw -> Quest from the stations both know
@@ -2318,6 +2724,8 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   std::lock_guard<std::mutex> g(net_);
   if (!optics_.Load(json, err)) return false;
   have_optics_ = true;
+  std::string left_out = optics_.Unused();
+  if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
   // a Quest's frame period is one of two, the Frame's is learned from its frames
   grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
   grid_ = FrameGrid(grid_quest_);
@@ -2343,6 +2751,116 @@ void Sync::SetStreamer(const std::string &system) {
     timing_learned_ = true;
     log_(Fmt("timing for %s: %.1f ms (learned before)", system.c_str(), it->second * 1000));
   }
+}
+
+// "Steam-Frame-1a2b3c4d": the model for the eye, a hash of the serial to tell two of a kind apart
+void Sync::SetHeadset(const std::string &serial, const std::string &model) {
+  std::string name;
+  for (char c : model.substr(0, 32)) {
+    if (std::isalnum((unsigned char)c)) name += c;
+    else if (!name.empty() && name.back() != '-') name += '-';
+  }
+  while (!name.empty() && name.back() == '-') name.pop_back();
+  if (name.empty()) name = "headset";
+  uint32_t h = 2166136261u;  // FNV-1a
+  for (unsigned char c : serial) { h ^= c; h *= 16777619u; }
+  std::string key = serial.empty() || serial == "unknown" ? name : Fmt("%s-%08x", name.c_str(), h);
+  std::lock_guard<std::mutex> g(hs_m_);
+  hs_pending_ = key;
+  hs_new_ = true;
+}
+
+// A headset other than the one before has its own state.json (headsets/<key>/): what the last one's cameras saw says
+// nothing of this one's tracking space, or of how its streamer times its poses. The single state.json of earlier
+// versions goes to the first headset that connects.
+void Sync::ApplyHeadset() {
+  if (!hs_new_.exchange(false)) return;
+  std::string key;
+  {
+    std::lock_guard<std::mutex> g(hs_m_);
+    key = hs_pending_;
+  }
+  if (key == hs_key_) return;  // the same headset again: it reconnected
+  namespace fs = std::filesystem;
+  const bool first = hs_key_.empty();
+  hs_key_ = key;
+  std::error_code ec;
+  fs::path dir = fs::path(cfg_.dir) / "headsets" / key, legacy = fs::path(cfg_.dir) / "state.json";
+  fs::create_directories(dir, ec);
+  const std::string path = (dir / "state.json").string();
+  bool adopted = false;
+  if (first && !fs::exists(path, ec) && fs::exists(legacy, ec)) {
+    fs::rename(legacy, path, ec);
+    adopted = !ec;
+  }
+  state_path_ = path;
+  LoadState();
+  if (!first) ClearAlignment();  // the last headset's sightings and fit mean nothing to this one
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    ApplyTiming();
+  }
+  log_(Fmt("state for %s: headsets\\%s\\state.json%s", key.c_str(), key.c_str(),
+           adopted ? " (the state.json of earlier versions, moved there)"
+                   : quest_.empty() ? " (nothing saved yet)" : Fmt(" (%d base stations saved)", (int)quest_.size()).c_str()));
+}
+
+// expo_ for the current streamer from timings_ (st_m_ held); the default when it has none
+void Sync::ApplyTiming() {
+  auto it = timings_.find(streamer_);
+  if (!streamer_.empty() && it != timings_.end() && cfg_.learn_timing) {
+    expo_ = it->second;
+    timing_learned_ = true;
+    log_(Fmt("timing for %s: %.1f ms (learned before)", streamer_.c_str(), it->second * 1000));
+  } else {
+    expo_ = cfg_.arrival_clock ? kExpoArrival : kExpoDefault;
+    timing_learned_ = false;
+  }
+}
+
+// the sightings, the fit and what hung on them: gone, the lighthouse devices uncorrected until the next acquisition
+void Sync::ClearAlignment() {
+  solver_.Clear();
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    last_st_ = StepStat();
+    has_last_st_ = false;
+  }
+  have_applied_ = false;
+  applied_ = X4{};
+  lock_time_ = -1;
+  resets_seen_ = solver_.resets();
+  sum_t_ = -1;
+  sum_n_ = 0;
+}
+
+void Sync::ForceRecalibrate() {
+  ClearAlignment();
+  quest_.clear();
+  seeded_ = true;
+  {
+    std::lock_guard<std::mutex> g(st_m_);
+    timings_.clear();
+    ApplyTiming();
+  }
+  // an automatic reference frame is pinned again from SteamVR's stations as they are now (and its level found again);
+  // a measured one is the user's own and stays
+  if (sfile_.autogen || !sfile_.loaded) {
+    for (auto &kv : sfile_.place) solver_.DropFix(kv.first);
+    sfile_ = StationsFile();
+    frame_.Reset();
+    std::remove(Join(cfg_.dir, "stations.json").c_str());
+    place_prior_.clear();
+    place_sess_.clear();
+    place_off_.clear();
+    left_seen_.clear();
+    left_since_ = 0;
+    bad_since_ = tilt_since_ = -1;
+    place_saved_ = -1e18;
+  }
+  SaveState(X4{}, {}, true);  // the saved alignment goes too, or a restart would seed from it
+  Rec(last_step_, "I recalibrate");
+  log_("force recalibrate: everything learned about the alignment is dropped, starting over");
 }
 
 void Sync::OnHmdPose(double t, const Quat &q, V3 p) {
@@ -2462,8 +2980,9 @@ void Sync::OnLine(double pc, const char *line) {
   long long tus;
   int mean, off = 0;
   if (sscanf(line, "F %d %u %lld %d %d%n", &cam, &k, &tus, &mean, &nb, &off) < 5) return;
-  nframes_++;
   std::lock_guard<std::mutex> g(net_);
+  if (have_optics_ && !optics_.Used(cam)) return;  // a camera that can't see the base stations: not worth a frame grid
+  nframes_++;
   double hs = tus / 1e6;
   if (cfg_.arrival_clock) clock_.AddArrival(pc, hs);
   double lag = 0;
@@ -2537,10 +3056,9 @@ void Sync::Use(const Shot &f) {
     prev = big;
   }
   if (still) { spots_.still += nb; return; }
-  double wmax = (cfg_.learn_timing && !timing_learned_ && !optics_.exact_time()) ? kWmaxUntimed : kWmax;
   M3 Rc;
   V3 tc;
-  if (have_lag && w <= wmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
+  if (have_lag && w <= kWmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
   for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
     if (npx > kMaxPx) { spots_.big++; continue; }
@@ -2552,7 +3070,7 @@ void Sync::Use(const Shot &f) {
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
               D.y, D.z, p.x, p.y, p.z, w, b.peak);
     }
-    if (w > wmax) { spots_.fast++; continue; }
+    if (w > kWmax) { spots_.fast++; continue; }
     bool bright = b.peak >= kBright;
     solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
     if (bright || solver_.starved()) spots_.used++;
@@ -2638,40 +3156,48 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
            "%.2f deg", step, RotDeg(L), lv.stations, lv.med));
 }
 
-// An automatic frame takes its stations' poses in it once three show up (Frame::Layout follows them from then on), adds
-// new ones as they come, and moves a station's place when the fit has left it out for kLayoutMoved s (it was moved).
-// When no fit gets within kMoved for kLayoutMoved s, more than one was moved: the frame starts over from SteamVR's.
+// An automatic frame takes its stations' poses in it once three show up (Frame::Layout follows them from then on) and
+// adds new ones as they come. A known station's place is never retaken from a fit of the others: SteamVR re-solves
+// them tens of cm off at times, and that bent the layout for good. The frame starts over from SteamVR's (its level
+// found again) when for kLayoutMoved s the fit leaves a station out, no fit gets within kMoved, or the fit tilts the
+// frame over kMaxRot off level.
 void Sync::LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
   if (!sfile_.autogen || frame_.ok() != 1) return;
   bool was = frame_.layout();
   if (!was && raw.size() < 3) return;
   if (!was || frame_.miss() <= kMoved) bad_since_ = -1;
   else if (bad_since_ < 0) bad_since_ = now;
-  if (bad_since_ >= 0 && now - bad_since_ >= kLayoutMoved && raw.size() >= 3) {
+  double tilt = TiltDeg(frame_.Anchored());
+  if (!was || tilt <= kMaxRot) tilt_since_ = -1;
+  else if (tilt_since_ < 0) tilt_since_ = now;
+  std::string left = frame_.left();
+  if (left != left_seen_) { left_seen_ = left; left_since_ = now; }
+  std::string why;
+  if (bad_since_ >= 0 && now - bad_since_ >= kLayoutMoved)
+    why = Fmt("base stations moved (%.0f cm off the fit)", frame_.miss() * 100);
+  else if (was && !left.empty() && now - left_since_ >= kLayoutMoved)
+    why = "base station " + left + " moved";
+  else if (tilt_since_ >= 0 && now - tilt_since_ >= kLayoutMoved)
+    why = Fmt("the base stations' fit tilts it %.1f deg off SteamVR's level", tilt);
+  if (!why.empty() && raw.size() >= 3) {
     sfile_.ref.clear();
     sfile_.ref.insert(raw.begin(), raw.end());
     sfile_.level = M3();  // SteamVR's frame as it is now: its level is found again
     sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
-    bad_since_ = -1;
-    log_(Fmt("lighthouse frame: base stations moved (%.0f cm off the fit): reference frame reset",
-             frame_.miss() * 100));
+    bad_since_ = tilt_since_ = -1;
+    left_since_ = now;
+    log_("lighthouse frame: " + why + ": reference frame reset");
     frame_.Update(raw);
     return;
   }
-  std::string left = frame_.left();
-  if (left != left_seen_) { left_seen_ = left; left_since_ = now; }
   int n = 0;
   for (auto &kv : raw) {
-    bool known = sfile_.ref.count(kv.first) > 0;
-    bool moved = known && kv.first == left && now - left_since_ >= kLayoutMoved;
-    if (known && !moved) continue;
+    if (sfile_.ref.count(kv.first)) continue;
     V3 p; M3 R;
     frame_.Unlevelled(kv.second.first, kv.second.second, p, R);
     sfile_.ref[kv.first] = {p, R};
     n++;
-    if (was)
-      log_(Fmt("lighthouse frame: base station %s %s", kv.first.c_str(),
-               moved ? "was moved: its new place taken" : "added to the fit"));
+    if (was) log_(Fmt("lighthouse frame: base station %s added to the fit", kv.first.c_str()));
   }
   if (!n) return;
   if (!was) log_(Fmt("lighthouse frame: follows the fit of %d base stations from now on", n));
@@ -2793,7 +3319,7 @@ void Sync::LevelCheck(double now) {
 }
 
 // two stations have 10 sightings that fit
-static bool Locked(bool has_x, const StepStat &st) {
+static bool TwoFit(bool has_x, const StepStat &st) {
   if (!has_x || !st.has_per) return false;
   std::vector<int> c;
   for (auto &kv : st.per) c.push_back(kv.second);
@@ -2802,11 +3328,14 @@ static bool Locked(bool has_x, const StepStat &st) {
 }
 
 Transform Sync::Tick(double now) {
+  ApplyHeadset();
   if (now - last_step_ >= 1.0) {
     last_step_ = now;
+    bool broke = false;
     int b = poses_.brk_id();
     if (b != brk_seen_) {
       brk_seen_ = b;
+      broke = true;
       solver_.PoseBreak(poses_.brk_t());
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
     }
@@ -2907,14 +3436,23 @@ Transform Sync::Tick(double now) {
       }
     }
     StepStat st = solver_.Step(now);
-    if (solver_.resets() != resets_seen_) { resets_seen_ = solver_.resets(); lock_time_ = now; }
+    bool reset = solver_.resets() != resets_seen_;
+    if (reset) { resets_seen_ = solver_.resets(); lock_time_ = now; }
+    // locked: two stations have 10 sightings that fit. It holds while one still has: a station out of view for WIN
+    // is no misfit. A pose break, a jump in the Quest's tracking or a new fit ends it
+    {
+      int best = 0;
+      for (auto &kv : st.per) best = std::max(best, kv.second);
+      locked_ = TwoFit(solver_.has_x(), st) ||
+                (locked_ && !broke && !reset && !st.jump && solver_.has_x() && st.has_per && best >= 10);
+    }
     {
       std::lock_guard<std::mutex> g(st_m_);
       last_st_ = st;
       has_last_st_ = true;
     }
     // not acquired: what became of the cameras' bright spots, after a minute and then every 5
-    if (Locked(solver_.has_x(), st)) sum_t_ = -1;
+    if (locked_) sum_t_ = -1;
     else {
       Spots sp = spots();
       if (sum_t_ < 0) { sum_t_ = now; sum_sp_ = sp; sum_n_ = 0; }
@@ -2932,7 +3470,7 @@ Transform Sync::Tick(double now) {
           solver_.has_x() ? Fmt("%+.4f %.4f %.4f %.4f", x[0] * kDeg, x[1], x[2], x[3]).c_str() : "-", st.n,
           st.has_med ? Fmt("%.4f", st.med).c_str() : "None", per.c_str(), st.cond ? " cond" : "", st.jump ? " JUMP" : "");
     }
-    if (Locked(solver_.has_x(), st) && st.cond && st.has_med && st.med < 0.3 && now - last_save_ > 10) {
+    if (TwoFit(solver_.has_x(), st) && st.cond && st.has_med && st.med < 0.3 && now - last_save_ > 10) {
       last_save_ = now;
       SaveState(x, cs);
     }
@@ -2975,7 +3513,10 @@ Transform Sync::Tick(double now) {
           std::lock_guard<std::mutex> g(st_m_);
           sys = streamer_;
         }
-        if (!sys.empty()) timings_[sys] = e;
+        if (!sys.empty()) {
+          std::lock_guard<std::mutex> g(st_m_);
+          timings_[sys] = e;
+        }
         if (first || std::fabs(best - cur) > 0.002)
           log_(Fmt("timing%s%s: %.1f ms (best fit %.1f ms within %.1f, on %d fast-head sightings: %.1f turning left, "
                    "%.1f right)", sys.empty() ? "" : " for ", sys.c_str(), e * 1000, best * 1000, sp.ci * 1000, n,
@@ -2988,11 +3529,11 @@ Transform Sync::Tick(double now) {
       last_level_ = now;
       LevelStep(raw, now);
     }
-    if (now - last_place_ >= kPlaceEvery && Locked(solver_.has_x(), st) && st.cond) {
+    if (now - last_place_ >= kPlaceEvery && TwoFit(solver_.has_x(), st) && st.cond) {
       last_place_ = now;
       PlaceStep(raw, now);
     }
-    if (now - last_check_ >= 60 && Locked(solver_.has_x(), st) && st.cond) {
+    if (now - last_check_ >= 60 && TwoFit(solver_.has_x(), st) && st.cond) {
       last_check_ = now;
       LevelCheck(now);
     }
@@ -3082,7 +3623,7 @@ Sync::Status Sync::GetStatus(double now) {
   s.cond = st.cond;
   s.n = st.n;
   s.med = st.has_med ? st.med : -1;
-  s.locked = Locked(s.has_x, st);
+  s.locked = s.has_x && locked_;
   s.locked_for = lock_time_ >= 0 ? now - lock_time_ : -1;
   if (s.has_x && have_applied_) {
     V3 h{0, 1.5, 0};
