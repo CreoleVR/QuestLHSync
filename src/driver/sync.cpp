@@ -105,7 +105,10 @@ bool Optics::Load(const std::string &json, std::string *err) {
   if (!JParse(json, root)) { if (err) *err = "calibration isn't JSON"; return false; }
   const JVal *kind = root.get("kind");
   if (kind && kind->t == JVal::Str && kind->s == "steam_frame") return LoadFrame(root, err);
-  const JVal *cams = root.get("CameraCalibration");
+  // A separate root key makes older PC drivers reject Galaxy XR profiles
+  // instead of silently interpreting [fx,fy,cx,cy] as Meta's [f,cx,cy].
+  bool gxr = kind && kind->t == JVal::Str && kind->s == "galaxy_xr";
+  const JVal *cams = root.get(gxr ? "GxrCameraCalibration" : "CameraCalibration");
   if (!cams || cams->t != JVal::Arr) { if (err) *err = "no CameraCalibration"; return false; }
   CamCal out[kMaxCam];
   int n = 0;
@@ -128,6 +131,17 @@ bool Optics::Load(const std::string &json, std::string *err) {
       for (int q = 0; q < 3; q++) k.R.m[r][q] = T[r * 4 + q];
     k.t = {T[3], T[7], T[11]};
     k.f = k.fy = pc[0]; k.cx = pc[1]; k.cy = pc[2];
+    // Measured Galaxy XR intrinsics retain separate horizontal/vertical focal
+    // lengths. Keep Meta's existing three-coefficient Pinhole layout unchanged.
+    const JVal *projection_model = proj->get("Model");
+    if (projection_model && projection_model->t == JVal::Str && projection_model->s == "PinholeXY") {
+      if (pc.size() != 4 || !std::isfinite(pc[0]) || !std::isfinite(pc[1]) ||
+          !std::isfinite(pc[2]) || !std::isfinite(pc[3]) || pc[0] <= 0 || pc[1] <= 0) {
+        if (err) *err = "PinholeXY requires finite [fx, fy, cx, cy] with positive focal lengths";
+        return false;
+      }
+      k.f = pc[0]; k.fy = pc[1]; k.cx = pc[2]; k.cy = pc[3];
+    }
     for (int j = 0; j < 6; j++) k.k[j] = dc[j];
     k.p[0] = dc[6]; k.p[1] = dc[7];
     k.ir = sensor && sensor->t == JVal::Str && sensor->s == "OV7251" ? kIR : 1.0;
