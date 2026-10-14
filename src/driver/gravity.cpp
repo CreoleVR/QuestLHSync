@@ -311,13 +311,12 @@ bool Gravity::FindPath(const std::string &receiver, std::string &path) {
     if (usb.empty()) continue;
     std::ifstream sf(usb + "/serial");
     std::string ser;
-    if (sf && (sf >> ser) && ser == receiver) found = base + "/dev";  // the devnode is recorded in "dev"
+    if (sf && (sf >> ser) && ser == receiver) found = base;  // the entry's name is the devnode's
   }
   closedir(d);
   if (found.empty()) return false;
-  // /sys/.../dev says "major:minor": the devnode is /dev/hidrawN, matching this entry's name
-  path = "/dev/" + std::string(found.substr(found.rfind('/') + 1));  // .../hidrawN/dev -> /dev/hidrawN
-  path.resize(path.size() - 2);  // drop the trailing "dev"
+  // the entry's name is the devnode's: hidraw3 -> /dev/hidraw3
+  path = "/dev/" + found.substr(found.rfind('/') + 1);
   struct stat st;
   if (stat(path.c_str(), &st) != 0) return false;
   return true;

@@ -268,11 +268,14 @@ static void UnhookHost() {
 // On Linux there's no MinHook: the interface object's vtable entry for TrackedDevicePoseUpdated (slot 1) is patched
 // to the detour, with the original kept. Every driver's calls through that interface object go through us, exactly
 // what MinHook achieved. The page holding the vtable is made writable for the patch (mprotect, and back).
+//
+// I exists to give the two hooked interfaces separate state, as the Windows Detour<I> has. self records the
+// interface object the vtable belongs to; nothing reads it, the detour gets it as its argument.
 template <int I>
 struct VtHook {
   static PoseFn orig;             // the function the vtable held
   static void **slot;             // &vtable[1], our patch's place
-  static void *self;              // the interface object the vtable belongs to (the one hooked)
+  static void *self;              // the interface object the vtable belongs to
 
   static void Detour(void *self_, uint32_t id, const vr::DriverPose_t &pose, uint32_t size) {
     if (size == sizeof(vr::DriverPose_t)) {
@@ -343,7 +346,7 @@ static void UnhookHost() {
 
 // ---------------------------------------------------------------- status shared memory
 #ifdef _WIN32
-static HANDLE g_map_file;  // CreateFileMappingW's, kept so the mapping could be closed (it isn't: see Cleanup)
+static HANDLE g_map_file;  // CreateFileMappingW's, kept so the file mapping (and with it the view) stays alive
 static void *MakeShm() {
   HANDLE map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(QlhsStatus), QLHS_SHM_NAME);
   if (!map) return nullptr;
@@ -353,8 +356,8 @@ static void *MakeShm() {
   return p;
 }
 #else
-// a shared memory object in /dev/shm, the status published in it for a dashboard (a Windows GDI app; a Linux one
-// would read the same memory)
+// a shared memory object in /dev/shm, the status published in it for the dashboard (Windows reads it through a named
+// file mapping, a Linux dashboard would open this same object)
 static void *MakeShm() {
   int fd = shm_open("/qlhs-status", O_CREAT | O_RDWR | O_TRUNC, 0666);
   if (fd < 0) return nullptr;
@@ -447,8 +450,9 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     HookHost("IVRServerDriverHost_006", 0, (void *)&Detour<0>);
     HookHost("IVRServerDriverHost_005", 1, (void *)&Detour<1>);
 #else
-    HookHost("IVRServerDriverHost_006", 0, nullptr);  // the detour arg is Windows-only (MinHook); the vtable
-    HookHost("IVRServerDriverHost_005", 1, nullptr);  // patch knows its own detour per VtHook<I>
+    // the detour arg is Windows-only (MinHook); the vtable patch knows its own detour per VtHook<I>
+    HookHost("IVRServerDriverHost_006", 0, nullptr);
+    HookHost("IVRServerDriverHost_005", 1, nullptr);
 #endif
     rel_done_ = !steady_ || g_rel->Hook();  // the lighthouse driver loads first; if not, the worker retries
     link_->Start();

@@ -11,7 +11,7 @@ OUT=driver/questlhsync/bin/linux64
 
 mkdir -p "$OUT"
 # The driver's only entry is HmdDriverFactory (visibility default). No openvr_api link: the driver side is
-# header-only through VRDriverContext. -pthread for the worker, reader and connection threads; -ldl for dlopen
-# (openvr's IVRDriverContext); rt not needed (clock_gettime is in libc).
+# header-only through VRDriverContext. -pthread for the worker, reader and connection threads (glibc keeps libdl
+# and librt in libc these days, so nothing else is needed).
 $CXX $FLAGS -shared -pthread -o "$OUT/driver_questlhsync.so" $SOURCES
 echo "built $OUT/driver_questlhsync.so"

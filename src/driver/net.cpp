@@ -211,7 +211,7 @@ static std::vector<sockaddr_in> Broadcasts() {
   for (auto *a = ifs; a; a = a->ifa_next) {
     if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
     if (!(a->ifa_flags & IFF_UP) || (a->ifa_flags & IFF_LOOPBACK)) continue;
-    // a /31 or narrower (prefix 31 or more) has no usable broadcast: the code skips those on Windows too
+    // a /31 or narrower (prefix 31 or more) has no broadcast address: the code skips those on Windows too
     uint32_t mask = 0, prefix = 0;
     if (a->ifa_netmask) {
       memcpy(&mask, &((sockaddr_in *)a->ifa_netmask)->sin_addr, 4);
