@@ -481,6 +481,8 @@ bool HeadsetLink::Session(const Found &f) {
             }
             wrong = true;
             ok = false;
+          } else {
+            sync_->SetHeadset(serial(), model());  // its own state.json from here on
           }
           break;
         }

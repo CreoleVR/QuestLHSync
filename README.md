@@ -79,7 +79,8 @@ Start SteamVR as usual. QuestLHSync finds the headset by itself. Its page is in
 the SteamVR dashboard, with a copy on the desktop.
 
 The first time, look around so the cameras catch both base stations (the
-Frame's upper cameras see most of them). It locks within about half a minute,
+Frame uses only its two upper cameras: the lower pair looks at the floor, not
+at the base stations). It locks within about half a minute,
 and after that starts from the saved alignment. Wear a tracker or hold a
 controller meanwhile: when two base stations could be either way round, the
 devices you wear or hold decide.
@@ -94,6 +95,20 @@ controllers' and trackers' accelerometers level it as they move about.
 
 - **Pause corrections** holds lighthouse devices where they are.
 - **Record session** saves what the driver receives to a file, for bug reports.
+- **Force recalibrate** drops everything learned about the alignment and starts
+  over, for when it sits stuck on a wrong fit. It clears the sightings, the fit,
+  the headset's saved alignment and pose timing, and an automatic reference frame
+  (`stations.json`: pinned again from SteamVR's base stations, its level found
+  again). Lighthouse devices go back to SteamVR's own places until the cameras
+  have found the base stations again. A reference frame you measured yourself
+  stays.
+
+What a headset's cameras have seen is kept per headset, in
+`%LOCALAPPDATA%\QuestLHSync\headsets\<model>-<id>\state.json` (the id is a hash
+of its serial number), so switching between headsets doesn't seed one with the
+other's alignment or pose timing. The `state.json` of earlier versions moves to
+the first headset that connects. `stations.json`, the reference frame of your
+base stations, is shared by all headsets.
 
 ## Settings
 

@@ -129,6 +129,9 @@ enum Kind { kUnknown = 0, kLighthouse = 1, kOther = 2, kHmd = 3 };
 static std::atomic<int> g_kind[vr::k_unMaxTrackedDeviceCount];
 static std::atomic<int> g_hmd{-1};             // the eligible HMD's index
 static std::atomic<bool> g_off{false};         // a wired headset: poses pass untouched
+static std::atomic<bool> g_hide{false};        // the headset is about to place the lighthouse devices
+static std::atomic<double> g_unplaced{0};      // when a controller or tracker first came while not placed (0: none)
+constexpr double kHideFor = 20;                // s from then, at most
 struct StationPose {
   char serial[32];
   int cls;
@@ -207,7 +210,17 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
     }
   }
   Xf x;
-  if (!ReadXf(x)) return false;
+  if (!ReadXf(x)) {
+    // not placed yet while the headset's cameras are about to: hidden, rather than shown metres away in SteamVR's own
+    // lighthouse universe and then snapped into place
+    if (d.cls == vr::TrackedDeviceClass_TrackingReference || !g_hide.load(std::memory_order_relaxed)) return false;
+    double now = QpcNow(), since = g_unplaced.load(std::memory_order_relaxed);
+    if (since == 0) g_unplaced.compare_exchange_strong(since, now);
+    else if (now - since > kHideFor) return false;
+    p.poseIsValid = false;
+    p.result = vr::TrackingResult_Running_OutOfRange;
+    return true;
+  }
   vr::HmdQuaternion_t xq{x.q.w, x.q.x, x.q.y, x.q.z};
   double wt[3];
   Rotate(xq, p.vecWorldFromDriverTranslation, wt);
@@ -436,6 +449,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
 #endif
     SyncConfig cfg;
     cfg.dir = dir_;
+    cfg.per_headset = true;
     g_sync = std::make_unique<Sync>(cfg, [](const std::string &s) { Log(s); });
     g_gravity = std::make_unique<Gravity>(dir_, [](const std::string &s) { Log(s); });
     g_gravity->SetRecord([](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
@@ -734,6 +748,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       case QLHS_CMD_RESUME: g_sync->SetPaused(false); Log("corrections resumed"); break;
       case QLHS_CMD_RECORD_ON: SetRecording(true); break;
       case QLHS_CMD_RECORD_OFF: SetRecording(false); break;
+      case QLHS_CMD_RECALIBRATE: g_sync->ForceRecalibrate(); break;
     }
   }
 
@@ -831,6 +846,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       double now = QpcNow();
       if (wired_) {  // only the status goes on, which closes a dashboard already open
         if (!stood_down_) StandDown();
+      g_hide.store(false);
         if (now - last_status_ >= 0.25) { last_status_ = now; Publish(now); }
         Sleep(50);
         continue;
@@ -838,7 +854,10 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       link_->SetWanted(g_hmd.load() >= 0);
       Stations();
       Commands();
-      WriteXf(g_sync->Tick(now));
+      Transform xf = g_sync->Tick(now);
+      WriteXf(xf);
+      g_hide.store(!xf.active && link_->state() == HeadsetLink::kConnected);
+      if (xf.active) g_unplaced.store(0);
       if (now - last_gravity_ >= 1) {
         last_gravity_ = now;
         Gravity::Ref ref;
