@@ -1367,13 +1367,14 @@ void Solver::BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, co
   }
 }
 
-bool Solver::Starved(const Rays &r) {
+bool Solver::Starved(const Rays &r) const {
+  if (dim_dots_) return !r.B.empty();
   size_t nb = 0;
   for (char b : r.B) nb += b != 0;
   return !r.B.empty() && r.size() >= 200 && nb * 20 < r.size();
 }
 
-Solver::Rays Solver::Bright(const Rays &r) {
+Solver::Rays Solver::Bright(const Rays &r) const {
   size_t nb = 0;
   for (char b : r.B) nb += b != 0;
   if (r.B.empty() || nb == r.size() || Starved(r)) return r;
@@ -2716,6 +2717,7 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
   // a Quest's frame period is one of two, the Frame's is learned from its frames
   grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
+  solver_.SetDimDots(optics_.exact_time());  // the Steam Frame (Optics::LoadFrame)
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   return true;

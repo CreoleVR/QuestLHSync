@@ -315,6 +315,7 @@ class Solver {
   void PoseBreak(double t);
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
+  void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
   bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
@@ -377,7 +378,11 @@ class Solver {
   bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
   bool acq_dim_ = false;     // ... was found on dim rays too (Bright): it needs twice the support
   std::atomic<bool> starved_{false};  // the recent rays are under 5% bright, of 200 or more (see Bright)
-  static bool Starved(const Rays &r);
+  bool Starved(const Rays &r) const;
+  // the Steam Frame: its cameras seldom see a base station's dot saturate (a recording: 95% of the sightings of the
+  // stations dim, while the bright spots were mostly other lights), so the dim ones always count, as in a room too light
+  // (Starved)
+  std::atomic<bool> dim_dots_{false};
   double DimGate() const { return starved_ ? INLIER : -1; }
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
   double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
@@ -398,7 +403,7 @@ class Solver {
   static Rays Thin(const Rays &r);
   // r's bright rays (kBright): dim ones are mostly other lights, and can make a wrong alignment look supported. All
   // of r when bright ones are under 5% of 200 or more: a room too light for the dots to saturate
-  static Rays Bright(const Rays &r);
+  Rays Bright(const Rays &r) const;
   bool Acquire(double now, X4 &best, int &bs, int &tight);
   int ThinnedScore(const X4 &x, double now);
   // 1: the lighthouse devices worn or held say a, 2: b, 0: they don't tell (da, db: their distance from the head, m;
