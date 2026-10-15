@@ -27,9 +27,13 @@ if [ "$1" = "--stage" ]; then
 fi
 
 ENGINE=$(command -v docker || command -v podman) || { echo "docker or podman needed"; exit 1; }
+# rootless podman maps container uids onto host subuids, so -u's uid would have no write access to the mounted /src;
+# keep-id maps the builder onto its own host uid. Docker and rootful podman don't remap uids and need no flag.
+USERNS=""
+if [ "$(basename "$ENGINE")" = podman ] && [ "$(id -u)" -ne 0 ]; then USERNS="--userns=keep-id"; fi
 rm -rf "$APP"
 mkdir -p "$APP/usr/bin"
-"$ENGINE" run --rm -v "$PWD":/src -w /src -u "$(id -u):$(id -g)" "$IMAGE" sh scripts/build_wivrn.sh --stage
+"$ENGINE" run --rm $USERNS -v "$PWD":/src -w /src -u "$(id -u):$(id -g)" "$IMAGE" sh scripts/build_wivrn.sh --stage
 cp out/questlhsync-xr "$APP/usr/bin/"
 cp LICENSE THIRD_PARTY_NOTICES.md "$APP/usr/share/doc/"
 

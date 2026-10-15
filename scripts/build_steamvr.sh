@@ -27,10 +27,14 @@ if [ "$1" = "--stage" ]; then
 fi
 
 ENGINE=$(command -v docker || command -v podman) || { echo "docker or podman needed"; exit 1; }
+# rootless podman maps container uids onto host subuids, so -u's uid would have no write access to the mounted /src;
+# keep-id maps the builder onto its own host uid. Docker and rootful podman don't remap uids and need no flag.
+USERNS=""
+if [ "$(basename "$ENGINE")" = podman ] && [ "$(id -u)" -ne 0 ]; then USERNS="--userns=keep-id"; fi
 "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1 || "$ENGINE" pull "$IMAGE"
 [ -n "$QLHS_DRIVER_BUILT" ] || scripts/build_driver.sh
 rm -rf "$APP"
-"$ENGINE" run --rm -v "$PWD":/src -w /src -u "$(id -u):$(id -g)" "$IMAGE" sh scripts/build_steamvr.sh --stage
+"$ENGINE" run --rm $USERNS -v "$PWD":/src -w /src -u "$(id -u):$(id -g)" "$IMAGE" sh scripts/build_steamvr.sh --stage
 
 # the payload: the driver folder as the installer copies it
 PAY="$APP/usr/share/questlhsync-payload"

@@ -33,5 +33,9 @@ if [ "$1" = "--compile" ] || [ -n "$QLHS_HOST_BUILD" ]; then
   exit 0
 fi
 ENGINE=$(command -v docker || command -v podman) || { echo "docker or podman needed (or QLHS_HOST_BUILD=1)"; exit 1; }
+# rootless podman maps container uids onto host subuids, so -u's uid would have no write access to the mounted /src;
+# keep-id maps the builder onto its own host uid. Docker and rootful podman don't remap uids and need no flag.
+USERNS=""
+if [ "$(basename "$ENGINE")" = podman ] && [ "$(id -u)" -ne 0 ]; then USERNS="--userns=keep-id"; fi
 "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1 || "$ENGINE" pull "$IMAGE"
-exec "$ENGINE" run --rm -v "$PWD":/src -w /src -u "$(id -u):$(id -g)" "$IMAGE" sh scripts/build_driver.sh --compile
+exec "$ENGINE" run --rm $USERNS -v "$PWD":/src -w /src -u "$(id -u):$(id -g)" "$IMAGE" sh scripts/build_driver.sh --compile
