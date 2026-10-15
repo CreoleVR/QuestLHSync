@@ -591,6 +591,9 @@ bool StationsFile::Load(const std::string &path) {
   anchor_p = {p[0], p[1], p[2]};
   anchor_R = ToM3(QuatFromJ(aq));
   if (const JVal *lq = d.get("level")) level = ToM3(QuatFromJ(lq));
+  // a level kept before it was a mean: one reading's worth
+  if (const JVal *ln = d.get("level_n")) level_n = (int)ln->num();
+  else level_n = RotDeg(level) > 0 ? 1 : 0;
   if (const JVal *st = d.get("stations"))
     for (auto &kv : st->o) {
       if (const JVal *pos = kv.second.get("pos")) {
@@ -639,10 +642,10 @@ bool StationsFile::SaveAuto(const std::string &path) const {
       "its lighthouse universe at every start; this pins it. stations: each base station's pose in it; with three or "
       "more, the frame follows the best fit of them all. place: with two, the other's distance and height from the "
       "anchor (m) as the headset's cameras measured them. level: the turn that levels it with the headset's gravity, "
-      "found from the base stations' sightings. Delete to start over.\",\n", anchor.c_str());
+      "the mean of level_n readings of the base stations' sightings. Delete to start over.\",\n", anchor.c_str());
   s += Fmt(" \"anchor\": \"%s\",\n \"anchor_p\": [%.6f, %.6f, %.6f],\n \"anchor_q\": [%.6f, %.6f, %.6f, %.6f],\n"
-           " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"stations\": {", anchor.c_str(), anchor_p.x, anchor_p.y,
-           anchor_p.z, q.w, q.x, q.y, q.z, l.w, l.x, l.y, l.z);
+           " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"level_n\": %d,\n \"stations\": {", anchor.c_str(),
+           anchor_p.x, anchor_p.y, anchor_p.z, q.w, q.x, q.y, q.z, l.w, l.x, l.y, l.z, level_n);
   s += st + Fmt("},\n \"saved\": \"%s\"\n}\n", Now().c_str());
   return WriteFileAtomic(path, s);
 }
@@ -1379,13 +1382,14 @@ void Solver::BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, co
   }
 }
 
-bool Solver::Starved(const Rays &r) {
+bool Solver::Starved(const Rays &r) const {
+  if (dim_dots_) return !r.B.empty();
   size_t nb = 0;
   for (char b : r.B) nb += b != 0;
   return !r.B.empty() && r.size() >= 200 && nb * 20 < r.size();
 }
 
-Solver::Rays Solver::Bright(const Rays &r) {
+Solver::Rays Solver::Bright(const Rays &r) const {
   size_t nb = 0;
   for (char b : r.B) nb += b != 0;
   if (r.B.empty() || nb == r.size() || Starved(r)) return r;
@@ -2728,6 +2732,7 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
   // a Quest's frame period is one of two, the Frame's is learned from its frames
   grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
+  solver_.SetDimDots(optics_.exact_time());  // the Steam Frame (Optics::LoadFrame)
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   return true;
@@ -3135,15 +3140,29 @@ bool Sync::GravityFrame(M3 &C, M3 &turn, std::string &key) {
 // knows gravity: level the frame by it whenever the sightings pin its tilt (Solver::Level), and keep the level in
 // stations.json. A measured frame is the user's own and stays as it is. A wrong alignment (two stations swapped) can
 // be levelled into fitting three stations too, so only a settled one whose worn or held devices sit at the head counts.
+// The tilt between the frame and the headset's gravity doesn't change, but one reading of it (five minutes of
+// sightings) is off by 0.15 deg, and the next one 0.2 deg away: each one moves the level by its share of all the
+// readings so far (up to kLevelMemory), so the level settles instead of following the last reading. One further from
+// it than kLevelJump says the level moved (SteamVR re-solved its base stations): it is taken whole and starts over.
 void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
   if (!sfile_.autogen || frame_.ok() != 1 || !solver_.has_x() || now - lock_time_ < kLevelSettle) return;
   if (!(BodyDist(solver_.x()) < kLevelBody)) return;
   Solver::LevelR lv;
   if (!solver_.Level(sfile_.anchor_p, lv)) return;
   double step = RotDeg(lv.tilt);
-  M3 L = lv.tilt * sfile_.level;
-  if (step < 0.05 || RotDeg(L) > kMaxRot) return;  // within the noise; or past what a level can be
+  if (RotDeg(lv.tilt * sfile_.level) > kMaxRot) return;  // past what a level can be
+  bool moved = sfile_.level_n > 0 && step > kLevelJump;
+  if (!moved && sfile_.level_n > 0 && now - level_read_ < kLevelEvery) return;  // a move is followed at once
+  level_read_ = now;
+  int n = moved ? 0 : std::min(sfile_.level_n, kLevelMemory - 1);
+  double share = 1.0 / (n + 1);
+  Quat q = ToQuat(lv.tilt);  // the reading's share of its turn, about the same axis
+  double half = std::atan2(std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z), q.w), s = std::sin(half * share);
+  double k = half > 1e-12 ? s / std::sin(half) : share;
+  M3 part = ToM3(Quat{std::cos(half * share), q.x * k, q.y * k, q.z * k});
+  M3 L = part * sfile_.level;
   sfile_.level = L;
+  sfile_.level_n = n + 1;
   sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
   frame_.Update(raw);
   for (auto &kv : raw) {
@@ -3151,9 +3170,19 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
     frame_.Apply(kv.second.first, kv.second.second, p, R);
     solver_.SetStation(kv.first, p, R);
   }
-  solver_.Relevel(lv.x);
-  log_(Fmt("lighthouse frame levelled with the headset: tilted %.2f deg (%.2f deg in all), %d base stations within "
-           "%.2f deg", step, RotDeg(L), lv.stations, lv.med));
+  X4 x = solver_.x();  // the alignment as far toward the reading's as the level went
+  x[0] += share * Wrap(lv.x[0] - x[0]);
+  for (int i = 1; i < 4; i++) x[i] += share * (lv.x[i] - x[i]);
+  solver_.Relevel(x);
+  Rec(now, "I level3 %.4f %.4f %d %.4f", step, step * share, sfile_.level_n, lv.med);
+  if (moved)
+    log_(Fmt("lighthouse frame levelled with the headset: tilted %.2f deg, too far from the level so far to be its "
+             "scatter: the level moved, its mean starts over (%.2f deg in all), %d base stations within %.2f deg", step,
+             RotDeg(L), lv.stations, lv.med));
+  else if (step * share >= 0.02)
+    log_(Fmt("lighthouse frame levelled with the headset: tilted %.2f deg, 1/%d of the %.2f deg this reading "
+             "says (%.2f deg in all), %d base stations within %.2f deg", step * share, n + 1, step, RotDeg(L),
+             lv.stations, lv.med));
 }
 
 // An automatic frame takes its stations' poses in it once three show up (Frame::Layout follows them from then on) and
@@ -3183,6 +3212,7 @@ void Sync::LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, doubl
     sfile_.ref.clear();
     sfile_.ref.insert(raw.begin(), raw.end());
     sfile_.level = M3();  // SteamVR's frame as it is now: its level is found again
+    sfile_.level_n = 0;
     sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
     bad_since_ = tilt_since_ = -1;
     left_since_ = now;
@@ -3363,6 +3393,7 @@ Transform Sync::Tick(double now) {
         sfile_.anchor_p = a.first;
         sfile_.anchor_R = a.second;
         sfile_.level = M3();  // SteamVR's frame as it is now: its level is found again
+        sfile_.level_n = 0;
         sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
         log_("anchor " + sfile_.anchor + " moved: reference frame reset");
       }

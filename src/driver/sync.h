@@ -85,6 +85,14 @@ constexpr double kSlewStill = 0.005, kSlewTurn = 0.0005, kSlewWalk = 0.05;
 constexpr double kJumpApply = 0.25;     // m: bigger corrections apply at once
 // levelling (Sync::LevelStep) waits this long after an acquisition, and wants the worn or held devices this close
 constexpr double kLevelSettle = 5.0, kLevelBody = 1.0;  // s, m
+// the level is a constant (SteamVR's frame as it was first seen, against the headset's gravity), read off five
+// minutes of sightings at a time: a reading every kLevelEvery s, the level the mean of the last kLevelMemory (looked
+// at every 10 s for kLevelJump)
+constexpr double kLevelEvery = 60.0;
+constexpr int kLevelMemory = 60;
+// unless SteamVR re-solves its base stations under the frame and the level moves with them: a reading this far (deg)
+// from the mean is no scatter, and the mean starts over from it
+constexpr double kLevelJump = 0.6;
 // channel check (Solver::CheckIdentity): every kIdEvery s, and at the step after a new alignment. The stations are
 // mixed up when their sightings follow each other's rotor periods better than their own by kSwapGain in all; a place's
 // sightings name a rotor when they follow it by kNamed more than any other; and the alignment with the stations where
@@ -209,6 +217,7 @@ struct StationsFile {
   V3 anchor_p;
   M3 anchor_R;
   M3 level;  // automatic frames: turns the frame level with the headset's gravity (Solver::Level)
+  int level_n = 0;  // how many of the cameras' readings the level is the mean of (Sync::LevelStep)
   std::map<std::string, V3> fix;  // measured positions, reference frame
   // automatic frames of three or more stations: each one's pose in the reference frame, before the level
   std::map<std::string, std::pair<V3, M3>> ref;
@@ -306,6 +315,7 @@ class Solver {
   void PoseBreak(double t);
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
+  void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
   bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
@@ -368,7 +378,11 @@ class Solver {
   bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
   bool acq_dim_ = false;     // ... was found on dim rays too (Bright): it needs twice the support
   std::atomic<bool> starved_{false};  // the recent rays are under 5% bright, of 200 or more (see Bright)
-  static bool Starved(const Rays &r);
+  bool Starved(const Rays &r) const;
+  // the Steam Frame: its cameras seldom see a base station's dot saturate (a recording: 95% of the sightings of the
+  // stations dim, while the bright spots were mostly other lights), so the dim ones always count, as in a room too light
+  // (Starved)
+  std::atomic<bool> dim_dots_{false};
   double DimGate() const { return starved_ ? INLIER : -1; }
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
   double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
@@ -389,7 +403,7 @@ class Solver {
   static Rays Thin(const Rays &r);
   // r's bright rays (kBright): dim ones are mostly other lights, and can make a wrong alignment look supported. All
   // of r when bright ones are under 5% of 200 or more: a room too light for the dots to saturate
-  static Rays Bright(const Rays &r);
+  Rays Bright(const Rays &r) const;
   bool Acquire(double now, X4 &best, int &bs, int &tight);
   int ThinnedScore(const X4 &x, double now);
   // 1: the lighthouse devices worn or held say a, 2: b, 0: they don't tell (da, db: their distance from the head, m;
@@ -515,6 +529,7 @@ class Sync {
   bool seeded_ = false, have_applied_ = false, paused_ = false, locked_ = false;
   X4 applied_{};
   double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, last_level_ = 0, lock_time_ = -1;
+  double level_read_ = -1e9;  // the last reading LevelStep took
   double split_said_ = -1e18;  // when a timing estimate too unsure to take was last logged
   int brk_seen_ = 0, resets_seen_ = 0;
   double last_prec_ = -1e18;
