@@ -154,6 +154,7 @@ bool Optics::Load(const std::string &json, std::string *err) {
   for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
   const JVal *dev = root.get("Device"), *type = dev ? dev->get("DeviceType") : nullptr;
   device_ = type && type->t == JVal::Str ? type->s : "";
+  headset_ = gxr ? kGalaxyXR : kQuest;
   exact_time_ = gxr_sensor;  // Backend converted QVR sensor BOOTTIME to daemon MONOTONIC.
   return true;
 }
@@ -228,6 +229,7 @@ bool Optics::LoadFrame(const JVal &root, std::string *err) {
   for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
   const JVal *model = dc->get("model_number");
   device_ = model && model->t == JVal::Str ? model->s : "Steam Frame";
+  headset_ = kFrame;
   exact_time_ = true;
   return true;
 }
@@ -2730,9 +2732,9 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   have_optics_ = true;
   std::string left_out = optics_.Unused();
   if (!left_out.empty()) log_("cameras " + left_out + " left out: they look down, the base stations hang above");
-  // a Quest's frame period is one of two, the Frame's is learned from its frames
-  grid_quest_ = !optics_.exact_time() && !cfg_.learn_grid;
-  solver_.SetDimDots(optics_.exact_time());  // the Steam Frame (Optics::LoadFrame)
+  // a Quest's frame period is one of two, the other headsets' are learned from their frames
+  grid_quest_ = optics_.headset() == Optics::kQuest && !cfg_.learn_grid;
+  solver_.SetDimDots(optics_.headset() == Optics::kFrame);
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   return true;
@@ -2991,8 +2993,8 @@ void Sync::OnLine(double pc, const char *line) {
   double hs = tus / 1e6;
   if (cfg_.arrival_clock) clock_.AddArrival(pc, hs);
   double lag = 0;
-  // the Frame stamps its frames itself; the Quest's are when lhsight found them, the grid takes the poll lag off. On
-  // the Frame the grid still learns the frame period, for the channel check
+  // the Frame stamps its frames itself, and so does a Galaxy XR with sensor stamps; the Quest's are when lhsight found
+  // them, the grid takes the poll lag off. With exact times the grid still learns the frame period, for the channel check
   bool grid_lag = nb >= 0 && grid_.Lag(cam, hs, lag);
   if (optics_.exact_time()) lag = 0;
   bool have_lag = nb >= 0 && (optics_.exact_time() || grid_lag);
