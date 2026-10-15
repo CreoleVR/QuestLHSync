@@ -63,6 +63,10 @@ inline double RotDeg(const M3 &R) {  // atan2 form: acos loses small angles
   double sx = R.m[2][1] - R.m[1][2], sy = R.m[0][2] - R.m[2][0], sz = R.m[1][0] - R.m[0][1];
   return std::atan2(std::sqrt(sx * sx + sy * sy + sz * sz) / 2, c) * 57.29577951308232;
 }
+// how far a rotation matrix tilts the vertical (deg)
+inline double TiltDeg(const M3 &R) {
+  return std::atan2(std::hypot(R.m[0][1], R.m[2][1]), R.m[1][1]) * 57.29577951308232;
+}
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDeg = 180.0 / kPi;
 inline double Wrap(double a) {  // [-pi, pi)
