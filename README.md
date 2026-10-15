@@ -14,6 +14,10 @@ dashboard.
 
 Steam Frame support is by [@NotZoeyDev](https://github.com/NotZoeyDev).
 
+Galaxy XR support is by [@stearnsbq](https://github.com/stearnsbq), with the
+[questlhsync-galaxy-xr](https://github.com/stearnsbq/questlhsync-galaxy-xr)
+headset module.
+
 ![The QuestLHSync dashboard page](docs/dashboard.png)
 
 ## Requirements
