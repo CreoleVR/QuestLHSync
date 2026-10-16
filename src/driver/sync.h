@@ -107,6 +107,25 @@ constexpr double kBodyNear = 1.0, kBodyGap = 1.0;  // m
 // ... or their motion does (Sync::BodyMotion): when the head went kBodyMoved, and they follow it one way by kBodyCorr
 // and the other way not (a fit and its mirror move them opposite ways)
 constexpr double kBodyMoved = 2.0, kBodyCorr = 0.2;  // m, correlation
+// worn or held lighthouse devices stay near the head: the nearest one within kBodyFar of it, horizontally, in
+// kBodyShare of the moments (0.1 s) since the last pose break, or the fit is no fit. From where one stands, two
+// stations seen along their lines of sight fit another pair nearer or further along the same lines, often with more
+// support, and only the devices tell (a Frame recording with a tracker held to the headset: the true fit kept the
+// nearest device within 0.16 m at the 90th percentile, five such relabellings put it 1.8-3.8 m off, swinging round the
+// head as it moved). Acquisition takes the best supported fit the devices allow, when they allow any.
+constexpr double kBodyFar = 0.6, kBodyShare = 0.8;  // m, share
+constexpr int kBodyMinBins = 20;  // 0.1 s moments with a device and a head pose, else the devices don't tell
+// ... nor before the head went kBodyPath (horizontally) since the last pose break: standing about one place, a wrong fit
+// turned about it keeps the devices near the head too (the same recording, after a pose break and 1 m walked: 0.4 m).
+// Acquisition waits for that, kBodyWait s at most (sitting still, the devices never tell)
+constexpr double kBodyPath = 2.0, kBodyWait = 30.0;  // m, s
+// ... and their motion tells the turn itself: worn or held, they go where the head goes, and a fit turned by e from the
+// true one turns their steps by e against the head's, wherever it turns about (the recording: the hip and feet gave the
+// true turn within 1-5 deg, from 8 s of walking on). Once their steps follow the head's that consistently (kBodyCoh) over
+// kBodyPath of the head's, a fit more than kBodyTurn off that turn is no fit
+constexpr double kBodyCoh = 0.6, kBodyTurn = 15.0;  // resultant share, deg
+// the worn or held devices at one moment: the head (Quest frame) and the devices (reference frame, levelled)
+struct BodyBin { V3 head; std::vector<V3> dev; };
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 constexpr double kUpward = 0.1;        // a camera whose axis climbs this much (of 1) looks up: the Frame's upper pair
@@ -304,6 +323,11 @@ class Solver {
   // how far the head went meanwhile (m); NaN without motion
   using MotionFn = std::function<double(const X4 &, double &)>;
   void SetMotion(MotionFn f) { motion_ = std::move(f); }
+  using BodyBinsFn = std::function<std::vector<BodyBin>()>;
+  void SetBodyBins(BodyBinsFn f) { body_bins_ = std::move(f); }
+  // the turn the devices' steps tell (rad), and how consistently (0-1), NAN when they don't
+  using BodyTurnFn = std::function<double(double &)>;
+  void SetBodyTurn(BodyTurnFn f) { body_turn_ = std::move(f); }
   void Reset(const X4 &x);
   void Clear();  // forgets the sightings, the alignment and what hung on them; the stations stay (Sync::ForceRecalibrate)
   // g: the frame's time on the headset's clock (NaN until the frame grid is known)
@@ -378,6 +402,11 @@ class Solver {
   int resets_ = 0;
   BodyFn body_;
   MotionFn motion_;
+  BodyBinsFn body_bins_;
+  BodyTurnFn body_turn_;
+  // the worn or held devices allow x: near the head (BodyAllows), and turned as their steps tell, if they tell
+  bool BodyOk(const X4 &x, const std::vector<BodyBin> &bins, double turn) const;
+  double BodyTurn() const;  // the turn the devices' steps tell, NAN when they don't
   bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
   bool acq_dim_ = false;     // ... was found on dim rays too (Bright): it needs twice the support
   std::atomic<bool> starved_{false};  // the recent rays are under 5% bright, of 200 or more (see Bright)
@@ -389,6 +418,15 @@ class Solver {
   double DimGate() const { return starved_ ? INLIER : -1; }
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
   double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
+  double far_said_ = -1e18;   // ... and of a better supported candidate they ruled out (kBodyFar)
+  double body_wait_ = 1e18;   // since when acquisition has waited for the devices to tell (kBodyWait)
+  // the nearest worn or held device's distance from the head at the kBodyShare quantile, NAN when they don't tell
+  static double BodyFar(const X4 &x, const std::vector<BodyBin> &b);
+  static bool BodyTells(const std::vector<BodyBin> &b);  // enough moments, and the head went kBodyPath
+  static bool BodyAllows(const X4 &x, const std::vector<BodyBin> &b) {
+    double d = BodyFar(x, b);
+    return !std::isfinite(d) || d <= kBodyFar;
+  }
 
   Rays GetRays(double t0);
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
@@ -492,7 +530,7 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, steady = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
@@ -542,6 +580,24 @@ class Sync {
   Spots spots_;  // under net_
   std::map<int, std::vector<std::pair<double, double>>> prev_big_;  // under net_: each camera's last steady lights
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
+  // under net_: steady lights. A base station's laser shows in a short frame only when its sweep and the exposure meet,
+  // a frame or two in a row at most (the recording: 22-43% of its sightings in the very next frame); a lamp or LED that
+  // is on shows in every frame it's in view (96-99%), and one about 1 m from a base station drew the fit there, 0.7-1 m
+  // up. A room direction lit in kSteadyRun short frames of a camera in a row, within kSteadyDeg, is such a light
+  struct PendSpot {
+    V3 o, d, D, p;  // the ray in the head frame; D: its direction in the Quest frame; p, R: the head
+    M3 R;
+    double hg, grid_pc, w;
+    int peak;
+    bool have_lag;
+    int run, from;  // short frames in a row lit this way; the spot it follows in the frame before, -1 none
+    bool drop;
+  };
+  struct PendFrame { double t; std::vector<PendSpot> s; };
+  std::map<int, std::deque<PendFrame>> steady_;
+  void FlushSteady(int cam, size_t keep);  // a camera's waiting frames on to the solver, but the last keep
+  static constexpr int kSteadyRun = 4;
+  static constexpr double kSteadyDeg = 1.0, kSteadyGap = 0.05;  // deg; s between a camera's short frames, at most
   // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
   struct Spot { int x10, y10, npx, peak; };
   struct Shot { double pc, t, hg, grid_pc; int cam; bool have_lag; std::vector<Spot> bl; };
@@ -569,6 +625,8 @@ class Sync {
   std::map<int, double> body_last_;
   double BodyDist(const X4 &x);
   double BodyMotion(const X4 &x, double &moved);
+  std::vector<BodyBin> BodyBins();  // the worn or held devices since the last pose break, by 0.1 s
+  double BodyTurn(double &coh);      // the turn (rad) taking the devices' steps onto the head's, since the last pose break
 
   void LoadState();
   // state.json lives in headsets/<model>-<serial hash>/ once the headset is known (before that, and for the tools,
