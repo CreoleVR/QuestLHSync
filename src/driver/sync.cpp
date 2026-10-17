@@ -1629,7 +1629,13 @@ void Solver::PoseBreak(double t, double dy) {
   brk_ = since_ = std::max(since_, t);
   last_acq_ = -1e18;
   has_acq_x_ = false;
-  // the headset space moved up dy (a floor set anew): the fit's height goes with it
+  // the headset space moved up dy (a floor set anew): the fit's height goes with it; by an unknown height (NAN), the
+  // height held means nothing now
+  if (std::isnan(dy)) {
+    held_h_.clear();
+    held_t_ = -1e18;
+    return;
+  }
   int d = (int)std::lround(dy / kHeightBin);
   if (d) {
     std::map<int, double> h;
@@ -3410,10 +3416,11 @@ Transform Sync::Tick(double now) {
       brk_seen_ = b;
       broke = true;
       // a jump from one pose to the next is the headset space moving, up by the head's jump; after a gap the head
-      // may have moved itself (stood up), and the height the fit has held stays
+      // may have moved itself (stood up) and the floor may have been set anew (the boundary redone while the poses
+      // stopped): how far the headset space moved up is unknown
       double gap, dy;
       poses_.brk_jump(gap, dy);
-      solver_.PoseBreak(poses_.brk_t(), gap < kBrkJumpGap ? dy : 0);
+      solver_.PoseBreak(poses_.brk_t(), gap < kBrkJumpGap ? dy : NAN);
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
     }
     std::map<std::string, std::pair<V3, M3>> raw;

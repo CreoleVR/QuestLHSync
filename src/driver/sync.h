@@ -113,7 +113,9 @@ constexpr double kBodyMoved = 2.0, kBodyCorr = 0.2;  // m, correlation
 // than kHeightTol off it takes over only with the worn devices for it, and a current fit that far off gives way to a
 // candidate at it. (Wrong fits come back alike, so candidates agreeing on a new height say nothing of the floor.)
 constexpr double kHeightBin = 0.05, kHeightTol = 0.2, kHeightKeep = 120.0;  // m, m, s
-// an HMD pose break across less than this is the headset space moving (a floor set anew moves the kept height with it)
+// an HMD pose break across less than this is the headset space moving (a floor set anew moves the kept height with it);
+// across more, the floor may have been set anew while the poses stopped (the boundary redone), and the kept height is
+// forgotten
 constexpr double kBrkJumpGap = 0.2;  // s
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
@@ -325,7 +327,7 @@ class Solver {
   void SetFramePeriod(double p) { frame_p_ = p; }  // s between short frames
   void AddFrame(double t, double g, int cam, V3 o, const M3 &R);  // every short frame; camera pose in Quest space
   void SetInImage(std::function<bool(int cam, V3 d)> f) { in_image_ = std::move(f); }
-  void PoseBreak(double t, double dy = 0);  // dy: how far up the headset space moved, if known (m)
+  void PoseBreak(double t, double dy = 0);  // dy: how far up the headset space moved (m), NAN if unknown
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
