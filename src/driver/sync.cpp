@@ -2807,6 +2807,13 @@ void Sync::SetStreamer(const std::string &system) {
   }
 }
 
+std::string HeadsetId(const std::string &serial) {
+  if (serial.empty() || serial == "unknown") return "";
+  uint32_t h = 2166136261u;  // FNV-1a
+  for (unsigned char c : serial) { h ^= c; h *= 16777619u; }
+  return Fmt("%08x", h);
+}
+
 // "Steam-Frame-1a2b3c4d": the model for the eye, a hash of the serial to tell two of a kind apart
 void Sync::SetHeadset(const std::string &serial, const std::string &model) {
   std::string name;
@@ -2816,9 +2823,7 @@ void Sync::SetHeadset(const std::string &serial, const std::string &model) {
   }
   while (!name.empty() && name.back() == '-') name.pop_back();
   if (name.empty()) name = "headset";
-  uint32_t h = 2166136261u;  // FNV-1a
-  for (unsigned char c : serial) { h ^= c; h *= 16777619u; }
-  std::string key = serial.empty() || serial == "unknown" ? name : Fmt("%s-%08x", name.c_str(), h);
+  std::string id = HeadsetId(serial), key = id.empty() ? name : name + "-" + id;
   std::lock_guard<std::mutex> g(hs_m_);
   hs_pending_ = key;
   hs_new_ = true;

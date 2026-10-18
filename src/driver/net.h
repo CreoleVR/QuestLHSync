@@ -17,7 +17,8 @@ class Sync;
 class HeadsetLink {
  public:
   enum State { kIdle, kSearching, kConnecting, kConnected };
-  struct Known { std::string ip, serial, model, streamer; };  // a headset that connected (the memory, latest first)
+  struct Known { std::string ip, id, model, streamer; };  // a headset that connected (the memory, latest first); id:
+                                                          // HeadsetId of its serial
   using LogFn = std::function<void(const std::string &)>;
   using RecFn = std::function<void(double, const std::string &)>;
 
@@ -58,7 +59,7 @@ class HeadsetLink {
   std::set<std::string> quiet_ips_;  // ... and of ones that sent no camera frames while others might (tried last)
 
   void Loop();
-  int Rank(const std::string &ip, const std::string &serial) const;  // m_ held; less is better
+  int Rank(const std::string &ip, const std::string &id) const;  // m_ held; less is better
   void Remember(const Known &k);  // m_ held
   bool Others(const std::string &ip) const;  // m_ held: another headset this could be, by memory or manual hosts
   bool Discover(std::vector<Found> &out);

@@ -453,6 +453,9 @@ class Timing {
 };
 
 // ---------------------------------------------------------------- the app
+// a hash of a headset's serial ("" without one): tells two of a kind apart, in file and folder names, without the serial
+std::string HeadsetId(const std::string &serial);
+
 struct SyncConfig {
   std::string dir;         // state files (stations.json, state.json)
   bool per_headset = false;    // the driver: state.json per headset (Sync::SetHeadset); the tools keep it in dir
