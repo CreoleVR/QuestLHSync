@@ -16,6 +16,11 @@
 #include "sync.h"
 
 static const int kUdpPort = 47281, kTcpPort = 47280;
+// a headset that sends no camera frames this long, when SteamVR's could be another one (the kind can't tell, or a
+// manual or remembered address is another headset's), gives way to the next: one left on a desk, awake
+static const double kQuietSwitch = 20.0;  // s
+static const double kQuietAgain = 120.0;  // s, once it gave way and came round again: nothing else answered then
+static const size_t kKnownMax = 8;        // headsets kept in the memory
 
 double QpcNow() {
   static LARGE_INTEGER f = [] { LARGE_INTEGER v; QueryPerformanceFrequency(&v); return v; }();
@@ -51,6 +56,11 @@ void HeadsetLink::SetFamily(const std::string &family) {
   family_ = family;
 }
 
+void HeadsetLink::SetStreamer(const std::string &driver) {
+  std::lock_guard<std::mutex> g(m_);
+  streamer_ = driver;
+}
+
 std::string QuestFamily(const std::string &text) {
   std::string s;
   for (char c : text)
@@ -68,9 +78,29 @@ static bool Fits(const std::string &family, const std::string &model) {
   return family.empty() || f.empty() || f == family;
 }
 
-static void WriteMemory(const std::string &path, const std::string &ip) {
+// the memory: a line per headset, the latest first, "<ip> <serial> <model> <streamer's driver>" ("-" for unknown, "_"
+// for a space). Up to 1.24 it held the last headset's address alone (and up to 1.3 its serial after it): read alike.
+static std::string MemField(const std::string &s) {
+  if (s.empty()) return "-";
+  std::string o = s;
+  for (auto &c : o)
+    if (isspace((unsigned char)c)) c = '_';
+  return o;
+}
+
+static std::string MemValue(const char *s, bool spaces) {
+  std::string o = strcmp(s, "-") ? s : "";
+  if (spaces)
+    for (auto &c : o)
+      if (c == '_') c = ' ';
+  return o;
+}
+
+static void WriteMemory(const std::string &path, const std::vector<HeadsetLink::Known> &known) {
   if (FILE *f = fopen(path.c_str(), "w")) {
-    fprintf(f, "%s\n", ip.c_str());
+    for (auto &k : known)
+      fprintf(f, "%s %s %s %s\n", k.ip.c_str(), MemField(k.serial).c_str(), MemField(k.model).c_str(),
+              MemField(k.streamer).c_str());
     fclose(f);
   }
 }
@@ -78,14 +108,57 @@ static void WriteMemory(const std::string &path, const std::string &ip) {
 void HeadsetLink::SetMemory(const std::string &path) {
   std::lock_guard<std::mutex> g(m_);
   mem_path_ = path;
-  last_ip_.clear();
+  known_.clear();
   if (FILE *f = fopen(path.c_str(), "r")) {
-    char ip[64], more[8];
-    int n = fscanf(f, "%63s %7s", ip, more);
+    char line[512];
+    while (fgets(line, sizeof line, f) && known_.size() < kKnownMax) {
+      char ip[64] = "", serial[64] = "-", model[128] = "-", streamer[64] = "-";
+      if (sscanf(line, "%63s %63s %127s %63s", ip, serial, model, streamer) < 1) continue;
+      known_.push_back({ip, MemValue(serial, false), MemValue(model, true), MemValue(streamer, false)});
+    }
     fclose(f);
-    if (n >= 1) last_ip_ = ip;
-    if (n == 2) WriteMemory(path, last_ip_);  // up to 1.3 the headset's serial was kept there too
   }
+}
+
+static bool SameHeadset(const HeadsetLink::Known &k, const std::string &ip, const std::string &serial) {
+  if (!serial.empty() && !k.serial.empty()) return k.serial == serial;
+  return k.ip == ip;
+}
+
+// k.streamer "" keeps the one it had: a headset counts as used with a streamer once its cameras send frames
+void HeadsetLink::Remember(const Known &k) {
+  std::vector<Known> v{k};
+  if (k.streamer.empty())
+    for (auto &o : known_)
+      if (SameHeadset(o, k.ip, k.serial)) { v[0].streamer = o.streamer; break; }
+  for (auto &o : known_)  // the same headset, or another one that had its address before
+    if (!SameHeadset(o, k.ip, k.serial) && o.ip != k.ip && v.size() < kKnownMax) v.push_back(o);
+  bool same = v.size() == known_.size();
+  for (size_t i = 0; same && i < v.size(); i++)
+    same = v[i].ip == known_[i].ip && v[i].serial == known_[i].serial && v[i].model == known_[i].model &&
+           v[i].streamer == known_[i].streamer;
+  known_.swap(v);
+  if (!same && !mem_path_.empty()) WriteMemory(mem_path_, known_);
+}
+
+// which headset to try first when several could be SteamVR's (all of them its kind, or the kind unknown): the one asked
+// for (settings), then those last used with this streamer, then the others remembered, the latest first, then new ones;
+// a headset that sent no camera frames goes after all of them
+int HeadsetLink::Rank(const std::string &ip, const std::string &serial) const {
+  int r = quiet_ips_.count(ip) ? 1000 : 0;
+  if (!preferred_.empty() && serial == preferred_) return r;
+  for (size_t i = 0; i < known_.size(); i++)
+    if (SameHeadset(known_[i], ip, serial))
+      return r + (!streamer_.empty() && known_[i].streamer == streamer_ ? 100 : 200) + (int)i;
+  return r + 300;
+}
+
+bool HeadsetLink::Others(const std::string &ip) const {
+  for (auto &h : hosts_)
+    if (h != ip && !wrong_ips_.count(h)) return true;
+  for (auto &k : known_)
+    if (k.ip != ip && !wrong_ips_.count(k.ip) && Fits(family_, k.model)) return true;
+  return false;
 }
 
 static void Sleep_(std::atomic<bool> &run, int ms) {
@@ -101,43 +174,45 @@ void HeadsetLink::Loop() {
     state_ = kSearching;
     std::vector<Found> found;
     Discover(found);
-    std::string pref, fam;
+    // what to try, in turn until one talks, by Rank: the headsets that answered and can be SteamVR's, and straight
+    // over TCP the manual hosts (a firewall eating UDP; ahead of headsets new to the memory) and the headsets remembered
+    // (a network dropping broadcasts), each after one that answered at the same rank
+    std::vector<std::pair<int, Found>> cand;
+    std::string fam;
     {
       std::lock_guard<std::mutex> g(m_);
-      pref = preferred_;
       fam = family_;
+      auto listed = [&](const std::string &ip) {
+        for (auto &c : cand)
+          if (c.second.ip == ip) return true;
+        return false;
+      };
+      for (auto &f : found)
+        if (Fits(fam, f.model)) cand.push_back({2 * Rank(f.ip, f.serial), f});
+      for (auto &h : hosts_)
+        if (!wrong_ips_.count(h) && !listed(h)) {
+          int r = Rank(h, "");
+          if (r % 1000 == 300) r -= 50;  // not remembered: still ahead of new headsets that answered
+          cand.push_back({2 * r + 1, {h, "", "", kTcpPort}});
+        }
+      for (auto &k : known_)
+        if (Fits(fam, k.model) && !wrong_ips_.count(k.ip) && !listed(k.ip))
+          cand.push_back({2 * Rank(k.ip, k.serial) + 1, {k.ip, "", "", kTcpPort}});
     }
-    const Found *pick = nullptr;
-    for (auto &f : found)
-      if (!pref.empty() && f.serial == pref && Fits(fam, f.model)) pick = &f;
-    for (auto &f : found)
-      if (!pick && Fits(fam, f.model)) pick = &f;
-    if (!pick && !found.empty() && skipped_ != found[0].serial) {  // once per headset, not every round
+    std::stable_sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+    bool fitting = false;
+    for (auto &f : found) fitting = fitting || Fits(fam, f.model);
+    if (!fitting && !found.empty() && skipped_ != found[0].serial) {  // once per headset, not every round
       skipped_ = found[0].serial;
       log_(found[0].model + " at " + found[0].ip + " answers, but SteamVR's headset is a " + fam + ": not used");
     }
-    if (!pick) {
-      if (found.empty() && quiet++ % 30 == 0)
-        log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
-      // straight over TCP: manual hosts (a firewall eating UDP), then the last headset (a network dropping broadcasts)
-      std::vector<std::string> direct;
-      {
-        std::lock_guard<std::mutex> g(m_);
-        direct = hosts_;
-        if (!last_ip_.empty() && std::find(direct.begin(), direct.end(), last_ip_) == direct.end())
-          direct.push_back(last_ip_);
-        direct.erase(std::remove_if(direct.begin(), direct.end(), [&](const std::string &h) { return wrong_ips_.count(h) > 0; }),
-                     direct.end());
+    if (found.empty() && quiet++ % 30 == 0)
+      log_("no QuestLHSync headset answers on the network (is it awake, with lhsyncd installed?)");
+    for (auto &c : cand)
+      if (run_ && wanted_ && Session(c.second)) {
+        quiet = 0;
+        break;
       }
-      bool talked = false;
-      for (auto &h : direct)
-        if (run_ && wanted_ && !talked) talked = Session({h, "", "", kTcpPort});
-      if (talked) quiet = 0;
-      Sleep_(run_, 2000);
-      continue;
-    }
-    quiet = 0;
-    Session(*pick);
     state_ = kSearching;
     Sleep_(run_, 2000);
   }
@@ -292,10 +367,31 @@ bool HeadsetLink::Session(const Found &f) {
   connected_at_ = start;
   state_ = kConnected;
   log_((f.model.empty() ? std::string("headset") : f.model) + " at " + f.ip + ": connected");
-  bool ok = true, wrong = false;
+  bool ok = true, wrong = false, framed = false, quiet_checked = false, remembered = false;
+  double quiet_after;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    quiet_after = quiet_ips_.count(f.ip) ? kQuietAgain : kQuietSwitch;
+  }
   char buf[65536];
   while (run_ && wanted_ && ok) {
     double now = QpcNow();
+    if (!framed && !quiet_checked && now - start > quiet_after) {  // once: memory and hosts don't change meanwhile
+      quiet_checked = true;
+      bool others, said;
+      {
+        std::lock_guard<std::mutex> g(m_);
+        others = family_.empty() && Others(f.ip);
+        said = quiet_ips_.count(f.ip) > 0;
+        if (others) quiet_ips_.insert(f.ip);
+      }
+      if (others) {
+        if (!said)
+          log_(model() + " at " + f.ip + ": no camera frames in " + std::to_string((int)kQuietSwitch) +
+               " s, SteamVR's headset may be another: trying it");
+        break;
+      }
+    }
     if (now >= next_ping) {  // clock round trips: 4 Hz
       next_ping = now + 0.25;
       char p[64];
@@ -342,6 +438,12 @@ bool HeadsetLink::Session(const Found &f) {
       switch (line[0]) {
         case 'F':
           last_frame_ = rx;
+          if (!framed) {
+            framed = true;
+            std::lock_guard<std::mutex> g(m_);
+            quiet_ips_.erase(f.ip);
+            if (remembered) Remember({f.ip, serial_, model_, streamer_});
+          }
           if (have_calib) sync_->OnLine(rx, line.c_str());
           break;
         case 'Q': {
@@ -373,10 +475,8 @@ bool HeadsetLink::Session(const Found &f) {
             fw_ = field("fw");
             fam = family_;
             fits = Fits(fam, model_);
-            if (fits && !mem_path_.empty() && last_ip_ != f.ip && h.rfind("H QuestLHSync ", 0) == 0) {
-              last_ip_ = f.ip;
-              WriteMemory(mem_path_, f.ip);
-            }
+            remembered = fits && h.rfind("H QuestLHSync ", 0) == 0;
+            if (remembered) Remember({f.ip, serial_, model_, ""});
           }
           log_(model() + ": firmware " + fw() + ", module " + field("module"));
           if (!fits) {  // reached straight over TCP (no discovery): the address of another headset
