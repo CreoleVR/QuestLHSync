@@ -57,11 +57,13 @@ class HeadsetLink {
   std::vector<Known> known_;
   std::set<std::string> wrong_ips_;  // addresses of headsets of another kind than SteamVR's (until that changes)
   std::set<std::string> quiet_ips_;  // ... and of ones that sent no camera frames while others might (tried last)
+  std::set<std::string> answered_;   // ... and of those of SteamVR's kind that answered the last discovery
 
   void Loop();
   int Rank(const std::string &ip, const std::string &id) const;  // m_ held; less is better
   void Remember(const Known &k);  // m_ held
-  bool Others(const std::string &ip) const;  // m_ held: another headset this could be, by memory or manual hosts
+  bool Others(const std::string &ip) const;  // m_ held: another headset this could be, by discovery, memory or manual
+                                             // hosts
   bool Discover(std::vector<Found> &out);
   bool Session(const Found &f);
 };

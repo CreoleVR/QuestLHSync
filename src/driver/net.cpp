@@ -16,8 +16,9 @@
 #include "sync.h"
 
 static const int kUdpPort = 47281, kTcpPort = 47280;
-// a headset that sends no camera frames this long, when SteamVR's could be another one (the kind can't tell, or a
-// manual or remembered address is another headset's), gives way to the next: one left on a desk, awake
+// a headset that sends no camera frames this long, when SteamVR's could be another one (the kind can't tell, and
+// another headset answered, or a manual or remembered address is another one's), gives way to the next: one left on a
+// desk, awake
 static const double kQuietSwitch = 20.0;  // s
 static const double kQuietAgain = 120.0;  // s, once it gave way and came round again: nothing else answered then
 static const size_t kKnownMax = 8;        // headsets kept in the memory
@@ -162,6 +163,8 @@ int HeadsetLink::Rank(const std::string &ip, const std::string &id) const {
 }
 
 bool HeadsetLink::Others(const std::string &ip) const {
+  for (auto &a : answered_)
+    if (a != ip && !wrong_ips_.count(a)) return true;
   for (auto &h : hosts_)
     if (h != ip && !wrong_ips_.count(h)) return true;
   for (auto &k : known_)
@@ -195,8 +198,12 @@ void HeadsetLink::Loop() {
           if (c.second.ip == ip) return true;
         return false;
       };
+      answered_.clear();
       for (auto &f : found)
-        if (Fits(fam, f.model)) cand.push_back({2 * Rank(f.ip, HeadsetId(f.serial)), f});
+        if (Fits(fam, f.model)) {
+          cand.push_back({2 * Rank(f.ip, HeadsetId(f.serial)), f});
+          answered_.insert(f.ip);
+        }
       for (auto &h : hosts_)
         if (!wrong_ips_.count(h) && !listed(h)) {
           int r = Rank(h, "");
