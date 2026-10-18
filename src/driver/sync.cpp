@@ -462,6 +462,8 @@ void PoseHist::Add(double t, const Quat &q, V3 p) {
 void PoseHist::Break(const PoseS &a, const PoseS &b) {
   brk_t_ = b.t;
   brk_what_ = Fmt("%.2f s, %.0f cm, %.1f deg", b.t - a.t, norm(b.p - a.p) * 100, QuatDeg(a.q, b.q));
+  brk_gap_ = b.t - a.t;
+  brk_dy_ = b.p.y - a.p.y;
   brk_id_++;
 }
 
@@ -861,6 +863,8 @@ void Solver::Clear() {
   amb_state_ = 0;
   kept_said_ = far_said_ = -1e18;
   body_wait_ = 1e18;
+  held_h_.clear();  // another headset, or a reference frame pinned anew: the height held means nothing now
+  held_t_ = -1e18;
 }
 
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
@@ -1553,6 +1557,15 @@ double Solver::BodyFar(const X4 &x, const std::vector<BodyBin> &b) {
   return d[k];
 }
 
+bool Solver::KeptHeight(double &h) const {
+  double best = 0;
+  int bin = 0;
+  for (auto &kv : held_h_)
+    if (kv.second > best) { best = kv.second; bin = kv.first; }
+  h = bin * kHeightBin;
+  return best >= kHeightKeep;
+}
+
 int Solver::ThinnedScore(const X4 &x, double now) {
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
@@ -1675,10 +1688,23 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
 }
 
 // the HMD pose stream broke: the Quest's space may have changed under the older sightings (boundary reset)
-void Solver::PoseBreak(double t) {
+void Solver::PoseBreak(double t, double dy) {
   brk_ = since_ = std::max(since_, t);
   last_acq_ = -1e18;
   has_acq_x_ = false;
+  // the headset space moved up dy (a floor set anew): the fit's height goes with it; by an unknown height (NAN), the
+  // height held means nothing now
+  if (std::isnan(dy)) {
+    held_h_.clear();
+    held_t_ = -1e18;
+    return;
+  }
+  int d = (int)std::lround(dy / kHeightBin);
+  if (d) {
+    std::map<int, double> h;
+    for (auto &kv : held_h_) h[kv.first + d] = kv.second;
+    held_h_.swap(h);
+  }
 }
 
 // ================================================================ station identity
@@ -2248,6 +2274,11 @@ StepStat Solver::Step(double /*now*/) {
     for (auto &kv : st.per) c.push_back(kv.second);
     locked = Score(c) >= 10;
   }
+  if (has_x_ && locked && st.cond) {  // the height the fit holds, by time
+    double dt = std::min(now - held_t_, 2.0);
+    if (dt > 0) held_h_[(int)std::lround(x_[2] / kHeightBin)] += dt;
+  }
+  held_t_ = now;
   if (now - last_acq_ > (locked ? 10 : 3)) {
     last_acq_ = now;
     X4 xa;
@@ -2284,7 +2315,22 @@ StepStat Solver::Step(double /*now*/) {
         body = std::isfinite(turn) && BodyOk(xa, body_bins_(), turn);
       }
       bool enough = sa >= k * need || tight >= k * TIGHT_N || ((acq_forced_ || body) && sa >= k * ACQ / 2);
-      if (!enough || !(sa > 2 * cur + 5 || acq_forced_)) {
+      // The height decides first: a candidate off the kept height doesn't take over without the worn devices for it
+      // (lamps line up with a wrong alignment at any height; a head that sat still leaves the held fit's thinned
+      // support a handful), and if a wrong fit got in, one at the kept height takes it back on plain support
+      double hk = 0;
+      bool kept = KeptHeight(hk);
+      bool off_a = kept && std::fabs(xa[2] - hk) > kHeightTol, off_c = kept && has_x_ && std::fabs(x_[2] - hk) > kHeightTol;
+      bool back = off_c && !off_a;
+      bool wins = back ? (sa >= k * ACQ || tight >= k * TIGHT_N) && sa > 2 * cur + 5
+                       : enough && (sa > 2 * cur + 5 || acq_forced_);
+      if (!wins) {
+      } else if (off_a && fav != 1) {
+        if (now - kept_said_ > 60) {
+          kept_said_ = now;
+          log_(Fmt("acquisition: yaw %+.1f deg (support %d, was %d) would fit as well, but at %.2f m high against the "
+                   "%.2f m the fit has held: the current fit stays", xa[0] * kDeg, sa, cur, xa[2], hk));
+        }
       } else if (fav == 2) {
         if (now - kept_said_ > 60) {
           kept_said_ = now;
@@ -2292,8 +2338,9 @@ StepStat Solver::Step(double /*now*/) {
                    xa[0] * kDeg, sa, cur, how.c_str()));
         }
       } else {
-        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s", xa[0] * kDeg, xa[1],
-                 xa[2], xa[3], sa, tight, TIGHT_DEG, cur, acq_forced_ ? ", by the mirror check" : ""));
+        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s%s", xa[0] * kDeg,
+                 xa[1], xa[2], xa[3], sa, tight, TIGHT_DEG, cur, acq_forced_ ? ", by the mirror check" : "",
+                 back ? ", back at the height the fit has held" : ""));
         Reset(xa);
         since_ = brk_;
       }
@@ -3548,7 +3595,12 @@ Transform Sync::Tick(double now) {
     if (b != brk_seen_) {
       brk_seen_ = b;
       broke = true;
-      solver_.PoseBreak(poses_.brk_t());
+      // a jump from one pose to the next is the headset space moving, up by the head's jump; after a gap the head
+      // may have moved itself (stood up) and the floor may have been set anew (the boundary redone while the poses
+      // stopped): how far the headset space moved up is unknown
+      double gap, dy;
+      poses_.brk_jump(gap, dy);
+      solver_.PoseBreak(poses_.brk_t(), gap < kBrkJumpGap ? dy : NAN);
       {  // the devices' places before it go with the head's older space
         std::lock_guard<std::mutex> g(body_m_);
         while (!body_.empty() && body_.front().t < poses_.brk_t()) body_.pop_front();

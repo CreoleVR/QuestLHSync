@@ -126,6 +126,16 @@ constexpr double kBodyPath = 2.0, kBodyWait = 30.0;  // m, s
 constexpr double kBodyCoh = 0.6, kBodyTurn = 15.0;  // resultant share, deg
 // the worn or held devices at one moment: the head (Quest frame) and the devices (reference frame, levelled)
 struct BodyBin { V3 head; std::vector<V3> dev; };
+// the height offset: both spaces stand on the floor, so a moved headset space turns and slides but keeps its height
+// (sessions with several moves: 2.06-2.23 m; wrong fits that lamps held: 0.75-1.74 m). How long the fit held each
+// height (kHeightBin steps) while locked and pinned is kept; from kHeightKeep s on the most-held one, a candidate more
+// than kHeightTol off it takes over only with the worn devices for it, and a current fit that far off gives way to a
+// candidate at it. (Wrong fits come back alike, so candidates agreeing on a new height say nothing of the floor.)
+constexpr double kHeightBin = 0.05, kHeightTol = 0.2, kHeightKeep = 120.0;  // m, m, s
+// an HMD pose break across less than this is the headset space moving (a floor set anew moves the kept height with it);
+// across more, the floor may have been set anew while the poses stopped (the boundary redone), and the kept height is
+// forgotten
+constexpr double kBrkJumpGap = 0.2;  // s
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 constexpr double kUpward = 0.1;        // a camera whose axis climbs this much (of 1) looks up: the Frame's upper pair
@@ -216,6 +226,8 @@ class PoseHist {
   int brk_id() const { return brk_id_; }
   double brk_t() const { return brk_t_; }
   std::string brk_what() const { std::lock_guard<std::mutex> g(m_); return brk_what_; }
+  // the last break's gap (s) and how far up the head jumped across it (m)
+  void brk_jump(double &gap, double &dy) const { std::lock_guard<std::mutex> g(m_); gap = brk_gap_; dy = brk_dy_; }
   void Clear() { std::lock_guard<std::mutex> g(m_); i_ = 0; pend_ = 0; }
 
  private:
@@ -223,7 +235,7 @@ class PoseHist {
   uint64_t i_ = 0;
   mutable std::mutex m_;
   std::atomic<int> brk_id_{0};
-  double brk_t_ = 0;
+  double brk_t_ = 0, brk_gap_ = 0, brk_dy_ = 0;
   std::string brk_what_;
   uint64_t pend_ = 0;  // a jump waiting for the poses after it: the index of the first pose past it
   bool Find(double t, uint64_t &i) const;  // newest index with time <= t (caller holds m_)
@@ -339,7 +351,7 @@ class Solver {
   void SetFramePeriod(double p) { frame_p_ = p; }  // s between short frames
   void AddFrame(double t, double g, int cam, V3 o, const M3 &R);  // every short frame; camera pose in Quest space
   void SetInImage(std::function<bool(int cam, V3 d)> f) { in_image_ = std::move(f); }
-  void PoseBreak(double t);
+  void PoseBreak(double t, double dy = 0);  // dy: how far up the headset space moved (m), NAN if unknown
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
@@ -427,6 +439,9 @@ class Solver {
     double d = BodyFar(x, b);
     return !std::isfinite(d) || d <= kBodyFar;
   }
+  std::map<int, double> held_h_;  // s the fit held each height (kHeightBin steps), locked and pinned
+  double held_t_ = -1e18;         // the Step that last added to it
+  bool KeptHeight(double &h) const;  // the most-held height, once held kHeightKeep s
 
   Rays GetRays(double t0);
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
