@@ -17,6 +17,7 @@ class Sync;
 class HeadsetLink {
  public:
   enum State { kIdle, kSearching, kConnecting, kConnected };
+  struct Known { std::string ip, serial, model, streamer; };  // a headset that connected (the memory, latest first)
   using LogFn = std::function<void(const std::string &)>;
   using RecFn = std::function<void(double, const std::string &)>;
 
@@ -25,11 +26,13 @@ class HeadsetLink {
   void Start();
   void Stop();
   void SetWanted(bool w) { wanted_ = w; }             // an eligible HMD is in SteamVR
-  void SetHosts(const std::vector<std::string> &h);   // manual addresses (settings), tried first
+  void SetHosts(const std::vector<std::string> &h);   // manual addresses (settings): asked and tried over TCP too
   void SetPreferred(const std::string &serial);       // pick this headset when several answer
   void SetFamily(const std::string &family);          // SteamVR's HMD (QuestFamily): skip other kinds of headset
-  void SetMemory(const std::string &path);            // the last headset's address, kept there: tried over TCP
-                                                      // when nothing answers discovery (networks that drop broadcasts)
+  void SetStreamer(const std::string &driver);        // SteamVR's streamer: with several headsets, the one last used
+                                                      // with it comes first when the kind can't tell
+  void SetMemory(const std::string &path);            // the headsets' addresses, kept there: tried over TCP when
+                                                      // nothing answers discovery (networks that drop broadcasts)
   State state() const { return state_; }
   std::string serial() const { std::lock_guard<std::mutex> g(m_); return serial_; }
   std::string model() const { std::lock_guard<std::mutex> g(m_); return model_; }  // "Quest Pro": what the page shows
@@ -49,10 +52,15 @@ class HeadsetLink {
   std::atomic<double> last_frame_{0}, connected_at_{0};
   mutable std::mutex m_;
   std::vector<std::string> hosts_;
-  std::string preferred_, serial_, model_, addr_, fw_, mem_path_, last_ip_, failed_ip_, family_, skipped_;
+  std::string preferred_, serial_, model_, addr_, fw_, mem_path_, failed_ip_, family_, streamer_, skipped_;
+  std::vector<Known> known_;
   std::set<std::string> wrong_ips_;  // addresses of headsets of another kind than SteamVR's (until that changes)
+  std::set<std::string> quiet_ips_;  // ... and of ones that sent no camera frames while others might (tried last)
 
   void Loop();
+  int Rank(const std::string &ip, const std::string &serial) const;  // m_ held; less is better
+  void Remember(const Known &k);  // m_ held
+  bool Others(const std::string &ip) const;  // m_ held: another headset this could be, by memory or manual hosts
   bool Discover(std::vector<Found> &out);
   bool Session(const Found &f);
 };

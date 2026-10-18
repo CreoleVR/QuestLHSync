@@ -399,17 +399,20 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         std::string actual = GetStr(c, vr::Prop_ActualTrackingSystemName_String);
         if (!actual.empty()) sys = actual;
         // Virtual Desktop names every headset newer than the Quest Pro "Meta Quest 3", ALVR the one it emulates (a
-        // Quest 2 unless set otherwise): neither name tells, so whichever headset answers is used
-        bool any = any_hmd_ || sys == "oculus_virtualdesktop" || sys == "alvr_server";
+        // Quest 2 unless set otherwise): neither name tells, so whichever headset answers is used (the one last used
+        // with that streamer first). Virtual Desktop's "Meta Quest Pro" is one, though, and a Steam Frame or another
+        // Quest left awake isn't used in its place
+        bool any = any_hmd_ || (sys == "oculus_virtualdesktop" && family != "Quest Pro") || sys == "alvr_server";
         if (family.empty() && !any && StreamerName(sys) == sys) {  // no streamer's driver: a headset on a cable
           SetWired(sys, model);
           g_kind[i] = kOther;
           continue;
         }
         if (!family.empty() || any) {
+          link_->SetFamily(any ? "" : family);  // before g_hmd: the link searches from then on
+          link_->SetStreamer(sys);
           g_hmd = (int)i;
           g_kind[i] = kHmd;
-          link_->SetFamily(any ? "" : family);
           std::lock_guard<std::mutex> g(hmd_m_);
           hmd_model_ = model.empty() ? "headset" : model;
           hmd_system_ = StreamerName(sys);
