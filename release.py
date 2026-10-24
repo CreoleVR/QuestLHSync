@@ -6,6 +6,7 @@ built, one per device:
   QuestLHSync-quest-module-<version>.zip   the Quest's Magisk module
   QuestLHSync-frame-module-<version>.tar.gz  the Steam Frame's package
   QuestLHSync-frame-installer.flatpak      the Steam Frame's installer app, when out/ has one (built on arm64 Linux)
+  QuestLHSync-steamvr-linux-<version>.tar.gz  the SteamVR driver for Linux, when out/ has it (make package, on Linux)
 
 Each package carries LICENSE and THIRD_PARTY_NOTICES.md. Refuses when a build is older than its sources, so a release
 never ships stale binaries.
@@ -28,6 +29,7 @@ BIN = os.path.join(DRIVER, "bin", "win64")
 INSTALLER = os.path.join(HERE, "out", "QuestLHSync-Installer.exe")
 MODULE = os.path.join(HERE, "out", f"QuestLHSync-quest-module-{VERSION.lstrip('v')}.zip")
 FRAME = os.path.join(HERE, "out", f"QuestLHSync-frame-{VERSION}.tar.gz")
+LINUX = os.path.join(HERE, "out", f"QuestLHSync-steamvr-linux-{VERSION.lstrip('v')}.tar.gz")
 NOTICES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
 
 
@@ -91,10 +93,14 @@ def main():
     flatpaks = sorted(glob.glob(os.path.join(HERE, "out", "QuestLHSync-frame-installer*.flatpak")), key=os.path.getmtime)
     if flatpaks:
         shutil.copy2(flatpaks[-1], os.path.join(dest, "QuestLHSync-frame-installer.flatpak"))
+    if os.path.exists(LINUX):  # carries LICENSE and THIRD_PARTY_NOTICES.md already (Makefile)
+        shutil.copy2(LINUX, os.path.join(dest, os.path.basename(LINUX)))
     for f in sorted(os.listdir(dest)):
         print(f"  {f}  ({os.path.getsize(os.path.join(dest, f)) / 1e6:.1f} MB)")
     if not flatpaks:
         print("  (no out/QuestLHSync-frame-installer*.flatpak: attach the Frame's installer app on its own)")
+    if not os.path.exists(LINUX):
+        print(f"  (no {os.path.relpath(LINUX, HERE)}: attach the Linux driver on its own, from make package)")
     print(f"built {dest}")
 
 

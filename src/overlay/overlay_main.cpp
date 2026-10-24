@@ -2,12 +2,25 @@
 // Reads the driver's status from the shared memory (qlhs_status.h), draws it with GDI at 2x and downsamples
 // (anti-aliased shapes and text), and sends the buttons back as commands.
 //   QuestLHSync.exe --preview out.png [locked|acquiring|still|frozen|searching|nohmd]   renders a sample page, no VR
+//
+// Linux (bin/linux64/QuestLHSync): the same page, drawn by canvas_linux.h (stb_truetype, fontconfig's fonts), sent to
+// the dashboard with SetOverlayRaw, and shown in an SDL2 window when libSDL2 and a display are there.
+#ifdef _WIN32
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #undef small  // rpcndr.h (via d3d11.h): "#define small char"
+#else
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +38,7 @@
 static const int W = 1280, H = 800, SS = 2;  // page size, supersampling
 
 // ---------------------------------------------------------------- canvas
+#ifdef _WIN32
 struct Canvas {
   int w, h;
   HDC dc;
@@ -81,6 +95,23 @@ struct Painter {
     DeleteObject(p);
   }
   void Dot(int cx, int cy, int r, uint32_t color) { Rect(cx - r, cy - r, 2 * r, 2 * r, color, r); }
+  // a stroke on the canvas (canvas px)
+  void LineC(double x0, double y0, double x1, double y1, double w, uint32_t color) {
+    HPEN pen = CreatePen(PS_SOLID, (int)w, C(color));
+    HGDIOBJ op = SelectObject(c.dc, pen);
+    MoveToEx(c.dc, (int)x0, (int)y0, nullptr);
+    LineTo(c.dc, (int)x1, (int)y1);
+    SelectObject(c.dc, op);
+    DeleteObject(pen);
+  }
+  // text width on the canvas (2x px)
+  int Measure(const std::wstring &t, const Font &f) {
+    HGDIOBJ of = SelectObject(c.dc, f.f);
+    SIZE sz;
+    GetTextExtentPoint32W(c.dc, t.c_str(), (int)t.size(), &sz);
+    SelectObject(c.dc, of);
+    return sz.cx;
+  }
   // text; align 0 left, 1 center, 2 right (x is the anchor). returns the width
   int Text(int x, int y, const std::wstring &s, const Font &f, uint32_t color, int align = 0, int maxw = 0) {
     HGDIOBJ of = SelectObject(c.dc, f.f);
@@ -115,6 +146,41 @@ static std::wstring F(const wchar_t *fmt, ...) {
   va_end(ap);
   return b;
 }
+#define WS L"%s"  // a wide string argument in F's format (MSVC's wide printf)
+#else
+#include "canvas_linux.h"
+
+static uint32_t C(uint32_t rgb) { return rgb; }
+
+namespace col {
+const uint32_t bg = 0x14161b, card = 0x1d2027, card2 = 0x252932, line = 0x30343e, text = 0xeceef2, dim = 0x9aa1ad,
+               faint = 0x6b7280, green = 0x3ccf6e, amber = 0xffb224, red = 0xff5f57, blue = 0x5b8cff, grey = 0x8e93a0;
+}
+
+// UTF-8 -> UTF-32 (wchar_t is 32-bit here)
+static std::wstring Wide(const char *s) {
+  std::wstring w;
+  auto *p = (const unsigned char *)s;
+  while (*p) {
+    uint32_t c = *p++;
+    int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+    if (more) c &= 0x3F >> more;
+    for (int i = 0; i < more && (*p & 0xC0) == 0x80; i++) c = (c << 6) | (*p++ & 0x3F);
+    w += (wchar_t)c;
+  }
+  return w;
+}
+
+static std::wstring F(const wchar_t *fmt, ...) {
+  wchar_t b[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vswprintf(b, sizeof b / sizeof b[0], fmt, ap);
+  va_end(ap);
+  return b;
+}
+#define WS L"%ls"  // a wide string argument in F's format (C's wide printf)
+#endif
 
 static std::wstring Ago(double s) {
   if (s < 0) return L"not yet";
@@ -196,11 +262,7 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
   StateText(s, stale, title, sub, sc);
   {
     Font pill(22, FW_SEMIBOLD, L"Segoe UI Semibold");
-    HGDIOBJ of = SelectObject(cv.dc, pill.f);
-    SIZE sz;
-    GetTextExtentPoint32W(cv.dc, title.c_str(), (int)title.size(), &sz);
-    SelectObject(cv.dc, of);
-    int tw = sz.cx / SS, pw = tw + 64, px = W - 48 - pw;
+    int tw = p.Measure(title, pill) / SS, pw = tw + 64, px = W - 48 - pw;
     p.Rect(px, 40, pw, 48, col::card2, 24);
     p.Dot(px + 26, 64, 7, sc);
     p.Text(px + 44, 50, title, pill, col::text);
@@ -230,7 +292,7 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
   row(x1, top + 168, L"Round trip", s.rtt_ms > 0 ? F(L"%.1f ms", s.rtt_ms) : L"—");
   row(x1, top + 202, L"Streamer", s.hmd_system[0] ? Wide(s.hmd_system) : L"—");
   row(x1, top + 236, L"Pose timing",
-      s.headset_addr[0] ? F(L"%.1f ms %s", s.expo_ms, s.expo_learned ? L"(learned)" : L"(learning)") : L"—",
+      s.headset_addr[0] ? F(L"%.1f ms " WS, s.expo_ms, s.expo_learned ? L"(learned)" : L"(learning)") : L"—",
       s.expo_learned || !s.headset_addr[0] ? col::text : col::amber);
   row(x1, top + 270, L"Bright spots", s.cam_fps > 0.5 ? F(L"%.0f/s, %.0f/s used", s.spot_rate, s.sight_rate) : L"—",
       s.state == QLHS_ACQUIRING && s.sight_rate < 0.5 ? col::amber : col::text);
@@ -326,14 +388,8 @@ static void DrawIcon(std::vector<uint8_t> &rgba, int N) {
   p.Rect(S(54), S(66), S(70), S(70), col::text, S(18));      // base station
   p.Dot(S(89), S(101), S(20), col::bg);
   p.Dot(S(89), S(101), S(10), col::blue);
-  HPEN pen = CreatePen(PS_SOLID, S(8) * SS, C(col::blue));
-  HGDIOBJ op = SelectObject(cv.dc, pen);
-  for (int i = 0; i < 3; i++) {  // laser lines
-    MoveToEx(cv.dc, S(118) * SS, S(112 + i * 14) * SS, nullptr);
-    LineTo(cv.dc, S(170) * SS, S(140 + i * 18) * SS);
-  }
-  SelectObject(cv.dc, op);
-  DeleteObject(pen);
+  for (int i = 0; i < 3; i++)  // laser lines
+    p.LineC(S(118) * SS, S(112 + i * 14) * SS, S(170) * SS, S(140 + i * 18) * SS, S(8) * SS, col::blue);
   p.Rect(S(140), S(150), S(86), S(52), col::green, S(20));   // headset visor
   p.Dot(S(166), S(176), S(9), col::bg);
   p.Dot(S(200), S(176), S(9), col::bg);
@@ -439,6 +495,7 @@ static QlhsStatus Sample(const char *kind) {
 // ---------------------------------------------------------------- main
 static QlhsStatus *g_shm;
 
+#ifdef _WIN32
 static bool ReadStatus(QlhsStatus &out) {
   if (!g_shm) {
     HANDLE m = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, QLHS_SHM_NAME);
@@ -463,12 +520,58 @@ static void SendCmd(int cmd) {
   MemoryBarrier();
   InterlockedIncrement((volatile LONG *)&g_shm->cmd_seq);
 }
+#else
+static uint64_t TickMs() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void SleepMs(unsigned ms) {
+  timespec ts{(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
+  while (nanosleep(&ts, &ts) != 0) {}
+}
+
+static bool ReadStatus(QlhsStatus &out) {
+  if (!g_shm) {
+    std::string name = QLHS_SHM_PREFIX + std::to_string((unsigned)getuid());
+    int fd = shm_open(name.c_str(), O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    struct stat st;
+    void *m = MAP_FAILED;
+    if (fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof(QlhsStatus))
+      m = mmap(nullptr, sizeof(QlhsStatus), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return false;
+    g_shm = (QlhsStatus *)m;
+  }
+  for (int i = 0; i < 100; i++) {
+    int32_t s = __atomic_load_n(&g_shm->seq, __ATOMIC_ACQUIRE);
+    if (s & 1) { sched_yield(); continue; }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    memcpy(&out, (const void *)g_shm, sizeof out);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&g_shm->seq, __ATOMIC_ACQUIRE) == s)
+      return out.magic == QLHS_MAGIC && out.version == QLHS_VERSION;
+  }
+  return false;
+}
+
+static void SendCmd(int cmd) {
+  if (!g_shm) return;
+  g_shm->cmd = cmd;
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  __atomic_add_fetch(&g_shm->cmd_seq, 1, __ATOMIC_SEQ_CST);
+}
+#endif
 
 // ---------------------------------------------------------------- desktop window: the same page, scaled to fit
 static Canvas *g_page;
 static Page *g_pg;
 static bool g_dirty = true, g_ui = false;  // g_ui: hover/click, redraw now
+#ifdef _WIN32
 static int g_down = -1;
+#endif
 
 static int HitAt(float mx, float my) {
   for (size_t i = 0; i < g_pg->buttons.size(); i++) {
@@ -478,6 +581,7 @@ static int HitAt(float mx, float my) {
   return -1;
 }
 
+#ifdef _WIN32
 static int WinHit(HWND h, LPARAM l) {
   RECT r;
   GetClientRect(h, &r);
@@ -764,3 +868,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   ReleaseMutex(mutex);
   return 0;
 }
+#else
+#include "main_linux.inc"
+#endif

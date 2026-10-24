@@ -11,6 +11,16 @@ the complete text is in `third_party/openvr/LICENSE`.
 
 Source: https://github.com/ValveSoftware/openvr
 
+The Linux build also compiles OpenVR's client library from `third_party/openvr/src` (the same tag, unmodified) into
+the dashboard app, under the same license.
+
+## stb_truetype
+
+`third_party/stb/stb_truetype.h` (v1.26), used by the Linux dashboard app to draw text, is by Sean Barrett and
+contributors, available under the MIT license or as public domain (the text is at the end of the file).
+
+Source: https://github.com/nothings/stb
+
 ## MinHook
 
 MinHook under `third_party/minhook` is Copyright (C) 2009-2017 Tsuda Kageyu,

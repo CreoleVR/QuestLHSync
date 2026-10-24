@@ -149,7 +149,14 @@ class Gravity {
 
   void Worker();
   void ReadLoop(std::string receiver, Reader *r);
+#ifdef _WIN32
   bool FindPath(const std::string &receiver, std::wstring &path);
+#else
+  // the receiver's hidraw nodes (/dev/hidrawN): Valve's (28de) whose USB serial (HID_UNIQ) is the receiver's
+  std::vector<std::string> FindPaths(const std::string &receiver);
+#endif
+  // one input report read from the receiver at QPC time t: its IMU samples to OnImu
+  void OnReport(const std::string &receiver, Reader *rd, const unsigned char *r, size_t n, double t);
   bool LoadConfig(Dev &d);
   void Ingest(Rx &r, const ImuS &s);
   void MapClock(Rx &r);

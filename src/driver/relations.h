@@ -50,6 +50,7 @@ class Relations {
   int say_n_ = 0, say_skipped_ = 0;                                    // lines this minute, and dropped
   bool odd_said_ = false;                                              // a relationship that isn't a pose logged
   void *target_ = nullptr;
+  bool said_linux_ = false;
 
   void Load();
   void Say(const std::string &s);  // a log line for Flush, at most 10 a minute (m_ held)
