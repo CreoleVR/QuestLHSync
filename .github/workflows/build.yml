@@ -1,0 +1,67 @@
+# Builds the SteamVR driver and dashboard app for Linux and Windows on every push and pull request.
+# Linux builds in Valve's Steam Runtime 3 (sniper) SDK, glibc 2.31, so the binaries load on any distro SteamVR runs on.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! { make -j"$(nproc)" && make tools && make package; } 2>&1 | tee build.log; then
+            grep -E "error|undefined reference|No such file" build.log | head -20 | sed 's/^/::error::/'
+            exit 1
+          fi
+      - name: Check
+        run: |
+          so=driver/questlhsync/bin/linux64/driver_questlhsync.so
+          nm -D --defined-only "$so" | grep -q " T HmdDriverFactory$"
+          echo "newest glibc symbol needed:"
+          objdump -T "$so" driver/questlhsync/bin/linux64/QuestLHSync | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          driver/questlhsync/bin/linux64/QuestLHSync --preview preview.png locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuestLHSync-steamvr-linux
+          path: |
+            out/QuestLHSync-steamvr-linux-*.tar.gz
+            preview.png
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: cmd
+        run: |
+          call build.bat > build.log 2>&1
+          set rc=%errorlevel%
+          type build.log
+          if not %rc%==0 (
+            findstr /i /c:" error " /c:"fatal error" /c:"unresolved external" build.log > errors.txt
+            for /f "usebackq delims=" %%l in ("errors.txt") do echo ::error::%%l
+            exit /b %rc%
+          )
+          call build_replay.bat > replay.log 2>&1
+          set rc=%errorlevel%
+          type replay.log
+          if not %rc%==0 (
+            findstr /i /c:" error " /c:"fatal error" /c:"unresolved external" replay.log > errors.txt
+            for /f "usebackq delims=" %%l in ("errors.txt") do echo ::error::%%l
+            exit /b %rc%
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuestLHSync-steamvr-windows
+          path: |
+            driver/questlhsync/bin/win64/driver_questlhsync.dll
+            driver/questlhsync/bin/win64/QuestLHSync.exe
+            out/QuestLHSync-Installer.exe

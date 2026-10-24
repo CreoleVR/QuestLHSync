@@ -1,18 +1,38 @@
 #include "net.h"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define closesocket close
+#endif
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <set>
 
+#include "platform.h"
 #include "sync.h"
 
 static const int kUdpPort = 47281, kTcpPort = 47280;
@@ -23,11 +43,45 @@ static const double kQuietSwitch = 20.0;  // s
 static const double kQuietAgain = 120.0;  // s, once it gave way and came round again: nothing else answered then
 static const size_t kKnownMax = 8;        // headsets kept in the memory
 
+#ifdef _WIN32
 double QpcNow() {
   static LARGE_INTEGER f = [] { LARGE_INTEGER v; QueryPerformanceFrequency(&v); return v; }();
   LARGE_INTEGER c;
   QueryPerformanceCounter(&c);
   return (double)(c.QuadPart / f.QuadPart) + (double)(c.QuadPart % f.QuadPart) / (double)f.QuadPart;
+}
+#else
+// CLOCK_MONOTONIC: the same clock as the pose times (now + poseTimeOffset) and the headset round trips
+double QpcNow() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+#endif
+
+// waits until s is readable (or writable): 1 ready, 0 timed out, -1 error. poll on Linux: vrserver may hold more than
+// FD_SETSIZE descriptors, which select can't take
+static int WaitFd(SOCKET s, bool write, double seconds) {
+#ifdef _WIN32
+  fd_set f, e;
+  FD_ZERO(&f); FD_SET(s, &f);
+  FD_ZERO(&e); FD_SET(s, &e);
+  timeval tv{(long)seconds, (long)((seconds - (long)seconds) * 1e6)};
+  int r = select(0, write ? nullptr : &f, write ? &f : nullptr, write ? &e : nullptr, &tv);
+  if (r > 0 && write && FD_ISSET(s, &e)) return -1;
+  return r < 0 ? -1 : r > 0 ? 1 : 0;
+#else
+  pollfd p{s, (short)(write ? POLLOUT : POLLIN), 0};
+  int ms = (int)(seconds * 1000 + 0.5);
+  for (;;) {
+    int r = poll(&p, 1, ms);
+    if (r < 0 && errno == EINTR) continue;
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    if (write && (p.revents & (POLLERR | POLLHUP))) return -1;
+    return 1;
+  }
+#endif
 }
 
 void HeadsetLink::Start() {
@@ -173,12 +227,14 @@ bool HeadsetLink::Others(const std::string &ip) const {
 }
 
 static void Sleep_(std::atomic<bool> &run, int ms) {
-  for (int i = 0; i < ms / 50 && run; i++) Sleep(50);
+  for (int i = 0; i < ms / 50 && run; i++) qlhs::SleepMs(50);
 }
 
 void HeadsetLink::Loop() {
+#ifdef _WIN32
   WSADATA wd;
   WSAStartup(MAKEWORD(2, 2), &wd);
+#endif
   int quiet = 0;
   while (run_) {
     if (!wanted_) { state_ = kIdle; Sleep_(run_, 500); continue; }
@@ -231,12 +287,15 @@ void HeadsetLink::Loop() {
     state_ = kSearching;
     Sleep_(run_, 2000);
   }
+#ifdef _WIN32
   WSACleanup();
+#endif
 }
 
 // directed broadcast address of every IPv4 interface that's up
 static std::vector<sockaddr_in> Broadcasts() {
   std::vector<sockaddr_in> out;
+#ifdef _WIN32
   ULONG sz = 16384;
   std::vector<unsigned char> buf(sz);
   if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
@@ -259,13 +318,33 @@ static std::vector<sockaddr_in> Broadcasts() {
       out.push_back(b);
     }
   }
+#else
+  ifaddrs *ifs = nullptr;
+  if (getifaddrs(&ifs) != 0) return out;
+  for (ifaddrs *a = ifs; a; a = a->ifa_next) {
+    if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET || !a->ifa_netmask) continue;
+    if (!(a->ifa_flags & IFF_UP) || (a->ifa_flags & IFF_LOOPBACK)) continue;
+    uint32_t ip = ntohl(((sockaddr_in *)a->ifa_addr)->sin_addr.s_addr);
+    uint32_t mask = ntohl(((sockaddr_in *)a->ifa_netmask)->sin_addr.s_addr);
+    if (mask == 0 || mask == 0xFFFFFFFFu || mask == 0xFFFFFFFEu) continue;  // no prefix, or /31, /32
+    sockaddr_in b{};
+    b.sin_family = AF_INET;
+    b.sin_port = htons(kUdpPort);
+    b.sin_addr.s_addr = htonl(ip | ~mask);
+    out.push_back(b);
+  }
+  freeifaddrs(ifs);
+#endif
   return out;
 }
 
 bool HeadsetLink::Discover(std::vector<Found> &out) {
   SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (s == INVALID_SOCKET) return false;
-  BOOL on = TRUE;
+#ifndef _WIN32
+  fcntl(s, F_SETFD, fcntl(s, F_GETFD) | FD_CLOEXEC);
+#endif
+  int on = 1;
   setsockopt(s, SOL_SOCKET, SO_BROADCAST, (const char *)&on, sizeof on);
   sockaddr_in any{};
   any.sin_family = AF_INET;
@@ -300,14 +379,10 @@ bool HeadsetLink::Discover(std::vector<Found> &out) {
   for (;;) {
     double left = until - QpcNow();
     if (left <= 0) break;
-    fd_set rf;
-    FD_ZERO(&rf);
-    FD_SET(s, &rf);
-    timeval tv{0, (long)(left * 1e6)};
-    if (select(0, &rf, nullptr, nullptr, &tv) <= 0) break;
+    if (WaitFd(s, false, left) <= 0) break;
     char buf[512];
     sockaddr_in from{};
-    int fl = sizeof from;
+    socklen_t fl = sizeof from;
     int n = recvfrom(s, buf, sizeof buf - 1, 0, (sockaddr *)&from, &fl);
     if (n <= 0) continue;
     buf[n] = 0;
@@ -327,7 +402,11 @@ bool HeadsetLink::Discover(std::vector<Found> &out) {
 static bool SendAll(SOCKET s, const std::string &d) {
   size_t o = 0;
   while (o < d.size()) {
+#ifdef _WIN32
     int n = send(s, d.data() + o, (int)(d.size() - o), 0);
+#else
+    ssize_t n = send(s, d.data() + o, d.size() - o, MSG_NOSIGNAL);  // a dropped headset mustn't SIGPIPE vrserver
+#endif
     if (n <= 0) return false;
     o += n;
   }
@@ -343,24 +422,39 @@ bool HeadsetLink::Session(const Found &f) {
   snprintf(port, sizeof port, "%d", f.port);
   if (getaddrinfo(f.ip.c_str(), port, &hint, &res) != 0 || !res) return false;
   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (s == INVALID_SOCKET) { freeaddrinfo(res); return false; }
+#ifdef _WIN32
   u_long nb = 1;
   ioctlsocket(s, FIONBIO, &nb);
+#else
+  fcntl(s, F_SETFD, fcntl(s, F_GETFD) | FD_CLOEXEC);  // not into the dashboard app the driver starts
+  fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+#endif
   connect(s, res->ai_addr, (int)res->ai_addrlen);
   freeaddrinfo(res);
-  fd_set wf, ef;
-  FD_ZERO(&wf); FD_SET(s, &wf);
-  FD_ZERO(&ef); FD_SET(s, &ef);
-  timeval tv{3, 0};
-  if (select(0, nullptr, &wf, &ef, &tv) <= 0 || FD_ISSET(s, &ef)) {
+  bool up = WaitFd(s, true, 3) > 0;
+#ifndef _WIN32
+  if (up) {  // a refused connect shows as writable here, with the error in SO_ERROR
+    int err = 0;
+    socklen_t el = sizeof err;
+    up = getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0;
+  }
+#endif
+  if (!up) {
     std::lock_guard<std::mutex> g(m_);
     if (failed_ip_ != f.ip) log_("headset " + f.ip + ": TCP connect failed");  // once per address, not every retry
     failed_ip_ = f.ip;
     closesocket(s);
     return false;
   }
+#ifdef _WIN32
   nb = 0;
   ioctlsocket(s, FIONBIO, &nb);
   BOOL on = TRUE;
+#else
+  fcntl(s, F_SETFL, fcntl(s, F_GETFL) & ~O_NONBLOCK);
+  int on = 1;
+#endif
   setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof on);
   setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof on);
   {
@@ -414,14 +508,10 @@ bool HeadsetLink::Session(const Found &f) {
       if (!SendAll(s, p)) break;
     }
     if (now - last_rx > 10) { log_("headset: nothing received for 10 s, reconnecting"); break; }
-    fd_set rf;
-    FD_ZERO(&rf);
-    FD_SET(s, &rf);
-    timeval t2{0, 50000};
-    int r = select(0, &rf, nullptr, nullptr, &t2);
+    int r = WaitFd(s, false, 0.05);
     if (r < 0) break;
     if (r == 0) continue;
-    int n = recv(s, buf, sizeof buf, 0);
+    int n = (int)recv(s, buf, sizeof buf, 0);
     if (n <= 0) { log_("headset: connection closed"); break; }
     double rx = QpcNow();
     last_rx = rx;

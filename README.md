@@ -27,8 +27,8 @@ headset module.
 - Or a **Steam Frame**. No root, no developer password: everything installs as
   your user.
 - **SteamVR base stations**, 1.0 or 2.0.
-- **Windows with SteamVR**, with the headset streamed by anything: Steam Link,
-  Link, Air Link, Virtual Desktop, ALVR, CreoleCast...
+- **Windows or Linux with SteamVR**, with the headset streamed by anything:
+  Steam Link, Link, Air Link, Virtual Desktop, ALVR, CreoleCast...
 - The PC and the headset on the **same local network**.
 - At least **one lighthouse device switched on** (a tracker or an Index
   controller). SteamVR only shows base stations while one is on.
@@ -74,6 +74,11 @@ Each device has its own file in
    "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "C:\path\to\questlhsync"
    ```
 
+   **On Linux:** with SteamVR closed, extract
+   `QuestLHSync-steamvr-linux-<version>.tar.gz` and run `./install.sh` in it.
+   It installs the driver to `~/.local/share/QuestLHSync/questlhsync` and
+   registers it with SteamVR. See [linux/README.md](linux/README.md).
+
 3. Turn off SpaceCalibrator, OpenVR-SpaceSync or anything else that moves
    lighthouse devices. Two tools correcting the same devices fight each other.
 
@@ -108,8 +113,8 @@ controllers' and trackers' accelerometers level it as they move about.
   stays.
 
 What a headset's cameras have seen is kept per headset, in
-`%LOCALAPPDATA%\QuestLHSync\headsets\<model>-<id>\state.json` (the id is a hash
-of its serial number), so switching between headsets doesn't seed one with the
+`%LOCALAPPDATA%\QuestLHSync\headsets\<model>-<id>\state.json` (on Linux
+`~/.local/share/QuestLHSync/headsets/...`; the id is a hash of its serial number), so switching between headsets doesn't seed one with the
 other's alignment or pose timing. The `state.json` of earlier versions moves to
 the first headset that connects. `stations.json`, the reference frame of your
 base stations, is shared by all headsets.
@@ -126,7 +131,7 @@ Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`:
 | `anyHmd` | `false` | Use SteamVR's headset even when it isn't named a Quest Pro, 3, 3S or Steam Frame |
 | `record` | `false` | Record every session (same as the button) |
 | `gravity` | `true` | `false` turns levelling by the lighthouse devices' accelerometers off |
-| `steadyStations` | `true` | `false` lets SteamVR move base stations by each new measurement instead of their average |
+| `steadyStations` | `true` | `false` lets SteamVR move base stations by each new measurement instead of their average (Windows only) |
 
 With a wired headset (SteamVR's headset is a lighthouse one, or tracked by a driver that isn't a streamer's: Index, Vive, Windows Mixed Reality, ...), QuestLHSync switches itself off: no corrections, no levelling, no base station averaging, and the dashboard closes. `anyHmd` keeps it on for a headset it wouldn't otherwise accept (never a lighthouse one).
 
@@ -135,7 +140,8 @@ With a wired headset (SteamVR's headset is a lighthouse one, or tracked by a dri
 - **"Looking for the headset":** the headset must be awake and on the same
   network. If your router drops broadcasts, set `host`.
 - **"No camera frames":** the cameras only run while the headset tracks. Put it
-  on. If it stays there, check `%LOCALAPPDATA%\QuestLHSync\questlhsync.log`:
+  on. If it stays there, check `%LOCALAPPDATA%\QuestLHSync\questlhsync.log`
+  (`~/.local/share/QuestLHSync/questlhsync.log` on Linux):
   a `no camera buffers found` line means the headset part doesn't know this
   headset or OS build yet. Please open an issue with that line. On the Frame, a
   "questlhsync_frame SteamVR driver isn't running" line means SteamVR on the
@@ -147,8 +153,8 @@ With a wired headset (SteamVR's headset is a lighthouse one, or tracked by a dri
 
 ## Privacy and security
 
-The PC side writes only to `%LOCALAPPDATA%\QuestLHSync` and only talks to the
-headset. The headset part answers anyone on the local network without
+The PC side writes only to `%LOCALAPPDATA%\QuestLHSync` (on Linux
+`~/.local/share/QuestLHSync`) and only talks to the headset. The headset part answers anyone on the local network without
 authentication. It sends bright-spot positions (never images), the camera
 calibration, and the headset's serial number, model and firmware. Use it on a
 network you trust. It only reads the cameras while a PC is connected, and
@@ -162,7 +168,9 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
   `QuestLHSync-frame/uninstall.sh` on the headset.
 - **PC:** with SteamVR closed, click **Uninstall** in the installer, or run
   `vrpathreg removedriver "C:\path\to\questlhsync"` and delete
-  `%LOCALAPPDATA%\QuestLHSync`.
+  `%LOCALAPPDATA%\QuestLHSync`. On Linux, run `./uninstall.sh` from the
+  package, and delete `~/.local/share/QuestLHSync` to drop the saved alignment
+  too.
 
 ## Building
 
@@ -191,6 +199,10 @@ and the GNOME SDK:
 `flatpak install --user flathub org.flatpak.Builder org.gnome.Sdk//50`.
 `release.py` adds it to the release files as `QuestLHSync-frame-installer.flatpak`
 when it's in `out/`.
+
+The Linux SteamVR driver and dashboard app build with `make` (`make package`
+for `out/QuestLHSync-steamvr-linux-<version>.tar.gz`, which `release.py` adds
+when it's in `out/`); see [linux/README.md](linux/README.md#building).
 
 `lhsyncd`'s core (`src/headset/lhsyncd.c`) is shared by both headsets; each adds
 its own side behind `src/headset/headset.h` (`magisk/src/quest.c`,

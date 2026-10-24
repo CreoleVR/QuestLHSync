@@ -2,8 +2,10 @@
 // log, placed on this PC's clock where the fake headset's clock puts the camera frames.
 //   qlhs_nettest <log> --dir <state dir> [--start s] [--dur s] [--mem <headset.txt>] [--family "Quest 3"]
 // --family: SteamVR's HMD kind (default Quest Pro), to test that headsets of another kind are skipped
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
+#endif
 
 #include <atomic>
 #include <cstdio>
@@ -15,6 +17,7 @@
 #include <vector>
 
 #include "../driver/net.h"
+#include "../driver/platform.h"
 #include "../driver/sync.h"
 
 int main(int argc, char **argv) {
@@ -89,7 +92,7 @@ int main(int argc, char **argv) {
       link.Stop();
       return 3;
     }
-    Sleep(10);
+    qlhs::SleepMs(10);
   }
   std::atomic<bool> run{true};
   std::thread feeder([&] {  // HMD poses at their time on this clock, like the driver's hook sees them
@@ -98,7 +101,7 @@ int main(int argc, char **argv) {
     for (; i < poses.size() && run; i++) {
       double at = qpc0 + (poses[i].t - pc0);
       double w = at - QpcNow();
-      if (w > 0.002) Sleep((DWORD)(w * 1000));
+      if (w > 0.002) qlhs::SleepMs((unsigned)(w * 1000));
       sync.OnHmdPose(at, poses[i].q, poses[i].p);
     }
   });
@@ -117,7 +120,7 @@ int main(int argc, char **argv) {
              st.x[1] * 100, st.x[2] * 100, st.x[3] * 100, st.n, st.med, sts.c_str());
       fflush(stdout);
     }
-    Sleep(50);
+    qlhs::SleepMs(50);
   }
   run = false;
   feeder.join();

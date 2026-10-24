@@ -6,6 +6,10 @@
 
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
+// Linux: POSIX shared memory "/QuestLHSync-<uid>", and the dashboard app holds an flock on
+// $XDG_RUNTIME_DIR/QuestLHSyncOverlay.lock (/tmp/QuestLHSyncOverlay-<uid>.lock without one) while it runs
+#define QLHS_SHM_PREFIX "/QuestLHSync-"
+#define QLHS_OVERLAY_LOCK "QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
 #define QLHS_VERSION 2
 #define QLHS_RELEASE "1.26"  // magisk/build_module.py reads it

@@ -7,9 +7,23 @@
 // through it): lighthouse devices get the transform prepended to their WorldFromDriver, and the HMD's own poses
 // (any streamer's) feed the solver with their exact times. Status and commands for the dashboard overlay
 // (QuestLHSync.exe, launched from here) go through the shared memory in qlhs_status.h.
+//
+// Linux: the hook goes on the host's vtable entry instead (hook_posix.h), the status in POSIX shared memory, and the
+// dashboard app is bin/linux64/QuestLHSync.
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #include <shlobj.h>
+#else
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -27,7 +41,12 @@
 #include <vector>
 
 #include "../common/qlhs_status.h"
+#ifdef _WIN32
 #include "MinHook.h"
+#else
+#include "hook_posix.h"
+#endif
+#include "platform.h"
 #include "gravity.h"
 #include "net.h"
 #include "openvr_driver.h"
@@ -52,7 +71,7 @@ static void Log(const std::string &s) {
   if (g_logf) {
     time_t t = time(nullptr);
     struct tm tm;
-    localtime_s(&tm, &t);
+    qlhs::LocalTime(t, tm);
     char b[32];
     strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &tm);
     fprintf(g_logf, "%s %s\n", b, s.c_str());
@@ -71,10 +90,7 @@ static std::string Fmt(const char *fmt, ...) {
 }
 
 static std::string DataDir() {
-  PWSTR p = nullptr;
-  std::filesystem::path d;
-  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p))) d = std::filesystem::path(p) / "QuestLHSync";
-  CoTaskMemFree(p);
+  std::filesystem::path d = qlhs::LocalAppData() / "QuestLHSync";
   std::error_code ec;
   std::filesystem::create_directories(d, ec);
   return d.string();
@@ -99,7 +115,7 @@ static bool ReadXf(Xf &x) {
   static thread_local Xf last{};
   for (int i = 0; i < 64; i++) {
     uint32_t s = g_xf_seq.load(std::memory_order_acquire);
-    if (s & 1) { YieldProcessor(); continue; }
+    if (s & 1) { qlhs::CpuRelax(); continue; }
     Xf c = g_xf_buf;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (g_xf_seq.load(std::memory_order_acquire) == s) { last = c; break; }
@@ -227,6 +243,7 @@ static void Detour(void *self, uint32_t id, const vr::DriverPose_t &pose, uint32
   g_orig[I](self, id, pose, size);
 }
 
+#ifdef _WIN32
 static void HookHost(const char *version, int i, void *detour) {
   vr::EVRInitError err = vr::VRInitError_None;
   void *host = vr::VRDriverContext()->GetGenericInterface(version, &err);
@@ -260,6 +277,52 @@ static void UnhookHost() {
     }
   }
 }
+#else
+static void **g_slot[2];
+
+// the host's vtable entry for TrackedDevicePoseUpdated (index 1, after TrackedDeviceAdded) points to the detour: every
+// driver's calls go through it, as through MinHook's jump on Windows. The original is kept before the entry changes,
+// so a pose update on another thread meanwhile finds it
+static void HookHost(const char *version, int i, void *detour) {
+  vr::EVRInitError err = vr::VRInitError_None;
+  void *host = vr::VRDriverContext()->GetGenericInterface(version, &err);
+  if (!host) { Log(Fmt("no %s", version)); return; }
+  void **slot = &(*(void ***)host)[1];
+  for (int j = 0; j < 2; j++)
+    if (g_slot[j] == slot) { Log(Fmt("%s shares the hooked function", version)); return; }
+  g_orig[i] = (PoseFn)__atomic_load_n(slot, __ATOMIC_ACQUIRE);
+  if (!hookp::SlotPut(slot, detour)) {
+    Log(Fmt("hooking %s failed", version));
+    return;
+  }
+  g_slot[i] = slot;
+  g_target[i] = (void *)slot;
+  g_detour[i] = detour;
+  Log(Fmt("hooked %s::TrackedDevicePoseUpdated", version));
+}
+
+// takes the pose hooks out, each only while its entry still points to our detour: one another driver has placed over
+// it since stays, passing poses on untouched, as taking it out would take theirs with it
+static void UnhookHost() {
+  for (int j = 0; j < 2; j++) {
+    if (!g_slot[j]) continue;
+    if (__atomic_load_n(g_slot[j], __ATOMIC_ACQUIRE) == g_detour[j]) {
+      if (hookp::SlotPut(g_slot[j], (void *)g_orig[j])) Log("pose hook taken out");
+    } else {
+      Log("another driver hooked SteamVR's pose updates after QuestLHSync: its hook stays, passing poses on untouched");
+    }
+    g_slot[j] = nullptr;
+  }
+}
+
+// this library stays loaded until vrserver exits: a hook placed over ours may still call into it after Cleanup
+static void PinSelf() {
+  Dl_info di{};
+  if (dladdr((void *)&PinSelf, &di) && di.dli_fname) dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+}
+
+static std::string ShmName() { return QLHS_SHM_PREFIX + std::to_string((unsigned)getuid()); }
+#endif
 
 // ---------------------------------------------------------------- status shared memory
 static std::mutex g_stlog_m;
@@ -269,7 +332,7 @@ static void PushStatusLog(const std::string &s) {
   std::lock_guard<std::mutex> g(g_stlog_m);
   time_t t = time(nullptr);
   struct tm tm;
-  localtime_s(&tm, &t);
+  qlhs::LocalTime(t, tm);
   char b[16];
   strftime(b, sizeof b, "%H:%M:%S", &tm);
   g_pending_log.push_back(std::string(b) + "  " + s);
@@ -306,19 +369,30 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     dir_ = DataDir();
     {
       std::lock_guard<std::mutex> g(g_log_m);
-      std::string lp = dir_ + "\\questlhsync.log";
+      std::string lp = dir_ + QLHS_SEP "questlhsync.log";
       std::error_code ec;
       if (std::filesystem::file_size(lp, ec) > (2 << 20)) std::filesystem::rename(lp, lp + ".old", ec);
       g_logf = fopen(lp.c_str(), "a");
     }
+#ifdef _WIN32
     map_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(QlhsStatus), QLHS_SHM_NAME);
     if (map_) g_st = (QlhsStatus *)MapViewOfFile(map_, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(QlhsStatus));
+#else
+    int fd = shm_open(ShmName().c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+      if (ftruncate(fd, sizeof(QlhsStatus)) == 0) {
+        void *m = mmap(nullptr, sizeof(QlhsStatus), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED) g_st = (QlhsStatus *)m;
+      }
+      close(fd);
+    }
+#endif
     if (g_st) {
       memset((void *)g_st, 0, sizeof(QlhsStatus));
       g_st->version = QLHS_VERSION;
       g_st->magic = QLHS_MAGIC;
     }
-    Log("QuestLHSync " QLHS_RELEASE " driver starting, data in %LOCALAPPDATA%\\QuestLHSync");
+    Log("QuestLHSync " QLHS_RELEASE " driver starting, data in " QLHS_DATA_DIR_TEXT);
     SyncConfig cfg;
     cfg.dir = dir_;
     cfg.per_headset = true;
@@ -329,9 +403,13 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     link_ = std::make_unique<HeadsetLink>(
         g_sync.get(), [](const std::string &s) { Log(s); },
         [](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
-    link_->SetMemory(dir_ + "\\headset.txt");
+    link_->SetMemory(dir_ + QLHS_SEP "headset.txt");
     ReadSettings();
+#ifdef _WIN32
     if (MH_Initialize() != MH_OK) { Log("MH_Initialize failed"); return vr::VRInitError_None; }
+#else
+    PinSelf();
+#endif
     HookHost("IVRServerDriverHost_006", 0, (void *)&Detour<0>);
     HookHost("IVRServerDriverHost_005", 1, (void *)&Detour<1>);
     rel_done_ = !steady_ || g_rel->Hook();  // the lighthouse driver loads first; if not, the worker retries
@@ -346,10 +424,16 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (worker_.joinable()) worker_.join();
     if (g_gravity) g_gravity->Stop();
     if (link_) link_->Stop();
+#ifdef _WIN32
     for (int j = 0; j < 2; j++)
       if (g_target[j]) MH_DisableHook(g_target[j]);
+#else
+    UnhookHost();
+#endif
     if (g_rel) { g_rel->Unhook(); g_rel->Flush(true); }
+#ifdef _WIN32
     MH_Uninitialize();
+#endif
     if (g_sync) g_sync->SetRecord(nullptr);
     Log("QuestLHSync driver stopped");
     // g_sync and the mappings stay: a late pose update on another thread may still touch them while vrserver exits
@@ -469,7 +553,9 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   void LeaveStandby() override {}
 
  private:
+#ifdef _WIN32
   HANDLE map_ = nullptr;
+#endif
   unsigned tick_ = 0;
   std::string dir_;
   std::unique_ptr<HeadsetLink> link_;
@@ -508,7 +594,12 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     bool grav = s->GetBool(kSection, "gravity", &e);  // levelling by resting devices' gravity (gravity.h); on unset
     g_gravity->SetEnabled(e != vr::VRSettingsError_None || grav);
     bool steady = s->GetBool(kSection, "steadyStations", &e);  // base station moves averaged (relations.h); on unset
+#ifdef _WIN32
     steady_ = e != vr::VRSettingsError_None || steady;
+#else
+    steady_ = false;  // Windows-only: SteamVR's Linux lighthouse driver is left alone
+    (void)steady;
+#endif
     g_rel->SetEnabled(steady_);
     bool rec = s->GetBool(kSection, "record", &e);
     SetRecording(e == vr::VRSettingsError_None && rec);
@@ -533,7 +624,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     while (old.size() > 9) { fs::remove(old.front(), ec); old.erase(old.begin()); }
     time_t t = time(nullptr);
     struct tm tm;
-    localtime_s(&tm, &t);
+    qlhs::LocalTime(t, tm);
     char b[64];
     strftime(b, sizeof b, "qlhs-%Y%m%d-%H%M%S.txt", &tm);
     FILE *f = fopen((rd / b).string().c_str(), "w");
@@ -542,9 +633,10 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     g_sync->SetRecord(f);
     rec_spots_ = g_sync->spots();
     g_sync->Rec(QpcNow(), "I QuestLHSync recording (qlhs_replay reads it)");
-    Log(std::string("recording to recordings\\") + b);
+    Log(std::string("recording to recordings" QLHS_SEP) + b);
   }
 
+#ifdef _WIN32
   void LaunchOverlay() {
     HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, QLHS_OVERLAY_MUTEX);
     if (m) { CloseHandle(m); return; }
@@ -569,6 +661,43 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     }
   }
 
+#else
+  // the dashboard app, bin/linux64/QuestLHSync next to this library, unless it runs already (its lock is held). Started
+  // detached (its own session, reparented away from vrserver: no zombie left behind), and exits with vrserver
+  void LaunchOverlay() {
+    std::string lock;
+    if (const char *r = getenv("XDG_RUNTIME_DIR"); r && *r) lock = std::string(r) + "/" QLHS_OVERLAY_LOCK ".lock";
+    else lock = "/tmp/" QLHS_OVERLAY_LOCK "-" + std::to_string((unsigned)getuid()) + ".lock";
+    int lf = open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lf >= 0) {
+      bool held = flock(lf, LOCK_EX | LOCK_NB) != 0;
+      close(lf);
+      if (held) return;
+    }
+    Dl_info di{};
+    if (!dladdr((void *)&HmdDriverFactoryAnchor, &di) || !di.dli_fname) { Log("dashboard app: can't find the driver's folder"); return; }
+    std::filesystem::path exe = std::filesystem::path(di.dli_fname).parent_path() / "QuestLHSync";
+    if (access(exe.c_str(), X_OK) != 0) { Log("dashboard app missing: no QuestLHSync next to the driver"); return; }
+    std::string path = exe.string(), dir = exe.parent_path().string();
+    char *argv[] = {(char *)path.c_str(), nullptr};
+    pid_t pid = fork();
+    if (pid < 0) { Log(Fmt("dashboard app didn't start (fork: %s)", strerror(errno))); return; }
+    if (pid == 0) {  // only async-signal-safe calls from here
+      setsid();
+      if (fork() != 0) _exit(0);
+      int nul = open("/dev/null", O_RDWR);
+      if (nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); }
+      if (chdir(dir.c_str()) != 0) {}
+      signal(SIGPIPE, SIG_DFL);
+      execv(path.c_str(), argv);
+      _exit(127);
+    }
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    Log("dashboard app started");
+  }
+
+#endif
   static void HmdDriverFactoryAnchor() {}
 
   void Stations() {
@@ -580,7 +709,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       if (int ch = d.channel.load()) chans[d.serial] = ch;
       for (int tries = 0; tries < 8; tries++) {
         uint32_t s = d.seq.load(std::memory_order_acquire);
-        if (s == 0 || (s & 1)) { Sleep(0); continue; }
+        if (s == 0 || (s & 1)) { qlhs::SleepMs(0); continue; }
         double p[3], q[4];
         memcpy(p, d.p, sizeof p);
         memcpy(q, d.q, sizeof q);
@@ -629,8 +758,13 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     else if (s.locked) state = QLHS_LOCKED;
     else state = QLHS_ACQUIRING;
     QlhsStatus *t = g_st;
+#ifdef _WIN32
     InterlockedIncrement((volatile LONG *)&t->seq);  // odd: writing
     MemoryBarrier();
+#else
+    __atomic_add_fetch(&t->seq, 1, __ATOMIC_SEQ_CST);  // odd: writing
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
     t->state = state;
     t->updated = now;
     Copy(t->hmd, sizeof t->hmd, model);
@@ -673,8 +807,13 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       }
       g_pending_log.clear();
     }
+#ifdef _WIN32
     MemoryBarrier();
     InterlockedIncrement((volatile LONG *)&t->seq);
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&t->seq, 1, __ATOMIC_SEQ_CST);
+#endif
   }
 
   // a wired headset: the hooks come out, the headset search and levelling stop, as close to the add-on being off as
@@ -695,7 +834,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         if (!stood_down_) StandDown();
       g_hide.store(false);
         if (now - last_status_ >= 0.25) { last_status_ = now; Publish(now); }
-        Sleep(50);
+        qlhs::SleepMs(50);
         continue;
       }
       link_->SetWanted(g_hmd.load() >= 0);
@@ -720,14 +859,19 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         overlay_started_ = true;
         LaunchOverlay();
       }
-      Sleep(50);
+      qlhs::SleepMs(50);
     }
   }
 };
 
 static Provider g_provider;
 
-extern "C" __declspec(dllexport) void *HmdDriverFactory(const char *name, int *ret) {
+#ifdef _WIN32
+#define QLHS_EXPORT extern "C" __declspec(dllexport)
+#else
+#define QLHS_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
+QLHS_EXPORT void *HmdDriverFactory(const char *name, int *ret) {
   if (strcmp(name, vr::IServerTrackedDeviceProvider_Version) == 0) return &g_provider;
   if (ret) *ret = vr::VRInitError_Init_InterfaceNotFound;
   return nullptr;
