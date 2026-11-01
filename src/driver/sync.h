@@ -97,6 +97,10 @@ constexpr int kLevelMemory = 60;
 // unless SteamVR re-solves its base stations under the frame and the level moves with them: a reading this far (deg)
 // from the mean is no scatter, and the mean starts over from it
 constexpr double kLevelJump = 0.6;
+// a pair of stations' reading (Sync::PairLevelStep) counts if its time slices agree within kPairLevelSd (deg): the
+// level check's across two stations came within 0.19. Its sightings' median error may reach kPairLevelMed, not
+// Solver::LEVEL_MED: a Galaxy XR's sit at 0.30-0.36 deg, and two stations leave the tilt along their line in them
+constexpr double kPairLevelSd = 0.2, kPairLevelMed = 0.4;
 // channel check (Solver::CheckIdentity): every kIdEvery s, and at the step after a new alignment. The stations are
 // mixed up when their sightings follow each other's rotor periods better than their own by kSwapGain in all; a place's
 // sightings name a rotor when they follow it by kNamed more than any other; and the alignment with the stations where
@@ -336,6 +340,9 @@ class Solver {
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
   void SetRotorVeto(bool on) { rotor_veto_ = on; }  // see rotor_veto_
+  // station k's sightings of the last WIN s, under the current alignment, follow its rotor (RotorPhase; only with
+  // rotor_veto_: the frames' exact times)
+  bool FollowsRotor(size_t k);
   bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
@@ -353,7 +360,9 @@ class Solver {
   // below the base stations sideways, and with two stations in view the 4-DOF fit can't see it. The third station's
   // sightings can: refit with the stations tilted about pivot (reference frame). True if the sightings pin the tilt.
   bool Level(V3 pivot, LevelR &out);
-  bool LevelAxis(V3 pivot, V3 axis, AxisR &out);  // two stations: the tilt across them (Sync::LevelCheck)
+  // two stations: the tilt across them (Sync::LevelCheck, Sync::PairLevelStep). only: the stations that must each be
+  // seen from LEVEL_CELLS cells (all of them without); max_med: the sightings' median error it takes (deg)
+  bool LevelAxis(V3 pivot, V3 axis, AxisR &out, const std::vector<int> *only = nullptr, double max_med = LEVEL_MED);
   void Relevel(const X4 &x);  // the alignment for the stations as just levelled
 
   // geometry, also used by Timing
@@ -615,7 +624,13 @@ class Sync {
   double DefaultExpo() const;
   void ClearAlignment();
   void Retime(double old_e, double new_e);
-  void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  bool LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);  // true: three stations pinned it
+  void PairLevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  std::map<std::string, std::pair<double, int>> pair_level_;  // each pair's last try and readings this session
+  // the level turned by part (on top of the one so far), the frame and the solver's stations with it, x the alignment
+  void TakeLevel(const M3 &part, const std::map<std::string, std::pair<V3, M3>> &raw, const X4 &x);
+  // the level a forced recalibration dropped with the frame, for the next one pinned to the same anchor
+  struct KeptLevel { std::string anchor; M3 anchor_R, level; int n = 0; } kept_level_;
   void LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   std::string left_seen_;  // the station the layout fit leaves out, since left_since_
   // since when no fit holds, since when the frame tilts off level (-1: not)

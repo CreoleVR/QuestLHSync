@@ -1472,6 +1472,28 @@ void Solver::RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<
   }
 }
 
+bool Solver::FollowsRotor(size_t k) {
+  if (!rotor_veto_ || !has_x_) return false;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z;
+  Stations(keys, S, Z);
+  if (k >= S.size()) return false;
+  std::vector<double> tau = Taus(keys);
+  if (!(tau[k] > 0)) return false;
+  Rays r = Bright(GetRays(std::max(seen_ - WIN, since_)));
+  std::vector<V3> P, Zq;
+  Predict(x_, S, Z, P, Zq);
+  std::vector<double> g;
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!std::isfinite(r.G[n])) continue;
+    int kk;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], kk, a);
+    if (kk == (int)k && a < INLIER) g.push_back(r.G[n]);
+  }
+  return RotorPhase(g, tau[k]) > 0;
+}
+
 static int SecondBest(const int *c, size_t K) {  // Solver::Score's: all but the best
   if (K < 2) return 0;
   int best = 0, sum = 0;
@@ -2377,7 +2399,7 @@ bool Solver::Level(V3 pivot, LevelR &out) {
 // With two stations the cameras can't see a tilt about the line through them (both stay put), but they do see one
 // across it: that raises one station and lowers the other. The 4-DOF fit's stations tilted about axis through
 // pivot, on the last WIN s of sightings, and on four time slices of them: their scatter says how well it's known.
-bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out) {
+bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out, const std::vector<int> *only, double max_med) {
   if (!has_x_) return false;
   std::vector<std::string> keys;
   std::vector<V3> S0, Z0;
@@ -2404,8 +2426,8 @@ bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out) {
       for (size_t k = 0; k < S0.size(); k++) { S[k] = pivot + L * (S0[k] - pivot); Z[k] = L * Z0[k]; }
       std::vector<int> cells;
       Support(x, S, Z, Thin(rr), INLIER, cells);
-      for (int c : cells)
-        if (c < LEVEL_CELLS) return false;
+      for (size_t k = 0; k < cells.size(); k++)
+        if (cells[k] < LEVEL_CELLS && (!only || std::count(only->begin(), only->end(), (int)k))) return false;
       std::vector<V3> P, Zq;
       Predict(x, S, Z, P, Zq);
       std::vector<double> in;
@@ -2420,7 +2442,7 @@ bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out) {
     }
     return true;
   };
-  if (!fit(r, out.theta, &out.med) || out.med > LEVEL_MED) return false;
+  if (!fit(r, out.theta, &out.med) || out.med > max_med) return false;
   std::vector<double> ts;
   double t0 = r.T.front(), t1 = r.T.back();
   for (int q = 0; q < 4; q++) {
@@ -2966,9 +2988,16 @@ void Sync::ForceRecalibrate() {
     timings_.clear();
     ApplyTiming();
   }
-  // an automatic reference frame is pinned again from SteamVR's stations as they are now (and its level found again);
-  // a measured one is the user's own and stays
+  // an automatic reference frame is pinned again from SteamVR's stations as they are now; a measured one is the user's
+  // own and stays. The level goes over to the new frame if it's pinned to the same anchor: it's the stations' frame
+  // against gravity, not the alignment, and its readings want three stations (or pairs on two lines) seen, which a
+  // room whose third station covers the corners gives slowly. A reading of a wrong alignment's doesn't get in
+  // (LevelStep: three stations within 0.3 deg, the worn devices at the head), and a moved level shows as kLevelJump
   if (sfile_.autogen || !sfile_.loaded) {
+    kept_level_ = {};
+    if (sfile_.autogen && sfile_.level_n > 0)
+      kept_level_ = {sfile_.anchor, sfile_.anchor_R, sfile_.level, sfile_.level_n};
+    pair_level_.clear();
     for (auto &kv : sfile_.place) solver_.DropFix(kv.first);
     sfile_ = StationsFile();
     frame_.Reset();
@@ -3265,15 +3294,15 @@ bool Sync::GravityFrame(M3 &C, M3 &turn, std::string &key) {
 // sightings) is off by 0.15 deg, and the next one 0.2 deg away: each one moves the level by its share of all the
 // readings so far (up to kLevelMemory), so the level settles instead of following the last reading. One further from
 // it than kLevelJump says the level moved (SteamVR re-solved its base stations): it is taken whole and starts over.
-void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
-  if (!sfile_.autogen || frame_.ok() != 1 || !solver_.has_x() || now - lock_time_ < kLevelSettle) return;
-  if (!(BodyDist(solver_.x()) < kLevelBody)) return;
+bool Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
+  if (!sfile_.autogen || frame_.ok() != 1 || !solver_.has_x() || now - lock_time_ < kLevelSettle) return false;
+  if (!(BodyDist(solver_.x()) < kLevelBody)) return false;
   Solver::LevelR lv;
-  if (!solver_.Level(sfile_.anchor_p, lv)) return;
+  if (!solver_.Level(sfile_.anchor_p, lv)) return false;
   double step = RotDeg(lv.tilt);
-  if (RotDeg(lv.tilt * sfile_.level) > kMaxRot) return;  // past what a level can be
+  if (RotDeg(lv.tilt * sfile_.level) > kMaxRot) return true;  // past what a level can be
   bool moved = sfile_.level_n > 0 && step > kLevelJump;
-  if (!moved && sfile_.level_n > 0 && now - level_read_ < kLevelEvery) return;  // a move is followed at once
+  if (!moved && sfile_.level_n > 0 && now - level_read_ < kLevelEvery) return true;  // a move is followed at once
   level_read_ = now;
   int n = moved ? 0 : std::min(sfile_.level_n, kLevelMemory - 1);
   double share = 1.0 / (n + 1);
@@ -3281,20 +3310,12 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
   double half = std::atan2(std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z), q.w), s = std::sin(half * share);
   double k = half > 1e-12 ? s / std::sin(half) : share;
   M3 part = ToM3(Quat{std::cos(half * share), q.x * k, q.y * k, q.z * k});
-  M3 L = part * sfile_.level;
-  sfile_.level = L;
   sfile_.level_n = n + 1;
-  sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
-  frame_.Update(raw);
-  for (auto &kv : raw) {
-    V3 p; M3 R;
-    frame_.Apply(kv.second.first, kv.second.second, p, R);
-    solver_.SetStation(kv.first, p, R);
-  }
   X4 x = solver_.x();  // the alignment as far toward the reading's as the level went
   x[0] += share * Wrap(lv.x[0] - x[0]);
   for (int i = 1; i < 4; i++) x[i] += share * (lv.x[i] - x[i]);
-  solver_.Relevel(x);
+  TakeLevel(part, raw, x);
+  const M3 &L = sfile_.level;
   Rec(now, "I level3 %.4f %.4f %d %.4f", step, step * share, sfile_.level_n, lv.med);
   if (moved)
     log_(Fmt("lighthouse frame levelled with the headset: tilted %.2f deg, too far from the level so far to be its "
@@ -3304,6 +3325,69 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
     log_(Fmt("lighthouse frame levelled with the headset: tilted %.2f deg, 1/%d of the %.2f deg this reading "
              "says (%.2f deg in all), %d base stations within %.2f deg", step * share, n + 1, step, RotDeg(L),
              lv.stations, lv.med));
+  return true;
+}
+
+void Sync::TakeLevel(const M3 &part, const std::map<std::string, std::pair<V3, M3>> &raw, const X4 &x) {
+  sfile_.level = part * sfile_.level;
+  sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
+  frame_.Update(raw);
+  for (auto &kv : raw) {
+    V3 p; M3 R;
+    frame_.Apply(kv.second.first, kv.second.second, p, R);
+    solver_.SetStation(kv.first, p, R);
+  }
+  solver_.Relevel(x);
+}
+
+// Three or more stations needn't all be in view within LevelStep's five minutes: one may be placed for the corners
+// the others miss. Two in view still show the frame's tilt across the line through them (Solver::LevelAxis), and the
+// level turns about that axis by the reading's share, as LevelStep's readings turn it; pairs on different lines (the
+// two in the middle, one of them and the corners' one) level it both ways in time. A pair's readings share the
+// level's count of readings so far, so a level many readings settled moves little; one further off than kLevelJump is
+// left for LevelStep to tell a moved level from. Galaxy XR only: it needs the rotor check (Solver::FollowsRotor).
+void Sync::PairLevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
+  if (!sfile_.autogen || frame_.ok() != 1 || !solver_.has_x() || now - lock_time_ < kLevelSettle) return;
+  if (!(BodyDist(solver_.x()) < kLevelBody)) return;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z;
+  solver_.Stations(keys, S, Z);
+  if (S.size() < 3) return;
+  for (size_t i = 0; i < S.size(); i++)
+    for (size_t j = i + 1; j < S.size(); j++) {
+      if (solver_.measured(keys[i]) || solver_.measured(keys[j])) continue;
+      V3 b = S[j] - S[i];
+      double h = std::hypot(b.x, b.z);
+      if (h < 1) continue;
+      std::string key = keys[i] + "+" + keys[j];
+      auto &pl = pair_level_.emplace(key, std::make_pair(-1e18, 0)).first->second;
+      if (now - pl.first < kLevelEvery) continue;
+      V3 axis{-b.z / h, 0, b.x / h}, pivot = (S[i] + S[j]) * 0.5;
+      // both stations' sightings follow their rotors: a few stray spots near one (a hidden station's place, in a
+      // test) held LevelAxis' three cells and tilted the frame 0.6 deg too far
+      if (!solver_.FollowsRotor(i) || !solver_.FollowsRotor(j)) continue;
+      Solver::AxisR a;
+      std::vector<int> only{(int)i, (int)j};
+      if (!solver_.LevelAxis(pivot, axis, a, &only, kPairLevelMed) || a.sd * kDeg > kPairLevelSd) continue;
+      if (sfile_.level_n > 0 && std::fabs(a.theta) * kDeg > kLevelJump) continue;
+      pl.first = now;
+      int n = std::min(std::max(sfile_.level_n, pl.second), kLevelMemory - 1);
+      double share = 1.0 / (n + 1), th = a.theta * share;
+      pl.second = n + 1;
+      M3 part = Tilt(th * axis.x, th * axis.z);
+      // the level turns the frame about the anchor, the reading about the pair's middle: the stations there stay put
+      X4 x = solver_.x();
+      V3 d = sfile_.anchor_p - pivot, shift = part * d - d;
+      V3 sq = Ry(x[0]) * shift;
+      x[1] += sq.x; x[2] += sq.y; x[3] += sq.z;
+      TakeLevel(part, raw, x);
+      Rec(now, "I level2 %s %.4f %.4f %d %.4f %.4f", key.c_str(), a.theta * kDeg, th * kDeg, n + 1, a.sd * kDeg, a.med);
+      if (std::fabs(th) * kDeg >= 0.02)
+        log_(Fmt("lighthouse frame levelled with the headset across %s and %s: tilted %+.2f deg, 1/%d of the %+.2f "
+                 "deg this reading says (within %.2f, %.2f deg in all)", keys[i].c_str(), keys[j].c_str(), th * kDeg,
+                 n + 1, a.theta * kDeg, a.sd * kDeg, RotDeg(sfile_.level)));
+      return;  // one reading at a time: the next pair's on the frame as it is now
+    }
 }
 
 // An automatic frame takes its stations' poses in it once three show up (Frame::Layout follows them from then on) and
@@ -3511,8 +3595,16 @@ Transform Sync::Tick(double now) {
       sfile_.anchor = best->first;
       sfile_.anchor_p = best->second.first;
       sfile_.anchor_R = best->second.second;
+      if (kept_level_.n > 0 && kept_level_.anchor == best->first) {  // the frame turns with the anchor's pose in it
+        sfile_.level = kept_level_.level * kept_level_.anchor_R * T(sfile_.anchor_R);
+        sfile_.level_n = kept_level_.n;
+        log_(Fmt("reference frame set: anchor %s, the level of %d reading(s) kept (%.2f deg)", best->first.c_str(),
+                 sfile_.level_n, RotDeg(sfile_.level)));
+      } else {
+        log_("reference frame set: anchor " + best->first);
+      }
+      kept_level_ = {};
       sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
-      log_("reference frame set: anchor " + best->first);
     } else if (sfile_.autogen && !frame_.layout() && raw.count(sfile_.anchor)) {  // follows a moved anchor
       auto &a = raw[sfile_.anchor];
       if (RotDeg(sfile_.anchor_R * T(a.second)) > kMaxRot || norm(a.first - sfile_.anchor_p) > kMoved) {
@@ -3684,7 +3776,7 @@ Transform Sync::Tick(double now) {
     }
     if (now - last_level_ >= 10) {
       last_level_ = now;
-      LevelStep(raw, now);
+      if (!LevelStep(raw, now)) PairLevelStep(raw, now);
     }
     if (now - last_place_ >= kPlaceEvery && TwoFit(solver_.has_x(), st) && st.cond) {
       last_place_ = now;
