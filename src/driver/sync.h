@@ -335,6 +335,7 @@ class Solver {
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
+  void SetRotorVeto(bool on) { rotor_veto_ = on; }  // see rotor_veto_
   bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
@@ -403,6 +404,16 @@ class Solver {
   // (Starved)
   std::atomic<bool> dim_dots_{false};
   double DimGate() const { return starved_ ? INLIER : -1; }
+  // A Galaxy XR in a lit room sees its base stations' dots seldom and the lamps in nearly every short frame: a wrong
+  // alignment that lines the stations up with lamps gathers ACQ long before the right one (31 Oct 2026: 5 of 8
+  // acquisitions wrong, one with a single station sighting in the minute). Its exact frame times tell them apart: a
+  // station's sightings keep the phase of its rotor, a lamp's don't
+  std::atomic<bool> rotor_veto_{false};
+  std::vector<double> Taus(const std::vector<std::string> &keys) const;  // each station's rotor period, 0 unknown
+  // A station's support (c) goes unless its sightings under x, of r, follow its rotor (RotorPhase). strict (a new
+  // candidate): too few to tell go too; else (the current fit) only the ones that don't follow
+  void RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<double> &tau,
+                 const Rays &r, bool strict, std::vector<int> &c) const;
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
   double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
   std::map<int, double> held_h_;  // s the fit held each height (kHeightBin steps), locked and pinned

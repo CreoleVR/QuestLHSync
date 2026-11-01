@@ -1,4 +1,25 @@
-# Galaxy XR: a lamp filter for acquisition (design, not implemented)
+# Galaxy XR: a lamp filter for acquisition
+
+## Implemented: the rotor-phase veto (1 Nov 2026)
+
+What went in is the second stage below, not the occupancy filter: `Solver::RotorVeto` / `RotorPhase` in
+`src/driver/sync.cpp`, Galaxy XR only. Under each acquisition candidate, a station's sightings (within `INLIER`, all
+bright rays) are tested for phase at the station's own rotor period, on the frames' sensor times: coherence (mean
+resultant length) `R`, with `n R^2 >= 4.6` "follows", `n >= 12` and `R < 0.3` "doesn't", else "can't tell". A new
+candidate counts only stations that follow; the current fit (`ThinnedScore`) loses only those that don't.
+
+Measured on the 30-31 Oct recordings, with the truth from a lighthouse device on a headset mount:
+
+- The stations' sightings: `R` 0.41-0.63 in every minute with 12 or more. The lamps three wrong fits rested on:
+  0.04-0.22. ED72 (channel 2) peaks at 50.154 Hz against its 50.157.
+- The lamps are periodic, but not at 100.000 Hz (coherence 0.00-0.15 there): half at ~100.24 Hz, half at 7x the
+  frame rate (104.95 Hz, a sampling artefact of steady lights). Only `tau`, not `tau/2`, is tested: channel 1's
+  `tau/2` is 100.10 Hz, next to the lamps (one reached 0.31 there).
+- Blob size and occupancy separated these recordings too (dots 3-18 px, lamps 20-60; occupancy as in the tables
+  below), but both depend on where the head is and looks, and with the veto in they changed no outcome: left out.
+- Replays of all ten recordings: no wrong acquisition (five before, 3-8 m off); 30 Oct's 5.8 min run acquires as before
+  (84 s) and ends within 0.06 m; 29 Oct 00:09 (82 s, the old pipeline) no longer acquires in its 80 s. 31 Oct 21:37
+  stays unlocked: its minute holds 47 station sightings, nearly all of ED72, too few for any fit.
 
 ## The problem
 

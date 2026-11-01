@@ -1423,6 +1423,55 @@ Solver::Rays Solver::Thin(const Rays &r) {
   return o;
 }
 
+// A station's sighting times (headset clock) keep a phase at its rotor period tau; a lamp's at its place don't.
+// Recordings (Galaxy XR, 30-31 Oct 2026): the stations' coherence (mean resultant length) 0.41-0.63 in every minute of
+// 12 sightings or more, the lamps three wrong fits rested on 0.04-0.22. +1: the sightings follow the rotor (Rayleigh,
+// n R^2 >= kRotorP: a lamp gets there by chance once in 100), -1: they don't (kRotorMin or more under kRotorLow), 0:
+// can't tell (fewer, or in between); +1 without a channel. Not tau/2 (two sweeps a turn): the lamps flicker at about
+// 100 Hz, and channel 1's tau/2 is 100.1 Hz (a lamp 0.31 there)
+static int RotorPhase(const std::vector<double> &g, double tau) {
+  constexpr int kRotorMin = 12;
+  constexpr double kRotorLow = 0.3, kRotorP = 4.6;
+  if (!(tau > 0)) return 1;
+  if ((int)g.size() < kRotorMin) return 0;
+  double c = 0, s = 0;
+  for (double x : g) {
+    double a = 2 * kPi * std::fmod((x - g[0]) / tau, 1.0);
+    c += std::cos(a);
+    s += std::sin(a);
+  }
+  double R = std::hypot(c, s) / g.size();
+  return g.size() * R * R >= kRotorP ? 1 : R < kRotorLow ? -1 : 0;
+}
+
+std::vector<double> Solver::Taus(const std::vector<std::string> &keys) const {
+  std::vector<double> tau(keys.size(), 0.0);
+  std::lock_guard<std::mutex> g(m_);
+  for (size_t k = 0; k < keys.size(); k++) {
+    auto it = ch_.find(keys[k]);
+    if (it != ch_.end()) tau[k] = RotorPeriod(it->second);
+  }
+  return tau;
+}
+
+void Solver::RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<double> &tau,
+                       const Rays &r, bool strict, std::vector<int> &c) const {
+  std::vector<V3> P, Zq;
+  Predict(x, S, Z, P, Zq);
+  std::vector<std::vector<double>> g(S.size());
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!std::isfinite(r.G[n])) continue;
+    int k;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < INLIER) g[k].push_back(r.G[n]);
+  }
+  for (size_t k = 0; k < S.size() && k < c.size(); k++) {
+    int ph = RotorPhase(g[k], tau[k]);
+    if (ph < 0 || (strict && ph == 0)) c[k] = 0;
+  }
+}
+
 static int SecondBest(const int *c, size_t K) {  // Solver::Score's: all but the best
   if (K < 2) return 0;
   int best = 0, sum = 0;
@@ -1472,6 +1521,15 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
                       [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K) > SecondBest(&c2[b * K], K); });
     for (size_t i = 0; i < n2; i++) cand.push_back(top[o2[i]]);
   }
+  // Galaxy XR: a station counts only if its sightings follow its rotor (RotorVeto)
+  std::vector<double> tau;
+  if (rotor_veto_) tau = Taus(keys);
+  auto support = [&](const X4 &x, double gate) {
+    std::vector<int> c;
+    Support(x, S, Z, t, gate, c);
+    if (rotor_veto_) RotorVeto(x, S, Z, tau, r, true, c);
+    return Score(c);
+  };
   bs = -1;
   bool have = false;
   for (X4 x : cand) {
@@ -1480,17 +1538,14 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
       if (!f.ok) break;
       x = f.x;
     }
-    std::vector<int> c;
-    Support(x, S, Z, t, INLIER, c);
-    int sc = Score(c);
+    int sc = support(x, INLIER);
     if (sc > bs) { best = x; bs = sc; have = true; }
   }
   if (!have) return false;
   CheckMirror(best, bs, S, Z, r, t, now);
+  if (rotor_veto_) bs = support(best, INLIER);  // the mirror check's pick, vetoed alike
   acq_x_ = best; has_acq_x_ = true;
-  std::vector<int> c;
-  Support(best, S, Z, t, TIGHT_DEG, c);
-  tight = Score(c);
+  tight = support(best, TIGHT_DEG);
   return true;
 }
 
@@ -1507,10 +1562,11 @@ int Solver::ThinnedScore(const X4 &x, double now) {
   std::vector<std::string> keys;
   std::vector<V3> S, Z;
   Stations(keys, S, Z);
-  Rays t = Thin(Bright(GetRays(std::max(now - ACQ_WIN, since_))));
+  Rays r = Bright(GetRays(std::max(now - ACQ_WIN, since_))), t = Thin(r);
   if (!t.size()) return 0;
   std::vector<int> c;
   Support(x, S, Z, t, INLIER, c);
+  if (rotor_veto_) RotorVeto(x, S, Z, Taus(keys), r, false, c);
   return Score(c);
 }
 
@@ -2782,6 +2838,7 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   // a Quest's frame period is one of two, the other headsets' are learned from their frames
   grid_quest_ = optics_.headset() == Optics::kQuest && !cfg_.learn_grid;
   solver_.SetDimDots(optics_.headset() == Optics::kFrame);
+  solver_.SetRotorVeto(optics_.headset() == Optics::kGalaxyXR);
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   if (!timing_learned_) expo_ = DefaultExpo();  // the headset is known from here
