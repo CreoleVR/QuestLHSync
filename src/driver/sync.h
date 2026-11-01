@@ -51,7 +51,7 @@ constexpr double kTimingTurn = 10.0, kTimingSplit = 0.030;  // deg/s, s
 // recordings: 1.1-3.9 ms; a Frame's, its few sightings coming in bursts: 5-15 ms, and it keeps kExpoDefault)
 constexpr int kTimingBoot = 200;
 constexpr double kTimingCI = 0.006;  // s
-constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a laser dot
+constexpr int kMaxPx = 100;             // bigger blobs are lamps/windows, not a laser dot
 // blobs this bright: a base station's dot, or a lamp. Dimmer ones (module 1.6 on) are mostly other lights, a few
 // percent station dots: they count only in a room too light for the dots to saturate (Solver::starved), and then in
 // the running fit only within Solver::INLIER of a station
