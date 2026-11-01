@@ -51,7 +51,13 @@ constexpr double kTimingTurn = 10.0, kTimingSplit = 0.030;  // deg/s, s
 // recordings: 1.1-3.9 ms; a Frame's, its few sightings coming in bursts: 5-15 ms, and it keeps kExpoDefault)
 constexpr int kTimingBoot = 200;
 constexpr double kTimingCI = 0.006;  // s
-constexpr int kMaxPx = 100;             // bigger blobs are lamps/windows, not a laser dot
+constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a laser dot
+constexpr double kMaxSource = 0.008;    // m^2
+// lim: the dots' size learned, sr * m (0: none yet)
+inline bool FromStation(double sr, V3 p, V3 o, double lim) {
+  double d2 = dot(p - o, p - o);
+  return sr * d2 <= kMaxSource || (lim > 0 && sr * std::sqrt(d2) <= 2 * lim);
+}
 // blobs this bright: a base station's dot, or a lamp. Dimmer ones (module 1.6 on) are mostly other lights, a few
 // percent station dots: they count only in a room too light for the dots to saturate (Solver::starved), and then in
 // the running fit only within Solver::INLIER of a station
@@ -319,9 +325,10 @@ class Solver {
   void Reset(const X4 &x);
   void Clear();  // forgets the sightings, the alignment and what hung on them; the stations stay (Sync::ForceRecalibrate)
   // g: the frame's time on the headset's clock (NaN until the frame grid is known)
-  void Add(double t, V3 o, V3 d, double g, int cam, bool bright);
+  void Add(double t, V3 o, V3 d, double g, int cam, bool bright, double sr);
   void Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
-               const std::vector<double> &G, const std::vector<int> &C, const std::vector<char> &B);  // rays >= from
+               const std::vector<double> &G, const std::vector<int> &C, const std::vector<char> &B,
+               const std::vector<float> &A);  // rays >= from
   void SetStation(const std::string &serial, V3 p, const M3 &R);
   void SetChannel(const std::string &serial, int channel);
   void SetFramePeriod(double p) { frame_p_ = p; }  // s between short frames
@@ -332,6 +339,7 @@ class Solver {
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
   bool starved() const { return starved_; }
+  double dot_size() const { return dot_; }  // sr * m (see FromStation)
   int resets() const { return resets_; }
   X4 x() const { return x_; }
   // stations (sorted by serial) as the solver uses them
@@ -361,6 +369,7 @@ class Solver {
     std::vector<V3> O, D;
     std::vector<int> C;
     std::vector<char> B;  // 1: peak >= kBright
+    std::vector<float> A;  // solid angle (sr)
     size_t size() const { return T.size(); }
   };
   struct FitR { bool ok = false; X4 x{}; int n = 0; bool cond = false; M3 tilt; double theta = 0; };
@@ -370,6 +379,7 @@ class Solver {
   std::vector<V3> ro_, rd_;
   std::vector<int> rc_;
   std::vector<char> rb_;
+  std::vector<float> ra_;
   std::map<std::string, std::pair<V3, M3>> S_;
   std::map<std::string, int> ch_;
   std::map<std::string, V3> fix_;
@@ -393,7 +403,10 @@ class Solver {
   bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
   bool acq_dim_ = false;     // ... was found on dim rays too (Bright): it needs twice the support
   std::atomic<bool> starved_{false};  // the recent rays are under 5% bright, of 200 or more (see Bright)
+  std::atomic<double> dot_{0};
+  double dot_said_ = 0;
   bool Starved(const Rays &r) const;
+  bool OnLamp(const X4 &x, const Rays &r, std::string &which) const;
   // the Steam Frame: its cameras seldom see a base station's dot saturate (a recording: 95% of the sightings of the
   // stations dim, while the bright spots were mostly other lights), so the dim ones always count, as in a room too light
   // (Starved)
@@ -436,20 +449,20 @@ class Solver {
 // ---------------------------------------------------------------- timing
 class Timing {
  public:
-  struct Rec { double tg; V3 od, dd; double hg; int cam; bool bright; };  // grid time (PC s), device-frame ray,
-                                                                          // headset grid time, peak >= kBright
-  void Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright);
+  // grid time (PC s), device-frame ray, headset grid time, peak >= kBright, solid angle (sr)
+  struct Rec { double tg; V3 od, dd; double hg; int cam; bool bright; float sr; };
+  void Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright, double sr);
   const std::deque<Rec> &recs() const { return rec_; }
   // the left and right turns' timings (NaN: none), their sightings, and the 90% spread of their mean (s)
   struct Split { double left, right; int nl = 0, nr = 0; double ci; };
   // grid search of the offset on fast-head sightings against the current alignment: true if it found one
   bool Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
-                bool wide, double &best, int &n, Split &sp);
+                bool wide, double &best, int &n, Split &sp, double lim);  // lim: Solver::dot_size
 
  private:
   std::deque<Rec> rec_;
   bool Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
-              bool wide, double &best, int &n, Split &sp, bool &edge);  // edge: a minimum at the search's edge
+              bool wide, double &best, int &n, Split &sp, bool &edge, double lim);  // edge: a minimum at the search's edge
 };
 
 // ---------------------------------------------------------------- the app
