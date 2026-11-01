@@ -79,6 +79,13 @@ refinements in `/data/vendor/openpx/calibration/records/FRAME_IMU_0_t_CAMERA_*`:
   (0.0725, −0.051, 0.106) m, ±2 cm. The display profile's eye points (`lut_frame_t_eye` of `eye-left/right`) put the
   eyes' middle at ~(0.061, −0.024, 0.051): Virtual Desktop's head pose isn't of that point.
 - `calibration_override.json` in the module directory, if there, is sent instead (for fitted corrections)
+- the override as of 31 Oct turns all four cameras ~1.1 deg about the head's z (its roll) off what the sightings of
+  `lhsight-gxr` need: against a tracker on the headset mount, 31 Oct 21:37 and 2 Nov 00:07 both want +0.9..1.2 deg
+  (the 30 Oct run of the old perceptionhost pipeline -0.4). The cameras then see the stations tilted, and the level
+  readings tilt the lighthouse frame to match: 1.77 deg where the truth said 0.2, 6-9 cm at the feet, growing with
+  every reading. Turned by rotvec (0, 0.11, 1.08) deg in the device frame (`DeviceFromCamera` R and t), the cameras'
+  residual rotation drops to 0.02-0.2 deg, the sightings' median miss from 0.72 to 0.49 deg, and the level the
+  sightings find to within 0.15 deg of the truth
 
 ## Building
 

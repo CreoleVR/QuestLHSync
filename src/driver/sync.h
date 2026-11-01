@@ -629,8 +629,9 @@ class Sync {
   std::map<std::string, std::pair<double, int>> pair_level_;  // each pair's last try and readings this session
   // the level turned by part (on top of the one so far), the frame and the solver's stations with it, x the alignment
   void TakeLevel(const M3 &part, const std::map<std::string, std::pair<V3, M3>> &raw, const X4 &x);
-  // the level a forced recalibration dropped with the frame, for the next one pinned to the same anchor
-  struct KeptLevel { std::string anchor; M3 anchor_R, level; int n = 0; } kept_level_;
+  // the level a forced recalibration dropped with the frame, for the next one: SteamVR's frame -> the levelled one as
+  // it was (Frame::Anchored, the layout fit's turn and all), and how many readings the level was the mean of
+  struct KeptLevel { M3 turn; int n = 0; } kept_level_;
   void LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   std::string left_seen_;  // the station the layout fit leaves out, since left_since_
   // since when no fit holds, since when the frame tilts off level (-1: not)

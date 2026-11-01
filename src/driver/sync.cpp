@@ -2989,14 +2989,15 @@ void Sync::ForceRecalibrate() {
     ApplyTiming();
   }
   // an automatic reference frame is pinned again from SteamVR's stations as they are now; a measured one is the user's
-  // own and stays. The level goes over to the new frame if it's pinned to the same anchor: it's the stations' frame
-  // against gravity, not the alignment, and its readings want three stations (or pairs on two lines) seen, which a
-  // room whose third station covers the corners gives slowly. A reading of a wrong alignment's doesn't get in
-  // (LevelStep: three stations within 0.3 deg, the worn devices at the head), and a moved level shows as kLevelJump
+  // own and stays. The level goes over to the new frame: it's the stations' frame against gravity, not the alignment,
+  // and its readings want three stations (or pairs on two lines) seen, which a room whose third station covers the
+  // corners gives slowly. A reading of a wrong alignment's doesn't get in (LevelStep: three stations within 0.3 deg,
+  // the worn devices at the head), and a moved level shows as kLevelJump. What goes over is SteamVR's frame -> the
+  // levelled one, whole: with three stations the old frame followed their fit, not the anchor alone (taking the level
+  // over by the anchor's pose put it 0.6 deg off, 2.24 deg for 1.6)
   if (sfile_.autogen || !sfile_.loaded) {
     kept_level_ = {};
-    if (sfile_.autogen && sfile_.level_n > 0)
-      kept_level_ = {sfile_.anchor, sfile_.anchor_R, sfile_.level, sfile_.level_n};
+    if (sfile_.autogen && sfile_.level_n > 0 && frame_.ok() == 1) kept_level_ = {frame_.Anchored(), sfile_.level_n};
     pair_level_.clear();
     for (auto &kv : sfile_.place) solver_.DropFix(kv.first);
     sfile_ = StationsFile();
@@ -3595,8 +3596,8 @@ Transform Sync::Tick(double now) {
       sfile_.anchor = best->first;
       sfile_.anchor_p = best->second.first;
       sfile_.anchor_R = best->second.second;
-      if (kept_level_.n > 0 && kept_level_.anchor == best->first) {  // the frame turns with the anchor's pose in it
-        sfile_.level = kept_level_.level * kept_level_.anchor_R * T(sfile_.anchor_R);
+      if (kept_level_.n > 0) {  // the new frame is SteamVR's as it is now: the level is the whole turn kept
+        sfile_.level = kept_level_.turn;
         sfile_.level_n = kept_level_.n;
         log_(Fmt("reference frame set: anchor %s, the level of %d reading(s) kept (%.2f deg)", best->first.c_str(),
                  sfile_.level_n, RotDeg(sfile_.level)));
