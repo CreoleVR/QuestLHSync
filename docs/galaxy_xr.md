@@ -85,7 +85,10 @@ refinements in `/data/vendor/openpx/calibration/records/FRAME_IMU_0_t_CAMERA_*`:
   readings tilt the lighthouse frame to match: 1.77 deg where the truth said 0.2, 6-9 cm at the feet, growing with
   every reading. Turned by rotvec (0, 0.11, 1.08) deg in the device frame (`DeviceFromCamera` R and t), the cameras'
   residual rotation drops to 0.02-0.2 deg, the sightings' median miss from 0.72 to 0.49 deg, and the level the
-  sightings find to within 0.15 deg of the truth
+  sightings find to within 0.15 deg of the truth. That file, for this unit (serial R34YA001JZB; made from the override
+  with md5 556be1ef...), is `magisk/calibration/galaxy_xr-R34YA001JZB.json`: copy it over the module directory's
+  `calibration_override.json` (the build doesn't package it; it fits one unit), then delete the PC's stations.json,
+  whose level was read with the old one
 
 ## Building
 
