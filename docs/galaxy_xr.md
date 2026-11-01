@@ -79,16 +79,14 @@ refinements in `/data/vendor/openpx/calibration/records/FRAME_IMU_0_t_CAMERA_*`:
   (0.0725, −0.051, 0.106) m, ±2 cm. The display profile's eye points (`lut_frame_t_eye` of `eye-left/right`) put the
   eyes' middle at ~(0.061, −0.024, 0.051): Virtual Desktop's head pose isn't of that point.
 - `calibration_override.json` in the module directory, if there, is sent instead (for fitted corrections)
-- the override as of 31 Oct turns all four cameras ~1.1 deg about the head's z (its roll) off what the sightings of
-  `lhsight-gxr` need: against a tracker on the headset mount, 31 Oct 21:37 and 2 Nov 00:07 both want +0.9..1.2 deg
-  (the 30 Oct run of the old perceptionhost pipeline -0.4). The cameras then see the stations tilted, and the level
-  readings tilt the lighthouse frame to match: 1.77 deg where the truth said 0.2, 6-9 cm at the feet, growing with
-  every reading. Turned by rotvec (0, 0.11, 1.08) deg in the device frame (`DeviceFromCamera` R and t), the cameras'
-  residual rotation drops to 0.02-0.2 deg, the sightings' median miss from 0.72 to 0.49 deg, and the level the
-  sightings find to within 0.15 deg of the truth. That file, for this unit (serial R34YA001JZB; made from the override
-  with md5 556be1ef...), is `magisk/calibration/galaxy_xr-R34YA001JZB.json`: copy it over the module directory's
-  `calibration_override.json` (the build doesn't package it; it fits one unit), then delete the PC's stations.json,
-  whose level was read with the old one
+- the cameras' rotation against the HMD pose isn't the same from session to session: against a tracker on the
+  headset mount the sightings wanted the override (md5 556be1ef...) turned about the head's z by -0.4 deg (30 Oct
+  23:00, old pipeline), +1.2 (31 Oct 21:37), +0.9..1.1 (2 Nov 00:07) and -0.2..-0.3 (2 Nov 00:30, x +0.1..0.2,
+  y +0.3..0.5). A fixed correction can't hold: turned by the 00:07 one, 00:30 came out worse (the level 1.0 deg for
+  2.4, a head-mounted tracker 12 cm off while the sightings' median miss read 0.28 deg; with the plain override the
+  level came out 1.9). The sightings can't see it themselves: a common turn of the cameras and a tilt of the
+  lighthouse frame make up for each other. Its source (the system's own online calibration, Virtual Desktop's pose,
+  ...) is open
 
 ## Building
 
