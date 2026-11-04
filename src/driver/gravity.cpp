@@ -1,7 +1,12 @@
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #include <setupapi.h>
-#include <shlobj.h>
+#else
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
 
 #include "gravity.h"
 
@@ -17,12 +22,15 @@
 
 #include "json.h"
 #include "net.h"
+#include "platform.h"
 
+#ifdef _WIN32
 extern "C" {
 void __stdcall HidD_GetHidGuid(GUID *guid);
 BOOLEAN __stdcall HidD_GetSerialNumberString(HANDLE device, PVOID buffer, ULONG length);
 BOOLEAN __stdcall HidD_SetNumInputBuffers(HANDLE device, ULONG n);
 }
+#endif
 
 namespace {
 constexpr double kKeepS = 20;                      // s of IMU samples and poses kept
@@ -77,7 +85,7 @@ std::string Fmt(const char *fmt, ...) {
 std::string Now() {
   time_t t = time(nullptr);
   struct tm tm;
-  localtime_s(&tm, &t);
+  qlhs::LocalTime(t, &tm);
   char b[32];
   strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", &tm);
   return b;
@@ -163,14 +171,9 @@ double Interp(const std::vector<double> &t, const std::vector<double> &v, double
 
 Gravity::Gravity(std::string dir, LogFn log, bool live) : dir_(std::move(dir)), log_(std::move(log)), live_(live) {
   // SteamVR's config folder: each lighthouse device's config, with its IMU calibration
-  PWSTR p = nullptr;
-  std::filesystem::path paths;
-  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p)))
-    paths = std::filesystem::path(p) / "openvr" / "openvrpaths.vrpath";
-  CoTaskMemFree(p);
   std::string text;
   JVal root;
-  if (ReadText(paths.string(), text) && JParse(text, root))
+  if (ReadText(qlhs::OpenVrPathsFile(), text) && JParse(text, root))
     if (const JVal *a = root.get("config"))
       if (a->t == JVal::Arr && !a->a.empty() && a->a[0].t == JVal::Str) config_dir_ = a->a[0].s;
   if (config_dir_.empty()) log_("gravity: no SteamVR config folder: levelling by gravity off");
@@ -231,6 +234,30 @@ bool Gravity::LoadConfig(Dev &d) {
   return true;
 }
 
+// A receiver's input reports, read only (another reader of the same interface, with its own queue: nothing is sent).
+// Reports: 0x23 one Watchman packet, 0x24 two (the second 29 bytes on). A packet: time MSB, size, time LSB, then
+// size - 1 bytes: Watchman v2 flags, and with 0x80 the IMU sample first: a time byte, accel xyz, gyro xyz (int16 LE).
+// The sample's time: the packet's two bytes and its own, the top 24 bits of the device's 48 MHz clock. libsurvive's
+// driver_vive.c (survive_handle_watchman, handle_watchman_v2, read_imu_data).
+void Gravity::Report(const std::string &receiver, Reader *rd, const unsigned char *r, size_t n, double t) {
+  if (n < 2 || (r[0] != 0x23 && r[0] != 0x24)) return;
+  for (size_t off : {size_t(1), size_t(30)}) {
+    if (off == 30 && r[0] != 0x24) break;
+    if (off + 3 > n) break;
+    const unsigned char *p = r + off;
+    size_t size = p[1];
+    if (size < 15 || off + 3 + size - 1 > n) continue;
+    const unsigned char *pay = p + 3;
+    if (!(pay[0] & 0x80)) continue;
+    int16_t v[6];
+    for (int i = 0; i < 6; i++) v[i] = (int16_t)(pay[2 + 2 * i] | (pay[3 + 2 * i] << 8));
+    uint32_t tick = (uint32_t)p[0] << 24 | (uint32_t)p[2] << 16 | (uint32_t)pay[1] << 8;
+    OnImu(receiver, t, tick, v, v + 3);
+    rd->n++;
+  }
+}
+
+#ifdef _WIN32
 // the receiver's HID interface: Valve's (vid_28de) whose serial is the receiver's
 bool Gravity::FindPath(const std::string &receiver, std::wstring &path) {
   GUID guid;
@@ -261,11 +288,6 @@ bool Gravity::FindPath(const std::string &receiver, std::wstring &path) {
   return found;
 }
 
-// A receiver's input reports, read only (another reader of the same interface, with its own queue: nothing is sent).
-// Reports: 0x23 one Watchman packet, 0x24 two (the second 29 bytes on). A packet: time MSB, size, time LSB, then
-// size - 1 bytes: Watchman v2 flags, and with 0x80 the IMU sample first: a time byte, accel xyz, gyro xyz (int16 LE).
-// The sample's time: the packet's two bytes and its own, the top 24 bits of the device's 48 MHz clock. libsurvive's
-// driver_vive.c (survive_handle_watchman, handle_watchman_v2, read_imu_data).
 void Gravity::ReadLoop(std::string receiver, Reader *rd) {
   std::wstring path;
   HANDLE h = INVALID_HANDLE_VALUE;
@@ -289,22 +311,7 @@ void Gravity::ReadLoop(std::string receiver, Reader *rd) {
       }
       if (!GetOverlappedResult(h, &ov, &n, FALSE)) break;
     }
-    double t = QpcNow();
-    if (n < 2 || (r[0] != 0x23 && r[0] != 0x24)) continue;
-    for (size_t off : {size_t(1), size_t(30)}) {
-      if (off == 30 && r[0] != 0x24) break;
-      if (off + 3 > n) break;
-      const unsigned char *p = r + off;
-      size_t size = p[1];
-      if (size < 15 || off + 3 + size - 1 > n) continue;
-      const unsigned char *pay = p + 3;
-      if (!(pay[0] & 0x80)) continue;
-      int16_t v[6];
-      for (int i = 0; i < 6; i++) v[i] = (int16_t)(pay[2 + 2 * i] | (pay[3 + 2 * i] << 8));
-      uint32_t tick = (uint32_t)p[0] << 24 | (uint32_t)p[2] << 16 | (uint32_t)pay[1] << 8;
-      OnImu(receiver, t, tick, v, v + 3);
-      rd->n++;
-    }
+    Report(receiver, rd, r, n, QpcNow());
   }
   CancelIoEx(h, nullptr);
   CloseHandle(ov.hEvent);
@@ -312,9 +319,61 @@ void Gravity::ReadLoop(std::string receiver, Reader *rd) {
   rd->done = true;
 }
 
+#else
+// the receiver's HID interfaces: Valve's (vendor 28de) whose serial (HID_UNIQ) is the receiver's. Every one of them
+// is read: only the one with the Watchman reports sends any
+static std::vector<std::string> HidrawPaths(const std::string &receiver) {
+  std::vector<std::string> out;
+  std::error_code ec;
+  for (auto &e : std::filesystem::directory_iterator("/sys/class/hidraw", ec)) {
+    std::string text;
+    if (!ReadText((e.path() / "device" / "uevent").string(), text)) continue;
+    std::string id, uniq;
+    std::istringstream ss(text);
+    for (std::string line; std::getline(ss, line);) {
+      if (line.rfind("HID_ID=", 0) == 0) id = line.substr(7);
+      else if (line.rfind("HID_UNIQ=", 0) == 0) uniq = line.substr(9);
+    }
+    for (auto &c : id) c = (char)toupper((unsigned char)c);
+    if (id.find(":000028DE:") == std::string::npos || uniq != receiver) continue;
+    out.push_back("/dev/" + e.path().filename().string());
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+void Gravity::ReadLoop(std::string receiver, Reader *rd) {
+  std::vector<pollfd> fds;
+  for (const std::string &p : HidrawPaths(receiver)) {
+    int fd = open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd >= 0) fds.push_back({fd, POLLIN, 0});
+  }
+  if (fds.empty()) { rd->done = true; return; }
+  unsigned char r[512];
+  while (run_ && enabled_ && !rd->stop) {
+    int k = poll(fds.data(), fds.size(), 200);
+    if (k < 0) break;
+    if (k == 0) continue;
+    bool gone = false;
+    for (auto &f : fds) {
+      if (f.revents & (POLLERR | POLLHUP | POLLNVAL)) { gone = true; continue; }
+      if (!(f.revents & POLLIN)) continue;
+      for (;;) {
+        ssize_t n = read(f.fd, r, sizeof r);
+        if (n <= 0) break;
+        Report(receiver, rd, r, (size_t)n, QpcNow());
+      }
+    }
+    if (gone) break;  // unplugged: Process starts it again
+  }
+  for (auto &f : fds) close(f.fd);
+  rd->done = true;
+}
+#endif
+
 void Gravity::Worker() {
   while (run_) {
-    Sleep(250);
+    qlhs::SleepMs(250);
     if (config_dir_.empty()) continue;
     Process(QpcNow());
   }
@@ -831,7 +890,7 @@ void Gravity::Report(double now) {
 void Gravity::Load() {
   std::string text;
   JVal root;
-  if (!ReadText(dir_ + "\\gravity.json", text) || !JParse(text, root)) return;
+  if (!ReadText(qlhs::Join(dir_, "gravity.json"), text) || !JParse(text, root)) return;
   const JVal *offs = root.get("offsets");
   if (!offs || offs->t != JVal::Obj) return;
   for (auto &kv : offs->o) {
@@ -857,12 +916,12 @@ void Gravity::Save() {
     first = false;
   }
   s += "\n }\n}\n";
-  std::string path = dir_ + "\\gravity.json", tmp = path + ".tmp";
+  std::string path = qlhs::Join(dir_, "gravity.json"), tmp = path + ".tmp";
   FILE *f = fopen(tmp.c_str(), "wb");
   if (!f) return;
   fwrite(s.data(), 1, s.size(), f);
   fclose(f);
-  MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+  qlhs::ReplaceFile(tmp, path);
 }
 
 bool Gravity::Step(const Ref &ref, bool &on, M3 &tilt) {

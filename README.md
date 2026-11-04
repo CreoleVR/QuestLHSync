@@ -28,7 +28,8 @@ headset module.
   your user.
 - **SteamVR base stations**, 1.0 or 2.0.
 - **Windows with SteamVR**, with the headset streamed by anything: Steam Link,
-  Link, Air Link, Virtual Desktop, ALVR, CreoleCast...
+  Link, Air Link, Virtual Desktop, ALVR, CreoleCast... Or **Linux with
+  SteamVR** (x86_64), built from source: see [Linux](#linux).
 - The PC and the headset on the **same local network**.
 - At least **one lighthouse device switched on** (a tracker or an Index
   controller). SteamVR only shows base stations while one is on.
@@ -73,6 +74,8 @@ Each device has its own file in
    ```
    "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "C:\path\to\questlhsync"
    ```
+
+   On Linux, build and register the driver from source: see [Linux](#linux).
 
 3. Turn off SpaceCalibrator, OpenVR-SpaceSync or anything else that moves
    lighthouse devices. Two tools correcting the same devices fight each other.
@@ -195,6 +198,32 @@ when it's in `out/`.
 `lhsyncd`'s core (`src/headset/lhsyncd.c`) is shared by both headsets; each adds
 its own side behind `src/headset/headset.h` (`magisk/src/quest.c`,
 `frame/src/frame.c`).
+
+## Linux
+
+The SteamVR driver also builds for Linux SteamVR (x86_64), with g++ and C++17.
+With SteamVR closed:
+
+```
+./build_linux.sh            driver/questlhsync/bin/linux64/driver_questlhsync.so
+./build_linux.sh install    ... and register driver/questlhsync with SteamVR (vrpathreg.sh adddriver)
+```
+
+Data and the log go to `~/.local/share/QuestLHSync` (`$XDG_DATA_HOME`) instead of
+`%LOCALAPPDATA%\QuestLHSync`. Gravity levelling reads the receivers through
+`/dev/hidraw*`, which Steam's udev rules already open to your user.
+
+Not on Linux yet:
+
+- **The dashboard page.** `src/tools/qlhs_ctl.py` shows the status in a terminal
+  (`qlhs_ctl.py watch`) and sends its commands (`pause`, `resume`, `record-on`,
+  `record-off`, `recalibrate`).
+- **Averaging the base stations' placement** (`steadyStations`): SteamVR places
+  them itself, as with `steadyStations` off.
+
+Uninstall: with SteamVR closed,
+`~/.steam/steam/steamapps/common/SteamVR/bin/vrpathreg.sh removedriver <path to driver/questlhsync>`,
+then delete `~/.local/share/QuestLHSync`.
 
 ## License
 

@@ -1,5 +1,4 @@
-#include <windows.h>
-
+#include "platform.h"
 #include "relations.h"
 
 #include <cmath>
@@ -9,7 +8,9 @@
 #include <fstream>
 #include <sstream>
 
+#ifdef _WIN32
 #include "MinHook.h"
+#endif
 #include "json.h"
 
 namespace {
@@ -22,6 +23,7 @@ constexpr size_t kKeepRel = 30;                     // the newest relationships 
 constexpr int kSayPerMin = 10;                      // log lines a minute at most
 constexpr uint64_t kSaveMs = 10000;                 // relations.json written at most this often
 
+#ifdef _WIN32
 // the relationship step's log line, and its arguments as it takes them: mov r13, r9 (the pose); mov r15d, r8d and
 // mov r12d, edx (the two stations' serials)
 const char kMoving[] = "Moving base %08X %.0fmm and %.1f deg because of relationship with %08X";
@@ -43,6 +45,7 @@ uint64_t Detour(void *self, uint64_t a, uint64_t b, const float *rel, uint64_t s
   }
   return g_orig(self, a, b, use ? avg : rel, s5, s6, s7, s8);
 }
+#endif
 
 std::string Fmt(const char *fmt, ...) {
   char buf[512];
@@ -90,6 +93,7 @@ Relations::Pose Relations::Mean(const std::vector<Pose> &v) {
   return {{s.w / n, s.x / n, s.y / n, s.z / n}, t * (1.0 / v.size())};
 }
 
+#ifdef _WIN32
 void *Relations::Find(void *module, std::string &why) {
   auto *base = (uint8_t *)module;
   auto *dos = (IMAGE_DOS_HEADER *)base;
@@ -171,6 +175,22 @@ bool Relations::Hook() {
 void Relations::Unhook() {
   if (target_) MH_DisableHook(target_);
 }
+#else
+// driver_lighthouse.so is built by another compiler for another calling convention: the Windows search doesn't
+// apply, so SteamVR places its base stations itself
+void *Relations::Find(void *, std::string &why) {
+  why = "not on Linux yet";
+  return nullptr;
+}
+
+bool Relations::Hook() {
+  log_("base stations: averaging SteamVR's measurements (steadyStations) isn't on Linux yet: base stations placed as "
+       "SteamVR places them");
+  return true;
+}
+
+void Relations::Unhook() {}
+#endif
 
 bool Relations::Average(uint32_t a, uint32_t b, const float rel[7], float out[7]) {
   if (!enabled_ || a == b || !a || !b) return false;
@@ -236,7 +256,7 @@ void Relations::Roll(uint64_t now) {
 }
 
 void Relations::Say(const std::string &s) {
-  Roll(GetTickCount64());
+  Roll(qlhs::TickMs());
   if (say_n_ < kSayPerMin) {
     said_.push_back(s);
     say_n_++;
@@ -250,7 +270,7 @@ void Relations::Flush(bool now) {
   std::vector<std::string> said;
   {
     std::lock_guard<std::mutex> g(m_);
-    uint64_t t = GetTickCount64();
+    uint64_t t = qlhs::TickMs();
     Roll(t);
     if (dirty_ && (now || t - saved_t_ >= kSaveMs)) {
       s = Json();
@@ -261,16 +281,16 @@ void Relations::Flush(bool now) {
   }
   for (auto &l : said) log_(l);
   if (s.empty()) return;
-  std::string path = dir_ + "\\relations.json", tmp = path + ".tmp";
+  std::string path = qlhs::Join(dir_, "relations.json"), tmp = path + ".tmp";
   FILE *f = fopen(tmp.c_str(), "wb");
   if (!f) return;
   fwrite(s.data(), 1, s.size(), f);
   fclose(f);
-  MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+  qlhs::ReplaceFile(tmp, path);
 }
 
 void Relations::Load() {
-  std::ifstream f(dir_ + "\\relations.json", std::ios::binary);
+  std::ifstream f(qlhs::Join(dir_, "relations.json"), std::ios::binary);
   if (!f) return;
   std::stringstream ss;
   ss << f.rdbuf();

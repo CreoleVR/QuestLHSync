@@ -6,6 +6,7 @@
 
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
+#define QLHS_SHM_NAME_POSIX "/QuestLHSync"  // Linux: shm_open, /dev/shm/QuestLHSync
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
 #define QLHS_VERSION 2
 #define QLHS_RELEASE "1.28"  // magisk/build_module.py reads it
