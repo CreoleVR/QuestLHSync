@@ -149,7 +149,10 @@ class Gravity {
 
   void Worker();
   void ReadLoop(std::string receiver, Reader *r);
+#ifdef _WIN32
   bool FindPath(const std::string &receiver, std::wstring &path);
+#endif
+  void Report(const std::string &receiver, Reader *rd, const unsigned char *r, size_t n, double t);  // one input report
   bool LoadConfig(Dev &d);
   void Ingest(Rx &r, const ImuS &s);
   void MapClock(Rx &r);

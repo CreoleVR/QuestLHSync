@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "json.h"
+#include "platform.h"
 
 static const double kInf = std::numeric_limits<double>::infinity();
 
@@ -2711,11 +2712,7 @@ void Sync::Retime(double old_e, double new_e) {
   solver_.Replace(rec.front().tg - old_e, T, O, D, G, C, B, A);
 }
 
-static std::string Join(const std::string &dir, const char *name) {
-  if (dir.empty()) return name;
-  char e = dir.back();
-  return dir + ((e == '\\' || e == '/') ? "" : "\\") + name;
-}
+static std::string Join(const std::string &dir, const char *name) { return qlhs::Join(dir, name); }
 
 static StationsFile LoadStations(const std::string &dir) {
   StationsFile f;
@@ -2918,7 +2915,7 @@ void Sync::ApplyHeadset() {
     std::lock_guard<std::mutex> g(st_m_);
     ApplyTiming();
   }
-  log_(Fmt("state for %s: headsets\\%s\\state.json%s", key.c_str(), key.c_str(),
+  log_(Fmt("state for %s: headsets" QLHS_SEP "%s" QLHS_SEP "state.json%s", key.c_str(), key.c_str(),
            adopted ? " (the state.json of earlier versions, moved there)"
                    : quest_.empty() ? " (nothing saved yet)" : Fmt(" (%d base stations saved)", (int)quest_.size()).c_str()));
 }
