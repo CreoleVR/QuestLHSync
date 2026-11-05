@@ -6,7 +6,7 @@
 // --learn: round-trip-less logs still learn the timing (starting from --expo), to test the estimator.
 // --learn-grid: learn the cameras' frame period as for headsets other than the Quest Pro, to test that.
 // --channel SERIAL=N: a base station's channel, for older logs.
-// --xf file: the transform applied to the lighthouse devices (raw -> Quest: pc_ns qw qx qy qz tx ty tz), every 0.25 s
+// --xf file: the transform applied to the lighthouse devices (raw -> Quest: pc_ns qw qx qy qz tx ty tz scale), every 0.25 s
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -116,8 +116,8 @@ int main(int argc, char **argv) {
       bool step = sync.WillStep(next_tick);
       Transform x = sync.Tick(next_tick);
       if (xf && x.active && ticks++ % 5 == 0)
-        fprintf(xf, "%lld %.7f %.7f %.7f %.7f %.5f %.5f %.5f\n", (long long)(next_tick * 1e9), x.q.w, x.q.x, x.q.y, x.q.z,
-                x.t.x, x.t.y, x.t.z);
+        fprintf(xf, "%lld %.7f %.7f %.7f %.7f %.5f %.5f %.5f %.5f\n", (long long)(next_tick * 1e9), x.q.w, x.q.x, x.q.y, x.q.z,
+                x.t.x, x.t.y, x.t.z, x.scale);
       if (step && out) {
         auto st = sync.GetStatus(next_tick);
         if (st.has_x)

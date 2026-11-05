@@ -16,11 +16,26 @@ Known problems:
   correctly. See [galaxy_xr_lamp_filter.md](galaxy_xr_lamp_filter.md).
 - **The alignment differs by several cm between SteamVR sessions.** The driver's gravity levelling of the lighthouse
   frame has come out 1.9° and 1.0° in two sessions (several cm at the base stations' distance); not yet investigated.
+- **Head and lighthouse disagree on a metre.** With a tracker fixed to the headset, the head covers 0.92-0.99 of the
+  tracker's distance, differing by session (five sessions; the base stations' distances stay within 0.5%). The
+  headset's own pose (Google's head tracking client) reaches SteamVR unchanged (1.0004), so it isn't the streamer. Which
+  of the two is off isn't known. The driver reads the scale from the sightings (`Sync::ScaleStep`), see below.
 - **Pose timing is not learned** on this headset (too few sightings per head turn); the driver starts it at 35 ms for a
   Galaxy XR (`kExpoGalaxyXR`, measured against a tracker on a headset mount), not the 18 ms default.
 - Virtual Desktop has crashed a few times during sessions, once right after every camera stream of the headset stalled
   for ~300 ms during a burst of low-memory kills. Whether QuestLHSync's camera client plays a part is not known;
   lhsight-gxr now reports the longest time it held a camera frame each second (`hold_max_us` in its `T` lines).
+
+## The lighthouse scale
+
+Galaxy XR frames of three or more base stations: lighthouse devices are placed by `scale * q * p + t`. Every minute
+the sightings of the last five minutes read the scale (`Solver::Scale`), and the reading counts when they come from a head
+that went at least 1 m (5-95%, all axes together) and from three stations: from a seated head they say nothing (0.67-0.87
+where a mounted tracker said 0.96). A session's readings are averaged; until its first one, `stations.json` holds the last
+session's, and *Force recalibrate* keeps it. Recordings replayed against a tracker on the mount: from 7.7 to 3.3 cm off
+(5 Nov, the head over 1.4 m; 0.949 for the tracker's 0.935), from 5.3 to 4.5 (30 Oct; 0.986 for 0.972); seated sessions read
+nothing and stay at the scale they had. **Not yet run live.** In the log: `lighthouse scale: ...`; in recordings:
+`I scale read scale_before span stations n median readings held`.
 
 ## Requirements
 
@@ -69,16 +84,26 @@ Cost: ~1.5 % of one core for lhsight-gxr, ~0.3 % for lhsyncd; scans ~125 µs per
 ### Calibration (`magisk/src/galaxy_xr.c`)
 
 The QVR XML under `/data/vendor/qvr` is an unconfigured default (its rig is ~15° off what the cameras see). The real
-calibration is Google's OpenPX profile, `/vendor/etc/calibration_service/device_profile.textproto`, with this unit's
-refinements in `/data/vendor/openpx/calibration/records/FRAME_IMU_0_t_CAMERA_*`:
+calibration is Google's OpenPX profile: this unit's factory one, `/mnt/vendor/efs/device_profile.textproto`, with its
+records in `/data/vendor/openpx/calibration/records/FRAME_IMU_0_t_CAMERA_*` (trackingA/B, the same as the factory's on the
+one headset compared). `/vendor/etc/calibration_service/device_profile.textproto` is the fallback: it is the same on
+every headset and isn't this unit (compared to the factory's on that headset, principal points up to 12 px off,
+trackingC/D up to 1.2°).
 
 - `frame_t_camera` quaternions are JPL (the Hamilton matrix transposed); `p` is the camera's place in IMU_0
 - IMU_0 has OpenGL axes (x right, y up, z back)
 - `distortion_fisheye_spline3` isn't a Kannala–Brandt polynomial; the lenses are close to ideal equidistant fisheyes
-- the HMD pose's origin in IMU_0 (`kEye`) was measured with a tracker on a rigid headset mount:
-  (0.0725, −0.051, 0.106) m, ±2 cm. The display profile's eye points (`lut_frame_t_eye` of `eye-left/right`) put the
-  eyes' middle at ~(0.061, −0.024, 0.051): Virtual Desktop's head pose isn't of that point.
-- `calibration_override.json` in the module directory, if there, is sent instead (for fitted corrections)
+- the HMD pose's frame is asked of Google's calibration service at each connection: `getLatestTransform("FRAME_IMU_0",
+  "SENSOR_THIRD_EYE")` through `libperception_calibration_client_plugin.so`, by `lhsight-gxr --transform` (a vendor
+  library, so from the copy in `/data/local/tmp`). The call is from stearnsbq's
+  [questlhsync-galaxy-xr](https://github.com/stearnsbq/questlhsync-galaxy-xr) (`src/head_origin.c`, MIT), and its ABI is
+  known on firmware I610UEU2AZF3 only. **Not yet run in this module.** The result goes to the driver's log with
+  `camera calibration:`, the cameras' own live transforms (a guess at their names) to the headset's logcat.
+- `kEye`, the fallback when that can't answer: the HMD pose's origin in IMU_0 measured with a tracker on a rigid headset
+  mount, (0.0725, −0.051, 0.106) m, ±2 cm. The display profile's eye points (`lut_frame_t_eye` of `eye-left/right`) put
+  the eyes' middle at ~(0.061, −0.024, 0.051): Virtual Desktop's head pose isn't of that point.
+- `calibration_override.json` in the module directory, if there, is sent instead (for fitted corrections), and the head's
+  frame is still asked and logged. To run on the factory profile and the live head, move it away.
 - the cameras' rotation against the HMD pose isn't the same from session to session: against a tracker on the
   headset mount the sightings wanted the override (md5 556be1ef...) turned about the head's z by -0.4 deg (30 Oct
   23:00, old pipeline), +1.2 (31 Oct 21:37), +0.9..1.1 (2 Nov 00:07) and -0.2..-0.3 (2 Nov 00:30, x +0.1..0.2,

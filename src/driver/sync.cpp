@@ -598,6 +598,7 @@ bool StationsFile::Load(const std::string &path) {
   // a level kept before it was a mean: one reading's worth
   if (const JVal *ln = d.get("level_n")) level_n = (int)ln->num();
   else level_n = RotDeg(level) > 0 ? 1 : 0;
+  if (const JVal *sc = d.get("scale")) scale = sc->num();
   if (const JVal *st = d.get("stations"))
     for (auto &kv : st->o) {
       if (const JVal *pos = kv.second.get("pos")) {
@@ -646,10 +647,10 @@ bool StationsFile::SaveAuto(const std::string &path) const {
       "its lighthouse universe at every start; this pins it. stations: each base station's pose in it; with three or "
       "more, the frame follows the best fit of them all. place: with two, the other's distance and height from the "
       "anchor (m) as the headset's cameras measured them. level: the turn that levels it with the headset's gravity, "
-      "the mean of level_n readings of the base stations' sightings. Delete to start over.\",\n", anchor.c_str());
+      "the mean of level_n readings of the base stations' sightings. scale: lighthouse metres in the headset's, as last read. Delete to start over.\",\n", anchor.c_str());
   s += Fmt(" \"anchor\": \"%s\",\n \"anchor_p\": [%.6f, %.6f, %.6f],\n \"anchor_q\": [%.6f, %.6f, %.6f, %.6f],\n"
-           " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"level_n\": %d,\n \"stations\": {", anchor.c_str(),
-           anchor_p.x, anchor_p.y, anchor_p.z, q.w, q.x, q.y, q.z, l.w, l.x, l.y, l.z, level_n);
+           " \"level\": [%.8f, %.8f, %.8f, %.8f],\n \"level_n\": %d,\n \"scale\": %.5f,\n \"stations\": {", anchor.c_str(),
+           anchor_p.x, anchor_p.y, anchor_p.z, q.w, q.x, q.y, q.z, l.w, l.x, l.y, l.z, level_n, scale);
   s += st + Fmt("},\n \"saved\": \"%s\"\n}\n", Now().c_str());
   return WriteFileAtomic(path, s);
 }
@@ -821,16 +822,19 @@ void Frame::Update(const std::map<std::string, std::pair<V3, M3>> &raw) {
     C_ = GC_ * f_.level * Cs;
     o_ = o;
     oref_ = f_.anchor_p;
+    s_ = lay ? f_.scale : 1;
   } else {
     Cs_ = C_ = GC_ = M3();
     o_ = {};
     oref_ = {};
+    s_ = 1;
   }
 }
 
 void Frame::Reset() {
   Cs_ = C_ = GC_ = M3();
   o_ = oref_ = V3{};
+  s_ = 1;
   ok_ = -1;
   deg_ = miss_ = 0;
   left_.clear();
@@ -2465,6 +2469,98 @@ bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out, const std::vector<int> *on
   return true;
 }
 
+// The 4-DOF fit's stations scaled about pivot, over a grid of scales: the one the thinned sightings (one per head cell and
+// direction, so that a seated stretch doesn't outweigh the walk) miss least by, between its neighbours. A head that
+// hasn't gone anywhere can't tell: a station's direction only says its distance by parallax.
+bool Solver::Scale(V3 pivot, ScaleR &out) {
+  if (!has_x_) return false;
+  std::vector<std::string> keys;
+  std::vector<V3> S0, Z0;
+  Stations(keys, S0, Z0);
+  if ((int)S0.size() < LEVEL_STATIONS) return false;
+  const double now = seen_;
+  Rays all = Bright(GetRays(std::max(now - WIN, since_)));
+  if (all.size() < 200) return false;
+  Rays r;  // Thin, with all the fields Fit takes
+  {
+    std::unordered_map<CellKey, size_t, CellHash> first;
+    for (size_t n = 0; n < all.size(); n++)
+      if (first.emplace(KeyOf(all.O[n], all.D[n]), n).second) {
+        r.T.push_back(all.T[n]); r.G.push_back(all.G[n]); r.O.push_back(all.O[n]); r.D.push_back(all.D[n]);
+        r.C.push_back(all.C[n]);
+        if (!all.B.empty()) r.B.push_back(all.B[n]);
+      }
+  }
+  V3 mid{};
+  for (const V3 &p : S0) mid = mid + p;
+  mid = (1.0 / S0.size()) * mid;
+  std::vector<V3> S(S0.size());
+  auto at = [&](double t, X4 x, X4 &fit, double *miss) {  // x: held where the stations' middle stays
+    for (size_t k = 0; k < S0.size(); k++) S[k] = pivot + t * (S0[k] - pivot);
+    V3 m = RyMul(std::cos(x[0]), std::sin(x[0]), (t - 1) * (mid - pivot));
+    x[1] -= m.x; x[2] -= m.y; x[3] -= m.z;
+    for (double gate : {GATE, 1.0}) {
+      FitR f = Fit(x, S, Z0, r, now, gate, nullptr, nullptr, DimGate());
+      if (!f.ok) return false;
+      x = f.x;
+    }
+    fit = x;
+    if (miss) {
+      std::vector<V3> P, Zq;
+      Predict(x, S, Z0, P, Zq);
+      double c = 0;
+      for (size_t n = 0; n < r.size(); n++) {
+        int k;
+        double a;
+        Nearest(P, Zq, r.O[n], r.D[n], k, a);
+        c += std::min(a * a, 1.0);
+      }
+      *miss = c;
+    }
+    return true;
+  };
+  static constexpr int kGrid = 8;  // +-8%
+  double cost[2 * kGrid + 1];
+  int best = -1;
+  X4 fit;
+  for (int i = -kGrid; i <= kGrid; i++) {
+    if (!at(1 + i * 0.01, x_, fit, &cost[i + kGrid])) cost[i + kGrid] = kInf;
+    if (best < 0 || cost[i + kGrid] < cost[best]) best = i + kGrid;
+  }
+  if (!(cost[best] < kInf) || best == 0 || best == 2 * kGrid) return false;  // no minimum inside
+  double a = cost[best - 1], b = cost[best], c = cost[best + 1], den = a - 2 * b + c;
+  if (!(den > 0)) return false;
+  out.t = 1 + (best - kGrid + 0.5 * (a - c) / den) * 0.01;
+  if (!at(out.t, x_, fit, nullptr)) return false;
+  out.x = fit;
+  // how far the head went among the sightings that fit, each way (5-95%), and from how many stations
+  std::vector<V3> P, Zq;
+  Predict(fit, S, Z0, P, Zq);
+  std::vector<double> in, xs, ys, zs;
+  for (size_t n = 0; n < r.size(); n++) {
+    int k;
+    double m;
+    Nearest(P, Zq, r.O[n], r.D[n], k, m);
+    if (m >= 1.0) continue;
+    in.push_back(m);
+    xs.push_back(r.O[n].x); ys.push_back(r.O[n].y); zs.push_back(r.O[n].z);
+  }
+  if ((int)in.size() < 50) return false;
+  auto span = [](std::vector<double> &v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() * 95 / 100] - v[v.size() * 5 / 100];
+  };
+  double sx = span(xs), sy = span(ys), sz = span(zs);
+  out.span = std::sqrt(sx * sx + sy * sy + sz * sz);
+  out.n = (int)in.size();
+  out.med = Median(in);
+  std::vector<int> cells;
+  Support(fit, S, Z0, r, INLIER, cells);
+  out.stations = 0;
+  for (int k : cells) out.stations += k >= LEVEL_CELLS;
+  return true;
+}
+
 void Solver::Relevel(const X4 &x) {
   x_ = anchor_ = x;
   has_x_ = has_anchor_ = true;
@@ -2973,6 +3069,7 @@ void Sync::ClearAlignment() {
   }
   have_applied_ = false;
   applied_ = X4{};
+  applied_scale_ = 1;
   lock_time_ = -1;
   resets_seen_ = solver_.resets();
   sum_t_ = -1;
@@ -2998,6 +3095,7 @@ void Sync::ForceRecalibrate() {
   if (sfile_.autogen || !sfile_.loaded) {
     kept_level_ = {};
     if (sfile_.autogen && sfile_.level_n > 0 && frame_.ok() == 1) kept_level_ = {frame_.Anchored(), sfile_.level_n};
+    kept_scale_ = sfile_.autogen ? sfile_.scale : 1;
     pair_level_.clear();
     for (auto &kv : sfile_.place) solver_.DropFix(kv.first);
     sfile_ = StationsFile();
@@ -3053,7 +3151,7 @@ double Sync::BodyDist(const X4 &x) {
     M3 R;
     V3 h;
     if (!poses_.At(e.t, R, h)) continue;
-    V3 q = RyMul(c, s, C * e.p + tc) + V3{x[1], x[2], x[3]};
+    V3 q = RyMul(c, s, frame_.scale() * (C * e.p) + tc) + V3{x[1], x[2], x[3]};
     double d = std::hypot(q.x - h.x, q.z - h.z);
     auto it = nearest.emplace((long long)std::floor(e.t * 10), d).first;
     it->second = std::min(it->second, d);
@@ -3090,7 +3188,7 @@ double Sync::BodyMotion(const X4 &x, double &moved) {
       M3 R;
       V3 h0, h1;
       if (!poses_.At(v[i]->t, R, h0) || !poses_.At(v[j]->t, R, h1)) continue;
-      V3 dq = RyMul(c, s, C * (v[j]->p - v[i]->p)), dh = h1 - h0;
+      V3 dq = RyMul(c, s, frame_.scale() * (C * (v[j]->p - v[i]->p))), dh = h1 - h0;
       num += dh.x * dq.x + dh.z * dq.z;
       nh += dh.x * dh.x + dh.z * dh.z;
       nd += dq.x * dq.x + dq.z * dq.z;
@@ -3327,6 +3425,36 @@ bool Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
              "says (%.2f deg in all), %d base stations within %.2f deg", step * share, n + 1, step, RotDeg(L),
              lv.stations, lv.med));
   return true;
+}
+
+void Sync::ScaleStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now) {
+  if (!have_optics_ || optics_.headset() != Optics::kGalaxyXR || !frame_.layout() || frame_.ok() != 1 || !solver_.has_x() ||
+      now - lock_time_ < kLevelSettle)
+    return;
+  if (!(BodyDist(solver_.x()) < kLevelBody)) return;
+  Solver::ScaleR sr;
+  if (!solver_.Scale(sfile_.anchor_p, sr)) return;
+  double read = sfile_.scale * sr.t;
+  bool held = sr.span >= kScaleSpan && sr.stations >= Solver::LEVEL_STATIONS && read >= kScaleMin && read <= kScaleMax;
+  Rec(now, "I scale %.4f %.4f %.2f %d %d %.3f %d %d", read, sfile_.scale, sr.span, sr.stations, sr.n, sr.med, scale_n_, held);
+  if (!held) return;
+  int n = std::min(scale_n_, kScaleMemory - 1);
+  double share = 1.0 / (n + 1), was = sfile_.scale, to = was + share * (read - was);
+  scale_n_ = n + 1;
+  X4 x = solver_.x();  // as far toward the reading's alignment as the scale went
+  x[0] += share * Wrap(sr.x[0] - x[0]);
+  for (int i = 1; i < 4; i++) x[i] += share * (sr.x[i] - x[i]);
+  sfile_.scale = to;
+  sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
+  frame_.Update(raw);
+  for (auto &kv : raw) {
+    V3 p; M3 R;
+    frame_.Apply(kv.second.first, kv.second.second, p, R);
+    solver_.SetStation(kv.first, p, R);
+  }
+  solver_.Relevel(x);
+  log_(Fmt("lighthouse scale: %.3f read from the sightings (the head over %.2f m, %d within 1 deg, median %.2f), now %.3f "
+           "(%d reading(s) this session, %.3f before)", read, sr.span, sr.n, sr.med, to, scale_n_, was));
 }
 
 void Sync::TakeLevel(const M3 &part, const std::map<std::string, std::pair<V3, M3>> &raw, const X4 &x) {
@@ -3605,6 +3733,8 @@ Transform Sync::Tick(double now) {
         log_("reference frame set: anchor " + best->first);
       }
       kept_level_ = {};
+      sfile_.scale = kept_scale_;
+      kept_scale_ = 1;
       sfile_.SaveAuto(Join(cfg_.dir, "stations.json"));
     } else if (sfile_.autogen && !frame_.layout() && raw.count(sfile_.anchor)) {  // follows a moved anchor
       auto &a = raw[sfile_.anchor];
@@ -3779,6 +3909,10 @@ Transform Sync::Tick(double now) {
       last_level_ = now;
       if (!LevelStep(raw, now)) PairLevelStep(raw, now);
     }
+    if (now - last_scale_ >= kScaleEvery) {
+      last_scale_ = now;
+      ScaleStep(raw, now);
+    }
     if (now - last_place_ >= kPlaceEvery && TwoFit(solver_.has_x(), st) && st.cond) {
       last_place_ = now;
       PlaceStep(raw, now);
@@ -3792,7 +3926,8 @@ Transform Sync::Tick(double now) {
   Transform out;
   if (!solver_.has_x()) return out;
   X4 x = solver_.x();
-  if (!have_applied_) { applied_ = x; have_applied_ = true; }
+  const double sc = frame_.scale();
+  if (!have_applied_) { applied_ = x; applied_scale_ = sc; have_applied_ = true; }
   else if (!paused_) {
     V3 h{0, 1.5, 0};
     double th, w = 0, v = 0;
@@ -3804,11 +3939,13 @@ Transform Sync::Tick(double now) {
     }
     X4 dx = {Wrap(x[0] - applied_[0]), x[1] - applied_[1], x[2] - applied_[2], x[3] - applied_[3]};
     V3 at{applied_[1], applied_[2], applied_[3]};
-    double d = norm(Ry(dx[0]) * (h - at) + at + V3{dx[1], dx[2], dx[3]} - h);
-    if (d > kJumpApply) applied_ = x;
+    double ds = sc - applied_scale_;
+    double d = norm(Ry(dx[0]) * (h - at) + at + V3{dx[1], dx[2], dx[3]} - h) + std::fabs(ds) * norm(h - at);
+    if (d > kJumpApply) { applied_ = x; applied_scale_ = sc; }
     else if (d > 1e-6) {
       double s = std::min(1.0, (kSlewStill + kSlewTurn * w + kSlewWalk * v) * 0.05 / d);
       for (int i = 0; i < 4; i++) applied_[i] += dx[i] * s;
+      applied_scale_ += ds * s;
     }
   }
   M3 C; V3 tc;
@@ -3816,7 +3953,8 @@ Transform Sync::Tick(double now) {
   M3 R = Ry(applied_[0]);
   out.active = true;
   out.q = ToQuat(R * C);
-  out.t = R * tc + V3{applied_[1], applied_[2], applied_[3]};
+  out.t = R * frame_.At(applied_scale_) + V3{applied_[1], applied_[2], applied_[3]};
+  out.scale = applied_scale_;
   return out;
 }
 

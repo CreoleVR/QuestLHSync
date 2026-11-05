@@ -97,6 +97,14 @@ constexpr int kLevelMemory = 60;
 // unless SteamVR re-solves its base stations under the frame and the level moves with them: a reading this far (deg)
 // from the mean is no scatter, and the mean starts over from it
 constexpr double kLevelJump = 0.6;
+// The headset's own tracking and lighthouse don't agree on a metre: on a Galaxy XR the head covers 0.92-0.99 of what a
+// tracker fixed to it does, differing by session (recordings, five sessions; the base stations' distances stay within
+// 0.5%), and the headset's pose reaches SteamVR as it is (1.0004). An alignment without it leaves ~12 cm at the feet.
+// Galaxy XR frames of three or more stations (Sync::ScaleStep): every kScaleEvery s the sightings read the scale, when
+// the head's sightings span kScaleSpan m (under that they say nothing: 0.67-0.87 from a seated head), within kScaleMin
+// to kScaleMax. A session's readings are averaged, up to kScaleMemory of them; until its first, the last session's holds
+constexpr double kScaleEvery = 60.0, kScaleSpan = 1.0, kScaleMin = 0.88, kScaleMax = 1.05;
+constexpr int kScaleMemory = 10;
 // a pair of stations' reading (Sync::PairLevelStep) counts if its time slices agree within kPairLevelSd (deg): the
 // level check's across two stations came within 0.19. Its sightings' median error may reach kPairLevelMed, not
 // Solver::LEVEL_MED: a Galaxy XR's sit at 0.30-0.36 deg, and two stations leave the tilt along their line in them
@@ -241,6 +249,7 @@ struct StationsFile {
   M3 anchor_R;
   M3 level;  // automatic frames: turns the frame level with the headset's gravity (Solver::Level)
   int level_n = 0;  // how many of the cameras' readings the level is the mean of (Sync::LevelStep)
+  double scale = 1;  // lighthouse metres -> the headset's (Sync::ScaleStep)
   std::map<std::string, V3> fix;  // measured positions, reference frame
   // automatic frames of three or more stations: each one's pose in the reference frame, before the level
   std::map<std::string, std::pair<V3, M3>> ref;
@@ -262,10 +271,13 @@ class Frame {
   bool layout() const { return f_.autogen && f_.ref.size() >= 3; }
   const std::string &left() const { return left_; }  // the station the layout fit leaves out: moved against the rest
   double miss() const { return miss_; }  // m: the layout fit's worst miss of the stations it keeps
-  void Apply(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + C_ * (p - o_); Ro = C_ * R; }
+  void Apply(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + s_ * (C_ * (p - o_)); Ro = C_ * R; }
   // before the level: what recordings hold, so a replay with the same stations.json levels them once
   void Unlevelled(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + Cs_ * (p - o_); Ro = Cs_ * R; }
-  void Rotation(M3 &C, V3 &t) const { C = C_; t = oref_ - C_ * o_; }  // p_ref = C p_raw + t
+  void Rotation(M3 &C, V3 &t) const { C = C_; t = oref_ - s_ * (C_ * o_); }  // p_ref = scale() C p_raw + t
+  double scale() const { return s_; }
+  // p_ref = s C p_raw + At(s): the scale an alignment on its way is at (Sync::Tick)
+  V3 At(double s) const { return oref_ - s * (C_ * o_); }
   // levelled by gravity (gravity.h): tilt after the level; from the next Update
   void SetGravity(bool on, const M3 &tilt) { grav_ = on; G_ = tilt; }
   const M3 &gravity() const { return GC_; }  // the tilt in C_ (none: identity)
@@ -281,6 +293,7 @@ class Frame {
   M3 G_, GC_;
   bool grav_ = false;
   V3 o_, oref_;
+  double s_ = 1;
   int ok_ = -1;
   double deg_ = 0;
   std::string left_;
@@ -312,6 +325,7 @@ class Solver {
   static constexpr double SIG_LEVEL = 1.0 / kDeg, COND_LEVEL = 0.1 / kDeg, LEVEL_MED = 0.3;
   static constexpr int LEVEL_STATIONS = 3, LEVEL_CELLS = 3;
   struct LevelR { X4 x{}; M3 tilt; int stations = 0; double med = 0; };  // tilt about the pivot, then x
+  struct ScaleR { X4 x{}; double t = 1, span = 0, med = 0; int stations = 0, n = 0; };  // scale about the pivot, then x
   // a tilt about one horizontal axis (rad), how well its time slices agree on it (rad), the sightings' median error
   struct AxisR { double theta = 0, sd = 0, med = 0; int slices = 0; };
 
@@ -364,6 +378,9 @@ class Solver {
   // seen from LEVEL_CELLS cells (all of them without); max_med: the sightings' median error it takes (deg)
   bool LevelAxis(V3 pivot, V3 axis, AxisR &out, const std::vector<int> *only = nullptr, double max_med = LEVEL_MED);
   void Relevel(const X4 &x);  // the alignment for the stations as just levelled
+  // the scale of the stations about pivot that fits the sightings best, on top of theirs, and how far the head went among
+  // them (kScaleSpan). False: too few, or no minimum within +-8%
+  bool Scale(V3 pivot, ScaleR &out);
 
   // geometry, also used by Timing
   static void Predict(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, std::vector<V3> &P, std::vector<V3> &Zq);
@@ -488,7 +505,7 @@ struct SyncConfig {
   bool learn_grid = false;     // tools: learn the frame period even on a Quest Pro
 };
 
-struct Transform { bool active = false; Quat q; V3 t; };  // raw lighthouse -> Quest
+struct Transform { bool active = false; Quat q; V3 t; double scale = 1; };  // raw lighthouse -> Quest: scale q p + t
 
 class Sync {
  public:
@@ -626,6 +643,9 @@ class Sync {
   void Retime(double old_e, double new_e);
   bool LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);  // true: three stations pinned it
   void PairLevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  void ScaleStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  double last_scale_ = 0, applied_scale_ = 1, kept_scale_ = 1;
+  int scale_n_ = 0;  // this session's readings of the scale
   std::map<std::string, std::pair<double, int>> pair_level_;  // each pair's last try and readings this session
   // the level turned by part (on top of the one so far), the frame and the solver's stations with it, x the alignment
   void TakeLevel(const M3 &part, const std::map<std::string, std::pair<V3, M3>> &raw, const X4 &x);

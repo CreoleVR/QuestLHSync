@@ -5,6 +5,7 @@
 // Nothing is injected anywhere; when it exits, the camera service drops its clients and the pattern with them.
 // Lines on stdout as lhsight.js wrote them:  F ... (frames)  T ... (heartbeat)  I/W/E ...
 //   lhsight-gxr idA idB idC idD     the camera ids lhsyncd's calibration gives trackingA..D (-1: not scanned)
+//   lhsight-gxr --transform a b ... Google's live calibration, per pair of frames (latest_transforms), then exits
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -146,7 +147,47 @@ static int pattern(void *dev, int on) {
   return q.set_param_num(dev, "qvrcamdevice_enable_frame_pattern", 0, 1, (const char *)&v);  // uint8
 }
 
+// ---------------------------------------------------------------- --transform: Google's live calibration
+// A line per pair of frames: "a b rx ry rz tx ty tz", a_t_b as a Rodrigues rotation (rad) and metres, or "a b E why".
+// The client's ABI on firmware I610UEU2AZF3, as stearnsbq's questlhsync-galaxy-xr found it (src/head_origin.c, MIT):
+// interface 0xc0001, its read-only getLatestTransform at byte 0xa0, six float32s out. A field of canaries rejects any
+// other layout, and lhsyncd asks only on this firmware. Each line is out before the next query: a frame the client
+// doesn't survive costs only the lines after it.
+#define CAL_IFACE 0xc0001
+#define CAL_CANARY 0x7fc00001u
+static int latest_transforms(int n, char **pairs) {
+  alarm(8);
+  void *lib = dlopen("/vendor/lib64/libperception_calibration_client_plugin.so", RTLD_NOW);
+  if (!lib) { say("E %s", dlerror()); return 2; }
+  int (*create)(int, const char *, void **) = dlsym(lib, "GoogleClient_CreateInstance");
+  void (*destroy)(void *) = dlsym(lib, "GoogleClient_DestroyInstance");
+  void (*activate)(void *) = dlsym(lib, "PerceptionClient_Activated");
+  void (*deactivate)(void *) = dlsym(lib, "PerceptionClient_Deactivated");
+  if (!create || !destroy || !activate || !deactivate) { say("E the calibration client lacks a function"); return 2; }
+  void *client = NULL;
+  int r = create(CAL_IFACE, "QuestLHSync", &client);
+  if (r || !client) { say("E no calibration client (%d)", r); return 2; }
+  if (*(uint32_t *)client != CAL_IFACE) { say("E the calibration client's interface differs"); destroy(client); return 2; }
+  activate(client);
+  int (*get)(void *, const char *, const char *, void *) =
+      *(int (**)(void *, const char *, const char *, void *))((uint8_t *)client + 0xa0);
+  for (int p = 0; p + 1 < n; p += 2) {
+    union { float v[1024]; uint32_t w[1024]; } out;
+    for (int i = 0; i < 1024; i++) out.w[i] = CAL_CANARY;
+    r = get ? get(client, pairs[p], pairs[p + 1], &out) : -1;
+    int ok = !r;
+    for (int i = 0; ok && i < 6; i++) ok = __builtin_isfinite(out.v[i]) && __builtin_fabsf(out.v[i]) <= (i < 3 ? 3.15f : .5f);
+    for (int i = 6; ok && i < 1024; i++) ok = out.w[i] == CAL_CANARY;
+    if (ok) say("%s %s %.9g %.9g %.9g %.9g %.9g %.9g", pairs[p], pairs[p + 1], out.v[0], out.v[1], out.v[2], out.v[3], out.v[4], out.v[5]);
+    else say("%s %s E %d", pairs[p], pairs[p + 1], r);
+  }
+  deactivate(client);
+  destroy(client);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 4 && !strcmp(argv[1], "--transform")) return latest_transforms(argc - 2, argv + 2);
   struct cam cams[2] = {{"tracking", {0, 1}}, {"ctrl-tracking", {2, 3}}};
   for (int i = 0; i < 4 && i + 1 < argc; i++) cams[i / 2].id[i % 2] = atoi(argv[i + 1]);
   signal(SIGTERM, on_term);

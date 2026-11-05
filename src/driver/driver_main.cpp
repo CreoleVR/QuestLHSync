@@ -81,7 +81,7 @@ static std::string DataDir() {
 }
 
 // ---------------------------------------------------------------- the transform the hook applies
-struct Xf { int active; Quat q; double t[3]; };
+struct Xf { int active; Quat q; double t[3]; double s; };
 static std::atomic<uint32_t> g_xf_seq{0};
 static Xf g_xf_buf{};
 
@@ -91,6 +91,7 @@ static void WriteXf(const Transform &x) {
   g_xf_buf.active = x.active;
   g_xf_buf.q = x.q;
   g_xf_buf.t[0] = x.t.x; g_xf_buf.t[1] = x.t.y; g_xf_buf.t[2] = x.t.z;
+  g_xf_buf.s = x.scale;
   std::atomic_thread_fence(std::memory_order_release);
   g_xf_seq.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -209,7 +210,13 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
   double wt[3];
   Rotate(xq, p.vecWorldFromDriverTranslation, wt);
   p.qWorldFromDriverRotation = Mul(xq, p.qWorldFromDriverRotation);
-  for (int i = 0; i < 3; i++) p.vecWorldFromDriverTranslation[i] = wt[i] + x.t[i];
+  for (int i = 0; i < 3; i++) {  // where it is and how fast it goes, not how it turns: the lighthouse scale (sync.h)
+    p.vecWorldFromDriverTranslation[i] = x.s * wt[i] + x.t[i];
+    p.vecPosition[i] *= x.s;
+    p.vecVelocity[i] *= x.s;
+    p.vecAcceleration[i] *= x.s;
+    p.vecDriverFromHeadTranslation[i] *= x.s;
+  }
   g_moved.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
