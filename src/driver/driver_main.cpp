@@ -227,6 +227,25 @@ static void Detour(void *self, uint32_t id, const vr::DriverPose_t &pose, uint32
   g_orig[I](self, id, pose, size);
 }
 
+// another interface whose vtable holds fn ("IVRDriverInput_004's method 1"), else empty
+static std::string SharedWith(void *fn, const char *self) {
+  static const char *const fam[] = {"IVRDriverInput", "IVRServerDriverHost", "IVRProperties", "IVRSettings",
+                                    "IVRDriverLog", "IVRResources", "IVRIOBuffer", "IVRDriverManager",
+                                    "IVRDriverSpatialAnchors", "IVRCompositorPluginProvider",
+                                    "IVRIPCResourceManagerClient", "IVRWatchdogHost"};
+  for (const char *f : fam)
+    for (int n = 1; n <= 9; n++) {
+      std::string v = Fmt("%s_%03d", f, n);
+      if (v == self) continue;
+      vr::EVRInitError e = vr::VRInitError_None;
+      void *o = vr::VRDriverContext()->GetGenericInterface(v.c_str(), &e);
+      if (!o) continue;
+      for (int k = 0; k < 16; k++)
+        if ((*(void ***)o)[k] == fn) return Fmt("%s's method %d", v.c_str(), k);
+    }
+  return {};
+}
+
 static void HookHost(const char *version, int i, void *detour) {
   vr::EVRInitError err = vr::VRInitError_None;
   void *host = vr::VRDriverContext()->GetGenericInterface(version, &err);
@@ -234,6 +253,13 @@ static void HookHost(const char *version, int i, void *detour) {
   void *fn = (*(void ***)host)[1];
   for (int j = 0; j < 2; j++)
     if (g_target[j] == fn) { Log(Fmt("%s shares the hooked function", version)); return; }
+  // _005's slot 1 is a stub shared with IVRDriverInput_004::UpdateBooleanComponent: hooked, it eats button clicks,
+  // and its poses reach the _006 hook anyway
+  std::string sharer = strcmp(version, "IVRServerDriverHost_006") ? SharedWith(fn, version) : std::string();
+  if (!sharer.empty()) {
+    Log(Fmt("%s::TrackedDevicePoseUpdated is the code of %s: not hooked", version, sharer.c_str()));
+    return;
+  }
   if (MH_CreateHook(fn, detour, (void **)&g_orig[i]) != MH_OK || MH_EnableHook(fn) != MH_OK) {
     Log(Fmt("hooking %s failed", version));
     return;
