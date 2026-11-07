@@ -2821,9 +2821,11 @@ bool Solver::Scale(V3 pivot, ScaleR &out) {
         if (!all.B.empty()) r.B.push_back(all.B[n]);
       }
   }
+  // 2-98%: a stand-up of 25 s in a seated session is a tenth of the rays, fewer of the thinned ones, and all the
+  // parallax there is; 5-95% lost it (7 Nov: 0.55 m of height read as 0.11)
   auto span = [](std::vector<double> &v) {
     std::sort(v.begin(), v.end());
-    return v[v.size() * 95 / 100] - v[v.size() * 5 / 100];
+    return v[v.size() * 98 / 100] - v[v.size() * 2 / 100];
   };
   {  // no need to search if the head hasn't gone anywhere
     std::vector<double> xs, ys, zs;
