@@ -453,6 +453,14 @@ class Solver {
   // candidate): too few to tell go too; else (the current fit) only the ones that don't follow
   void RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<double> &tau,
                  const Rays &r, bool strict, std::vector<int> &c) const;
+  // the alignment from the lights r's rays meet at whose times follow a station's rotor (two or more): false without
+  bool RotorPoints(const Rays &r, const std::vector<double> &tau, const std::vector<V3> &S, const std::vector<V3> &Z,
+                   double now, X4 &x);
+  // the stations x puts in r's rays hold them under the layout, refit as named (x updated): a reflection at one doesn't
+  bool LayoutHolds(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now);
+  // each hypothesis' rotor evidence, all stations' but the best's (out): acquisition's ranking on a Galaxy XR
+  void RotorRank(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
+                 const std::vector<double> &tau, double gate, std::vector<double> &out) const;
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
   double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
   std::map<int, double> held_h_;  // s the fit held each height (kHeightBin steps), locked and pinned

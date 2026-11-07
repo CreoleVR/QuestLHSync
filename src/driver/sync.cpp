@@ -1529,11 +1529,13 @@ Solver::Rays Solver::Thin(const Rays &r) {
 // The headset's clock and the station's run apart by tens of ppm (30 Oct-5 Nov: ~28): over minutes of sightings that
 // turns the phase round, so R is the best within kRotorPpm of 1/tau, in quarter steps of what the span tells apart,
 // and chance gets ln(that many apart) more of n R^2. The lamps stay far: ~100.2 Hz, or the frame rate's 45 and 60 Hz
-static int RotorPhase(const std::vector<double> &g, double tau) {
-  constexpr int kRotorMin = 12;
-  constexpr double kRotorLow = 0.3, kRotorP = 4.6, kRotorPpm = 100e-6;
-  if (!(tau > 0)) return 1;
-  if ((int)g.size() < kRotorMin) return 0;
+static X4 YawFit(const std::vector<V3> &S, const std::vector<V3> &Q);
+
+// n R^2 of sighting times g at the rotor period tau (the Rayleigh statistic, chance ~ e^-z), less what the frequency
+// search gains chance; R: the coherence itself
+static double RotorZ(const std::vector<double> &g, double tau, double *R_out = nullptr) {
+  constexpr double kRotorPpm = 100e-6;
+  if (g.size() < 2 || !(tau > 0)) { if (R_out) *R_out = 0; return 0; }
   auto mm = std::minmax_element(g.begin(), g.end());
   double g0 = *mm.first, span = *mm.second - g0, f0 = 1 / tau, apart = std::max(1.0, 2 * kRotorPpm * f0 * span);
   int steps = (int)std::ceil(2 * apart);  // each way
@@ -1547,7 +1549,203 @@ static int RotorPhase(const std::vector<double> &g, double tau) {
     }
     R = std::max(R, std::hypot(c, s) / g.size());
   }
-  return g.size() * R * R >= kRotorP + std::log(apart) ? 1 : R < kRotorLow ? -1 : 0;
+  if (R_out) *R_out = R;
+  return g.size() * R * R - std::log(apart);
+}
+
+static int RotorPhase(const std::vector<double> &g, double tau) {
+  constexpr int kRotorMin = 12;
+  constexpr double kRotorLow = 0.3, kRotorP = 4.6;
+  if (!(tau > 0)) return 1;
+  if ((int)g.size() < kRotorMin) return 0;
+  double R;
+  double z = RotorZ(g, tau, &R);
+  return z >= kRotorP ? 1 : R < kRotorLow ? -1 : 0;
+}
+
+// Each hypothesis' stations' rotor evidence (RotorZ) on the bright rays r within gate of where it puts them, scored
+// as Score does support: all but the best station's (yaw needs two). A hypothesis that lines a lamp up with a station
+// has rays there in numbers but no phase: in a lit room (7 Nov, 5-13 station sightings a minute among ~6000 spots)
+// support alone ranked lamp hypotheses over the right one every time
+void Solver::RotorRank(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
+                       const std::vector<double> &tau, double gate, std::vector<double> &out) const {
+  size_t K = S.size();
+  out.assign(H.size(), 0.0);
+  std::vector<V3> P, Zq;
+  std::vector<std::vector<double>> g(K);
+  for (size_t h = 0; h < H.size(); h++) {
+    Predict(H[h], S, Z, P, Zq);
+    for (auto &v : g) v.clear();
+    for (size_t n = 0; n < r.size(); n++) {
+      if (!std::isfinite(r.G[n])) continue;
+      int k;
+      double a;
+      Nearest(P, Zq, r.O[n], r.D[n], k, a);
+      if (a < gate) g[k].push_back(r.G[n]);
+    }
+    double sum = 0, best = 0;
+    for (size_t k = 0; k < K; k++) {
+      double z = std::max(0.0, RotorZ(g[k], tau[k]));
+      sum += z;
+      best = std::max(best, z);
+    }
+    out[h] = sum - best;
+  }
+}
+
+// The alignment from the base stations found as points: the bright rays of the last WIN s, paired within 5 deg of
+// direction from head positions 0.15 m or more apart, meet where a static light is (closest approach within kMeet,
+// 0.5-12 m out); the meeting points vote on a 0.25 m grid, and each cell of kVotes or more is a light (few: a station
+// seen a dozen times from a head that hardly moved votes little, and the rotor test below keeps lamps out anyway). A
+// light is the station whose rotor its rays' times follow (RotorZ, by kPointZ and twice any other channel's). With two
+// or more stations named, the alignment is the fit of their rays as named (Fit with who), started from YawFit of the
+// stations' layout onto the lights: a light's place along the line of sight is poor from a head that hardly moved
+// (0.8 m out, 7 Nov), its rays' directions aren't. This finds the right alignment where guessing it from pairs of rays
+// can't: in a lit room the lamps' rays outnumber the stations' a hundred to one (7 Nov), so no guess ranked by how many
+// rays it gathers survives, while the rotor names a light outright
+bool Solver::RotorPoints(const Rays &r, const std::vector<double> &tau, const std::vector<V3> &S,
+                         const std::vector<V3> &Z, double now, X4 &x) {
+  constexpr double kMeet = 0.10, kCell = 0.25, kPointDeg = 0.7, kPointZ = 6.9, kBase = 0.15;
+  constexpr int kVotes = 3, kPairsPerCell = 4000;
+  size_t K = S.size();
+  if (r.size() < 50 || K < 2) return false;
+  std::vector<size_t> ix;
+  for (size_t n = 0; n < r.size(); n++)
+    if (std::isfinite(r.G[n])) ix.push_back(n);
+  // direction cells of 5 deg
+  std::map<std::pair<int, int>, std::vector<size_t>> cells;
+  for (size_t n : ix) {
+    double el = std::asin(std::max(-1.0, std::min(1.0, r.D[n].y))) * kDeg, az = std::atan2(r.D[n].x, -r.D[n].z) * kDeg;
+    cells[{(int)std::floor(el / 5), (int)std::floor(az * std::cos(el / kDeg) / 5)}].push_back(n);
+  }
+  std::mt19937_64 rng(1);
+  struct Vote { int n = 0; V3 sum; };
+  std::map<std::array<int, 3>, Vote> grid;
+  for (auto &kv : cells) {
+    const std::vector<size_t> &c = kv.second;
+    if (c.size() < 2) continue;
+    size_t np = c.size() * (c.size() - 1) / 2;
+    bool all = np <= (size_t)kPairsPerCell;
+    std::uniform_int_distribution<size_t> U(0, c.size() - 1);
+    for (size_t p = 0; p < (all ? np : (size_t)kPairsPerCell); p++) {
+      size_t i, j;
+      if (all) {  // every pair once
+        size_t a = (size_t)((1 + std::sqrt(1 + 8.0 * p)) / 2);
+        while (a * (a - 1) / 2 > p) a--;
+        while ((a + 1) * a / 2 <= p) a++;
+        i = c[a]; j = c[p - a * (a - 1) / 2];
+      } else { i = c[U(rng)]; j = c[U(rng)]; if (i == j) continue; }
+      V3 w = r.O[i] - r.O[j];
+      if (norm(w) < kBase) continue;
+      // closest approach of the lines O_i + l D_i and O_j + m D_j
+      double b = dot(r.D[i], r.D[j]), d = dot(r.D[i], w), e = dot(r.D[j], w), den = 1 - b * b;
+      if (den < 1e-6) continue;
+      double l = (b * e - d) / den, m = (e - b * d) / den;
+      if (l < 0.5 || m < 0.5 || l > 12 || m > 12) continue;
+      V3 pi = r.O[i] + r.D[i] * l, pj = r.O[j] + r.D[j] * m;
+      if (norm(pi - pj) > kMeet) continue;
+      V3 q = (pi + pj) * 0.5;
+      Vote &v = grid[{(int)std::floor(q.x / kCell), (int)std::floor(q.y / kCell), (int)std::floor(q.z / kCell)}];
+      v.n++;
+      v.sum = v.sum + q;
+    }
+  }
+  // the lights: cells of kVotes or more that beat their neighbours
+  std::vector<V3> lights;
+  for (auto &kv : grid) {
+    if (kv.second.n < kVotes) continue;
+    bool top = true;
+    for (int dx = -1; dx <= 1 && top; dx++)
+      for (int dy = -1; dy <= 1 && top; dy++)
+        for (int dz = -1; dz <= 1 && top; dz++) {
+          if (!dx && !dy && !dz) continue;
+          auto it = grid.find({kv.first[0] + dx, kv.first[1] + dy, kv.first[2] + dz});
+          if (it != grid.end() && it->second.n > kv.second.n) top = false;
+        }
+    if (top) lights.push_back(kv.second.sum * (1.0 / kv.second.n));
+  }
+  if (lights.size() < 2) return false;
+  // each light's station by its rays' rotor; a station claimed twice goes to the stronger
+  const double cp = std::cos(kPointDeg / kDeg);
+  std::vector<int> who(K, -1);
+  std::vector<double> wz(K, 0.0);
+  std::vector<std::vector<size_t>> cone(lights.size());  // each light's rays
+  std::vector<double> g;
+  for (size_t li = 0; li < lights.size(); li++) {
+    g.clear();
+    for (size_t n : ix) {
+      V3 u = lights[li] - r.O[n];
+      double nn = norm(u);
+      if (nn > 0.3 && dot(u, r.D[n]) > cp * nn) { g.push_back(r.G[n]); cone[li].push_back(n); }
+    }
+    if (g.size() < 12) continue;
+    int bk = -1;
+    double b1 = 0, b2 = 0;
+    for (size_t k = 0; k < K; k++) {
+      if (!(tau[k] > 0)) continue;
+      double z = RotorZ(g, tau[k]);
+      if (z > b1) { b2 = b1; b1 = z; bk = (int)k; }
+      else b2 = std::max(b2, z);
+    }
+    if (bk < 0 || b1 < kPointZ || b1 < 2 * std::max(b2, 0.0)) continue;
+    if (b1 > wz[bk]) { who[bk] = (int)li; wz[bk] = b1; }
+  }
+  std::vector<V3> Sf, Qf;
+  std::vector<int> lab(r.size(), -1);
+  for (size_t k = 0; k < K; k++)
+    if (who[k] >= 0) {
+      Sf.push_back(S[k]);
+      Qf.push_back(lights[who[k]]);
+      for (size_t n : cone[who[k]]) lab[n] = (int)k;
+    }
+  if (Sf.size() < 2) return false;
+  x = YawFit(Sf, Qf);
+  FitR f = Fit(x, S, Z, r, now, GATE, nullptr, nullptr, 180, nullptr, &lab);
+  if (!f.ok) return false;
+  x = f.x;
+  return LayoutHolds(x, S, Z, r, now);
+}
+
+// A reflection of a station's sweep off a glossy surface keeps the rotor's phase as the station does (7 Nov: a ceiling
+// corner coherent with channel 3, z 6-8, 4 m from the station), so the rotor alone can't name a light. What a
+// reflection can't do is sit where the layout puts the station against the others: the rays of each station in view
+// (kConeDeg of where x puts it, kConeMin of them), refit as named, must stay with it, kHold1 of them within 1 deg and
+// kHold05 within INLIER. Right alignments kept 55-100% / 97-100% (7 Nov, 5 Nov, 2 Nov), ones resting on a reflection
+// 0-14% / 0-50%. Two stations at least, or nothing holds the yaw. x: refit on the way
+bool Solver::LayoutHolds(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now) {
+  constexpr double kConeDeg = 1.0, kHold1 = 0.6, kHold05 = 0.3;
+  constexpr int kConeMin = 12;
+  size_t K = S.size();
+  std::vector<V3> P, Zq;
+  Predict(x, S, Z, P, Zq);
+  std::vector<int> lab(r.size(), -1), cnt(K, 0);
+  for (size_t n = 0; n < r.size(); n++) {
+    int k;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < kConeDeg) { lab[n] = k; cnt[k]++; }
+  }
+  int seen = 0;
+  for (size_t k = 0; k < K; k++) {
+    if (cnt[k] >= kConeMin) seen++;
+    else for (size_t n = 0; n < r.size(); n++) if (lab[n] == (int)k) lab[n] = -1;  // too few to judge: left out
+  }
+  if (seen < 2) return false;
+  FitR f = Fit(x, S, Z, r, now, GATE, nullptr, nullptr, 180, nullptr, &lab);
+  if (!f.ok) return false;
+  Predict(f.x, S, Z, P, Zq);
+  std::vector<int> in1(K, 0), in05(K, 0);
+  for (size_t n = 0; n < r.size(); n++) {
+    if (lab[n] < 0) continue;
+    V3 u = P[lab[n]] - r.O[n];
+    double a = std::acos(std::max(-1.0, std::min(1.0, dot(u, r.D[n]) / norm(u)))) * kDeg;
+    in1[lab[n]] += a < 1.0;
+    in05[lab[n]] += a < INLIER;
+  }
+  for (size_t k = 0; k < K; k++)
+    if (cnt[k] >= kConeMin && (in1[k] < kHold1 * cnt[k] || in05[k] < kHold05 * cnt[k])) return false;
+  x = f.x;
+  return true;
 }
 
 std::vector<double> Solver::Taus(const std::vector<std::string> &keys) const {
@@ -1616,10 +1814,19 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   acq_dim_ = r.size() == all.size() && std::count(all.B.begin(), all.B.end(), 0) > 0;
   if (S.size() < 2 || r.size() < 30) return false;
   Rays t = Thin(r);
+  // Galaxy XR: a station counts only if its sightings follow its rotor (RotorRank, RotorVeto), told on the last WIN s
+  // of them, not ACQ_WIN's: a lit room gives 5-13 a minute within INLIER of a station, never enough in one minute (7 Nov)
+  std::vector<double> tau;
+  Rays rv;
+  if (rotor_veto_) { tau = Taus(keys); rv = Bright(GetRays(std::max(now - WIN, since_))); }
   std::vector<X4> H;
   Hypotheses(t, S, H);
   std::vector<X4> cand;
   if (has_acq_x_) cand.push_back(acq_x_);
+  if (rotor_veto_) {  // Galaxy XR: the alignment from the stations found as lights the rotors name
+    X4 xp;
+    if (RotorPoints(rv, tau, S, Z, now, xp)) cand.push_back(xp);
+  }
   size_t K = S.size();
   if (!H.empty()) {
     std::vector<int> sub(t.size());
@@ -1634,42 +1841,61 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     BatchSupport(H, S, Z, t, sub, 1.5, c1);
     std::vector<size_t> ord(H.size());
     for (size_t i = 0; i < ord.size(); i++) ord[i] = i;
-    size_t n1 = std::min<size_t>(40, ord.size());
+    // the top n1 by support on the sample; the right one in a lit room ranks hundreds down (lamps' rays outnumber the
+    // stations' a hundred to one), so RotorRank gets 200 to choose from
+    size_t n1 = std::min<size_t>(rotor_veto_ ? 200 : 40, ord.size());
     std::partial_sort(ord.begin(), ord.begin() + n1, ord.end(),
                       [&](size_t a, size_t b) { return SecondBest(&c1[a * K], K) > SecondBest(&c1[b * K], K); });
     std::vector<X4> top;
     for (size_t i = 0; i < n1; i++) top.push_back(H[ord[i]]);
-    std::vector<int> all(t.size()), c2;
-    for (size_t i = 0; i < all.size(); i++) all[i] = (int)i;
-    BatchSupport(top, S, Z, t, all, 1.5, c2);
     std::vector<size_t> o2(top.size());
     for (size_t i = 0; i < o2.size(); i++) o2[i] = i;
     size_t n2 = std::min<size_t>(5, o2.size());
-    std::partial_sort(o2.begin(), o2.begin() + n2, o2.end(),
-                      [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K) > SecondBest(&c2[b * K], K); });
+    if (rotor_veto_) {  // Galaxy XR: by the stations' rotor evidence (RotorRank), on the last WIN s of sightings
+      std::vector<double> zr;
+      RotorRank(top, S, Z, rv, tau, 1.5, zr);
+      std::partial_sort(o2.begin(), o2.begin() + n2, o2.end(), [&](size_t a, size_t b) { return zr[a] > zr[b]; });
+    } else {
+      std::vector<int> all(t.size()), c2;
+      for (size_t i = 0; i < all.size(); i++) all[i] = (int)i;
+      BatchSupport(top, S, Z, t, all, 1.5, c2);
+      std::partial_sort(o2.begin(), o2.begin() + n2, o2.end(),
+                        [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K) > SecondBest(&c2[b * K], K); });
+    }
     for (size_t i = 0; i < n2; i++) cand.push_back(top[o2[i]]);
   }
-  // Galaxy XR: a station counts only if its sightings follow its rotor (RotorVeto), told on the last WIN s of them, not
-  // ACQ_WIN's: a lit room gives 5-13 a minute within INLIER of a station, never enough in one minute to tell (7 Nov)
-  std::vector<double> tau;
-  Rays rv;
-  if (rotor_veto_) { tau = Taus(keys); rv = Bright(GetRays(std::max(now - WIN, since_))); }
   auto support = [&](const X4 &x, double gate) {
     std::vector<int> c;
     Support(x, S, Z, t, gate, c);
     if (rotor_veto_) RotorVeto(x, S, Z, tau, rv, true, c);
     return Score(c);
   };
+  // the candidates refit, the best taken: by support, or on a Galaxy XR by rotor evidence (RotorRank) among those with
+  // support at all; by support, a lamp at a station's place (rays in numbers, no phase) outscored the right one (7 Nov)
   bs = -1;
   bool have = false;
+  std::vector<X4> fitted;
+  std::vector<int> fsup;
   for (X4 x : cand) {
     for (double gate : {1.5, 0.6}) {
       FitR f = Fit(x, S, Z, r, now, gate, nullptr);
       if (!f.ok) break;
       x = f.x;
     }
-    int sc = support(x, INLIER);
-    if (sc > bs) { best = x; bs = sc; have = true; }
+    // Galaxy XR: a candidate whose stations' rays don't hold under the layout (a reflection at one) is out
+    if (rotor_veto_ && !LayoutHolds(x, S, Z, rv, now)) continue;
+    fitted.push_back(x);
+    fsup.push_back(support(x, INLIER));
+  }
+  if (rotor_veto_ && !fitted.empty()) {
+    std::vector<double> zr;
+    RotorRank(fitted, S, Z, rv, tau, INLIER, zr);
+    double bz = -1;
+    for (size_t i = 0; i < fitted.size(); i++)
+      if (fsup[i] > 0 && zr[i] > bz) { best = fitted[i]; bs = fsup[i]; bz = zr[i]; have = true; }
+  } else {
+    for (size_t i = 0; i < fitted.size(); i++)
+      if (fsup[i] > bs) { best = fitted[i]; bs = fsup[i]; have = true; }
   }
   if (!have) return false;
   CheckMirror(best, bs, S, Z, r, t, now);
