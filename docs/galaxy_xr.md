@@ -34,7 +34,8 @@ that went at least 1 m (5-95%, all axes together) and from three stations: from 
 where a mounted tracker said 0.96). A session's readings are averaged; until its first one, `stations.json` holds the last
 session's, and *Force recalibrate* keeps it. Recordings replayed against a tracker on the mount: from 7.7 to 3.3 cm off
 (5 Nov, the head over 1.4 m; 0.949 for the tracker's 0.935), from 5.3 to 4.5 (30 Oct; 0.986 for 0.972); seated sessions read
-nothing and stay at the scale they had. **Not yet run live.** In the log: `lighthouse scale: ...`; in recordings:
+nothing and stay at the scale they had. Run live once, for the last 26 s of a recording (0.950 for the tracker's 0.934); until
+a session's first reading it's looked for every 10 s, then every minute. In the log: `lighthouse scale: ...`; in recordings:
 `I scale read scale_before span stations n median readings held`.
 
 ## Requirements
@@ -92,7 +93,11 @@ trackingC/D up to 1.2°).
 
 - `frame_t_camera` quaternions are JPL (the Hamilton matrix transposed); `p` is the camera's place in IMU_0
 - IMU_0 has OpenGL axes (x right, y up, z back)
-- `distortion_fisheye_spline3` isn't a Kannala–Brandt polynomial; the lenses are close to ideal equidistant fisheyes
+- `distortion_fisheye_spline3` isn't a Kannala–Brandt polynomial. The factory profile's lens goes to the driver as it is
+  (`"Lens"`: spline, `distortion_offset`, the `curved_window`), and the driver's rays follow it (`CamCal::UnprojectLens`, the
+  model from stearnsbq's `src/prepare.c`). An ideal equidistant fisheye with the same focal lengths is 0.3° off (median), 1°
+  (p90). Replayed against a tracker on the mount (five sessions): from 3.7-12.1 cm off to 1.3-3.6 cm, and acquired sooner
+  (seated: 227 s for 398). **Not yet run live.** Rays past the profile's `max_valid_*_radius` are dropped (~2%).
 - the HMD pose's frame is asked of Google's calibration service at each connection: `getLatestTransform("FRAME_IMU_0",
   "SENSOR_THIRD_EYE")` through `libperception_calibration_client_plugin.so`, by `lhsight-gxr --transform` (a vendor
   library, so from the copy in `/data/local/tmp`). The call is from stearnsbq's

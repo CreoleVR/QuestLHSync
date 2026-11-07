@@ -102,8 +102,9 @@ constexpr double kLevelJump = 0.6;
 // 0.5%), and the headset's pose reaches SteamVR as it is (1.0004). An alignment without it leaves ~12 cm at the feet.
 // Galaxy XR frames of three or more stations (Sync::ScaleStep): every kScaleEvery s the sightings read the scale, when
 // the head's sightings span kScaleSpan m (under that they say nothing: 0.67-0.87 from a seated head), within kScaleMin
-// to kScaleMax. A session's readings are averaged, up to kScaleMemory of them; until its first, the last session's holds
-constexpr double kScaleEvery = 60.0, kScaleSpan = 1.0, kScaleMin = 0.88, kScaleMax = 1.05;
+// to kScaleMax. A session's readings are averaged, up to kScaleMemory of them; until its first, the last session's holds,
+// and it's looked for every kScaleFirst s (a recording: the first reading 80 s after the head could have given one)
+constexpr double kScaleEvery = 60.0, kScaleFirst = 10.0, kScaleSpan = 1.0, kScaleMin = 0.88, kScaleMax = 1.05;
 constexpr int kScaleMemory = 10;
 // a pair of stations' reading (Sync::PairLevelStep) counts if its time slices agree within kPairLevelSd (deg): the
 // level check's across two stations came within 0.19. Its sightings' median error may reach kPairLevelMed, not
@@ -133,6 +134,10 @@ constexpr double kHeightBin = 0.05, kHeightTol = 0.2, kHeightKeep = 120.0;  // m
 // across more, the floor may have been set anew while the poses stopped (the boundary redone), and the kept height is
 // forgotten
 constexpr double kBrkJumpGap = 0.2;  // s
+// a Galaxy XR's head pose jumping this far from one pose to the next (Virtual Desktop restarted: a recording 1.24 m and 58
+// deg) is a new headset space: the alignment means nothing in it. Dropped, so the lighthouse devices hide (driver_main)
+// rather than stay metres off until it's found again (that recording: 62 s)
+constexpr double kBrkDrop = 0.5;  // m
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 constexpr double kUpward = 0.1;        // a camera whose axis climbs this much (of 1) looks up: the Frame's upper pair
@@ -146,6 +151,13 @@ struct CamCal {
   M3 R;  // device <- camera
   V3 t;
   double f = 0, fy = 0, cx = 0, cy = 0, k[6] = {}, p[2] = {};
+  // a Galaxy XR's lens (Optics::Load, "Lens"): a spline of the fisheye angle, then the curved window in front of it
+  bool lens = false;
+  double sp[6] = {}, off[2] = {}, rmax = 0, umax = 0;
+  V3 axis;
+  std::vector<double> win;
+  double Spline(double theta) const;
+  bool UnprojectLens(double px, double py, V3 &d) const;  // unit ray, camera frame; false: outside the calibrated part
   void Dist(double a, double b, double &u, double &v) const;
   bool Unproject(double px, double py, V3 &d) const;  // unit ray, camera frame
 };
@@ -225,6 +237,7 @@ class PoseHist {
   std::string brk_what() const { std::lock_guard<std::mutex> g(m_); return brk_what_; }
   // the last break's gap (s) and how far up the head jumped across it (m)
   void brk_jump(double &gap, double &dy) const { std::lock_guard<std::mutex> g(m_); gap = brk_gap_; dy = brk_dy_; }
+  double brk_dist() const { std::lock_guard<std::mutex> g(m_); return brk_d_; }
   void Clear() { std::lock_guard<std::mutex> g(m_); i_ = 0; pend_ = 0; }
 
  private:
@@ -232,7 +245,7 @@ class PoseHist {
   uint64_t i_ = 0;
   mutable std::mutex m_;
   std::atomic<int> brk_id_{0};
-  double brk_t_ = 0, brk_gap_ = 0, brk_dy_ = 0;
+  double brk_t_ = 0, brk_gap_ = 0, brk_dy_ = 0, brk_d_ = 0;
   std::string brk_what_;
   uint64_t pend_ = 0;  // a jump waiting for the poses after it: the index of the first pose past it
   bool Find(double t, uint64_t &i) const;  // newest index with time <= t (caller holds m_)

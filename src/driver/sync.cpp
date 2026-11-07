@@ -101,6 +101,91 @@ bool CamCal::Unproject(double px, double py, V3 &d) const {
   return true;
 }
 
+// A Galaxy XR's lens from its factory profile (OpenPX): distortion_fisheye_spline3 (r = theta (1 + spline of theta), three
+// segments of 30 deg, k0..k5: value and slope at each end), distortion_offset, and layered_distortion's curved_window:
+// a shell the ray goes through on its way in, bent toward the shell's axis by an amount that depends only on its angle to
+// it. The model as stearnsbq's questlhsync-galaxy-xr has it (src/prepare.c, MIT). Against an ideal fisheye with the same
+// focal lengths it moves the rays 0.3 deg (median), 1 deg (p90), and the sightings' misses go from 0.5 to 0.3 deg.
+double CamCal::Spline(double theta) const {
+  int seg = (int)(theta / (kPi / 6));
+  if (seg > 2) seg = 2;
+  double u = theta / (kPi / 6) - seg;
+  double a = seg ? sp[2 * seg - 2] : 0, da = seg ? sp[2 * seg - 1] : 0, b = sp[2 * seg], db = sp[2 * seg + 1];
+  return theta * (1 + a + u * (da + u * ((3 * (b - a) - 2 * da - db) + u * (2 * (a - b) + da + db))));
+}
+
+bool CamCal::UnprojectLens(double px, double py, V3 &d) const {
+  double x = (px - cx) / f, y = (py - cy) / fy, r = std::hypot(x, y);
+  double lo = 0, hi = kPi / 2 - 1e-7;
+  if (r > rmax || r > Spline(hi)) return false;
+  for (int i = 0; i < 40; i++) {
+    double m = (lo + hi) / 2;
+    if (Spline(m) < r) lo = m; else hi = m;
+  }
+  double ur = std::tan((lo + hi) / 2);
+  if (ur > umax) return false;
+  double s = r > 1e-12 ? ur / r : 1;
+  V3 ray{x * s + off[0], y * s + off[1], 1};
+  ray = ray * (1 / norm(ray));
+  double pos = (dot(ray, axis) + 1) * 999 / 2;
+  pos = pos < 0 ? 0 : pos > 999 ? 999 : pos;
+  int i = (int)pos;
+  if (i > 998) i = 998;
+  ray = ray - (win[i] + (pos - i) * (win[i + 1] - win[i])) * axis;
+  ray = ray * (1 / norm(ray));
+  if (ray.z <= 0) return false;
+  d = ray;
+  return true;
+}
+
+static bool LoadLens(const JVal &j, CamCal &k) {
+  auto num = [&](const JVal *p, const char *n) { const JVal *v = p->get(n); return v ? v->num(NAN) : NAN; };
+  const JVal *sp = j.get("Spline"), *off = j.get("Offset"), *w = j.get("Window");
+  const JVal *ctr = w ? w->get("Center") : nullptr;
+  if (!sp || !off || !w || !ctr) return false;
+  auto s = sp->nums(), o = off->nums(), c = ctr->nums();
+  double radius = num(w, "Radius"), thick = num(w, "Thickness"), index = num(w, "Index");
+  k.rmax = num(&j, "MaxDistorted");
+  k.umax = num(&j, "MaxUndistorted");
+  if (s.size() != 6 || o.size() != 2 || c.size() != 3 || !(k.rmax > 0) || !(k.umax > 0)) return false;
+  for (int i = 0; i < 6; i++) k.sp[i] = s[i];
+  k.off[0] = o[0]; k.off[1] = o[1];
+  double D = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+  if (!(radius > 0 && thick >= 0 && thick < radius && index >= 1 && D > 0 && D <= radius - thick / 2)) return false;
+  k.rmax = std::min(k.rmax, k.Spline(std::atan(k.umax)));
+  double prev = 0;
+  for (int i = 1; i <= 2048; i++) {  // the angle must follow from the radius
+    double r = k.Spline((kPi / 2 - 1e-7) * i / 2048);
+    if (!std::isfinite(r) || r <= prev) return false;
+    prev = r;
+  }
+  k.axis = V3{-c[0] / D, -c[1] / D, -c[2] / D};
+  // the window, in the plane of a ray and its axis: where a ray at each angle ends up, through both of the shell's surfaces
+  k.win.assign(1000, 0.0);
+  for (int i = 1; i < 999; i++) {
+    double cs = -1 + 2.0 * i / 999, sn = std::sqrt(std::max(0.0, 1 - cs * cs));
+    double dx = cs, dy = sn, ox = 0, oy = 0;
+    for (int s2 = 0; s2 < 2; s2++) {
+      double R = radius + (s2 ? 0.5 : -0.5) * thick, eta = s2 ? index : 1 / index;
+      double ex = ox + D, ey = oy, pr = ex * dx + ey * dy, disc = pr * pr - (ex * ex + ey * ey) + R * R;
+      if (disc < 0) return false;
+      double tr = -pr + std::sqrt(disc);
+      ox += tr * dx; oy += tr * dy;
+      double nx = (ox + D) / R, ny = oy / R, inc = nx * dx + ny * dy, t2 = 1 - eta * eta * (1 - inc * inc);
+      if (t2 < 0) return false;
+      double a = std::sqrt(t2) - eta * inc;
+      dx = eta * dx + a * nx; dy = eta * dy + a * ny;
+      double dn = std::hypot(dx, dy);
+      dx /= dn; dy /= dn;
+    }
+    double tr = (1 - ox) / dx;
+    k.win[i] = cs - sn * (ox + tr * dx) / (oy + tr * dy);
+    if (!std::isfinite(k.win[i])) return false;
+  }
+  k.lens = true;
+  return true;
+}
+
 bool Optics::Load(const std::string &json, std::string *err) {
   JVal root;
   if (!JParse(json, root)) { if (err) *err = "calibration isn't JSON"; return false; }
@@ -147,6 +232,11 @@ bool Optics::Load(const std::string &json, std::string *err) {
     for (int j = 0; j < 6; j++) k.k[j] = dc[j];
     k.p[0] = dc[6]; k.p[1] = dc[7];
     k.ir = sensor && sensor->t == JVal::Str && sensor->s == "OV7251" ? kIR : 1.0;
+    if (const JVal *lens = gxr ? c.get("Lens") : nullptr)
+      if (!LoadLens(*lens, k)) {
+        if (err) *err = "camera " + std::to_string(i) + ": its Lens is unusable";
+        return false;
+      }
     k.valid = true;
     n++;
   }
@@ -246,7 +336,9 @@ bool Optics::Ray(int cam, double x, double y, V3 &o, V3 &d) const {
   const CamCal &c = cams_[cam];
   double k = c.ir;
   V3 dc;
-  if (!c.Unproject(c.cx + (x - c.cx) * k, c.cy + (y - c.cy) * k, dc)) return false;
+  if (c.lens) {
+    if (!c.UnprojectLens(x, y, dc)) return false;
+  } else if (!c.Unproject(c.cx + (x - c.cx) * k, c.cy + (y - c.cy) * k, dc)) return false;
   d = c.R * dc;
   double n = norm(d);
   if (!std::isfinite(n) || n <= 0) return false;
@@ -464,6 +556,7 @@ void PoseHist::Break(const PoseS &a, const PoseS &b) {
   brk_what_ = Fmt("%.2f s, %.0f cm, %.1f deg", b.t - a.t, norm(b.p - a.p) * 100, QuatDeg(a.q, b.q));
   brk_gap_ = b.t - a.t;
   brk_dy_ = b.p.y - a.p.y;
+  brk_d_ = norm(b.p - a.p);
   brk_id_++;
 }
 
@@ -2491,6 +2584,17 @@ bool Solver::Scale(V3 pivot, ScaleR &out) {
         if (!all.B.empty()) r.B.push_back(all.B[n]);
       }
   }
+  auto span = [](std::vector<double> &v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() * 95 / 100] - v[v.size() * 5 / 100];
+  };
+  {  // no need to search if the head hasn't gone anywhere
+    std::vector<double> xs, ys, zs;
+    for (const V3 &o : r.O) { xs.push_back(o.x); ys.push_back(o.y); zs.push_back(o.z); }
+    if (r.size() < 50) return false;
+    double sx = span(xs), sy = span(ys), sz = span(zs);
+    if (std::sqrt(sx * sx + sy * sy + sz * sz) < kScaleSpan) return false;
+  }
   V3 mid{};
   for (const V3 &p : S0) mid = mid + p;
   mid = (1.0 / S0.size()) * mid;
@@ -2546,10 +2650,6 @@ bool Solver::Scale(V3 pivot, ScaleR &out) {
     xs.push_back(r.O[n].x); ys.push_back(r.O[n].y); zs.push_back(r.O[n].z);
   }
   if ((int)in.size() < 50) return false;
-  auto span = [](std::vector<double> &v) {
-    std::sort(v.begin(), v.end());
-    return v[v.size() * 95 / 100] - v[v.size() * 5 / 100];
-  };
   double sx = span(xs), sy = span(ys), sz = span(zs);
   out.span = std::sqrt(sx * sx + sy * sy + sz * sz);
   out.n = (int)in.size();
@@ -3707,6 +3807,10 @@ Transform Sync::Tick(double now) {
       poses_.brk_jump(gap, dy);
       solver_.PoseBreak(poses_.brk_t(), gap < kBrkJumpGap ? dy : NAN);
       log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
+      if (have_optics_ && optics_.headset() == Optics::kGalaxyXR && gap < kBrkJumpGap && poses_.brk_dist() >= kBrkDrop) {
+        log_("the headset's space is a new one (Virtual Desktop restarted?): the alignment is dropped until it's found again");
+        ClearAlignment();
+      }
     }
     std::map<std::string, std::pair<V3, M3>> raw;
     std::map<std::string, int> chans;
@@ -3909,7 +4013,7 @@ Transform Sync::Tick(double now) {
       last_level_ = now;
       if (!LevelStep(raw, now)) PairLevelStep(raw, now);
     }
-    if (now - last_scale_ >= kScaleEvery) {
+    if (now - last_scale_ >= (scale_n_ ? kScaleEvery : kScaleFirst)) {
       last_scale_ = now;
       ScaleStep(raw, now);
     }

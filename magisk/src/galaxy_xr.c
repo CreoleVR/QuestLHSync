@@ -256,12 +256,12 @@ int hs_calibration(char **data, size_t *len, char *name, size_t n) {
     return -1;
   }
   const char *pe = prof + plen;
-  size_t jcap = 8192, jo = 0;
+  size_t jcap = 16384, jo = 0;
   char *json = malloc(jcap);
   #define JP(...) do { jo += snprintf(json + jo, jcap - jo, __VA_ARGS__); } while (0)
   // galaxy_xr_sensor: lhsight's frame times are the sensors' own (mid-exposure, CLOCK_MONOTONIC), not when it found them
   JP("{\"kind\": \"galaxy_xr_sensor\", \"GxrCameraCalibration\": [");
-  int ncam = 0, nrec = 0;
+  int ncam = 0, nrec = 0, nlens = 0;
   char missing[256] = "";
   for (int i = 0; i < NCAM; i++) {
     const char *cb, *ce, *xb, *xe;
@@ -300,9 +300,26 @@ int hs_calibration(char **data, size_t *len, char *name, size_t n) {
     JP(" \"DeviceFromCamera\": [%.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, %.10g, 0, 0, 0, 1],",
        D[0], D[1], D[2], d[0], D[3], D[4], D[5], d[1], D[6], D[7], D[8], d[2]);
     JP(" \"Projection\": {\"Model\": \"PinholeXY\", \"Coefficients\": [%.10g, %.10g, %.10g, %.10g]},", f[0], f[1], c[0], c[1]);
-    // distortion_fisheye_spline3 isn't a KB polynomial (read as one it runs away at the rim); the lenses are near
-    // ideal equidistant fisheyes, which is what all-zero coefficients give
+    // distortion_fisheye_spline3 isn't a KB polynomial (read as one it runs away at the rim). All-zero coefficients: an
+    // ideal equidistant fisheye, for a driver without Lens; the factory profile's lens goes as it is (the driver's
+    // Optics, LoadLens)
     JP(" \"Distortion\": {\"Coefficients\": [0, 0, 0, 0, 0, 0, 0, 0]},");
+    {
+      static const char *const ks[] = {"k0", "k1", "k2", "k3", "k4", "k5"}, *const xyz[] = {"x", "y", "z"};
+      double sp[6], of[2], ctr[3];
+      const char *lb, *le, *wb, *we;
+      double rmax = opx_num(cb, ce, "max_valid_distorted_radius"), umax = opx_num(cb, ce, "max_valid_undistorted_radius");
+      if (!strcmp(srcname, "factory") && opx_vec(cb, ce, "distortion_fisheye_spline3", ks, 6, sp) &&
+          opx_vec(cb, ce, "distortion_offset", xy, 2, of) && opx_sub(cb, ce, "layered_distortion", &lb, &le) &&
+          opx_sub(lb, le, "curved_window", &wb, &we) && opx_vec(wb, we, "center", xyz, 3, ctr) && rmax > 0 && umax > 0) {
+        JP(" \"Lens\": {\"Spline\": [%.10g, %.10g, %.10g, %.10g, %.10g, %.10g], \"Offset\": [%.10g, %.10g],", sp[0], sp[1], sp[2],
+           sp[3], sp[4], sp[5], of[0], of[1]);
+        JP(" \"MaxDistorted\": %.10g, \"MaxUndistorted\": %.10g, \"Window\": {\"Center\": [%.10g, %.10g, %.10g], \"Radius\": %.10g,"
+           " \"Thickness\": %.10g, \"Index\": %.10g}},", rmax, umax, ctr[0], ctr[1], ctr[2], opx_num(wb, we, "radius"),
+           opx_num(wb, we, "thickness"), opx_num(wb, we, "refractive_index"));
+        nlens++;
+      }
+    }
     JP(" \"SensorType\": \"S5K931\"}");
     ncam++;
   }
@@ -321,7 +338,7 @@ int hs_calibration(char **data, size_t *len, char *name, size_t n) {
     snprintf(m, sizeof m, "calibration: missing%s", missing);
     hs_log(m);
   }
-  snprintf(name, n, "openpx-%s,%d-cameras,%d-records,%s%s", srcname, ncam, nrec, head, missing[0] ? ",cameras-missing" : "");
+  snprintf(name, n, "openpx-%s,%d-cameras,%d-records,%d-lenses,%s%s", srcname, ncam, nrec, nlens, head, missing[0] ? ",cameras-missing" : "");
   return 0;
 }
 
