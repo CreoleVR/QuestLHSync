@@ -1525,20 +1525,29 @@ Solver::Rays Solver::Thin(const Rays &r) {
 // 12 sightings or more, the lamps three wrong fits rested on 0.04-0.22. +1: the sightings follow the rotor (Rayleigh,
 // n R^2 >= kRotorP: a lamp gets there by chance once in 100), -1: they don't (kRotorMin or more under kRotorLow), 0:
 // can't tell (fewer, or in between); +1 without a channel. Not tau/2 (two sweeps a turn): the lamps flicker at about
-// 100 Hz, and channel 1's tau/2 is 100.1 Hz (a lamp 0.31 there)
+// 100 Hz, and channel 1's tau/2 is 100.1 Hz (a lamp 0.31 there).
+// The headset's clock and the station's run apart by tens of ppm (30 Oct-5 Nov: ~28): over minutes of sightings that
+// turns the phase round, so R is the best within kRotorPpm of 1/tau, in quarter steps of what the span tells apart,
+// and chance gets ln(that many apart) more of n R^2. The lamps stay far: ~100.2 Hz, or the frame rate's 45 and 60 Hz
 static int RotorPhase(const std::vector<double> &g, double tau) {
   constexpr int kRotorMin = 12;
-  constexpr double kRotorLow = 0.3, kRotorP = 4.6;
+  constexpr double kRotorLow = 0.3, kRotorP = 4.6, kRotorPpm = 100e-6;
   if (!(tau > 0)) return 1;
   if ((int)g.size() < kRotorMin) return 0;
-  double c = 0, s = 0;
-  for (double x : g) {
-    double a = 2 * kPi * std::fmod((x - g[0]) / tau, 1.0);
-    c += std::cos(a);
-    s += std::sin(a);
+  auto mm = std::minmax_element(g.begin(), g.end());
+  double g0 = *mm.first, span = *mm.second - g0, f0 = 1 / tau, apart = std::max(1.0, 2 * kRotorPpm * f0 * span);
+  int steps = (int)std::ceil(2 * apart);  // each way
+  double R = 0;
+  for (int i = -steps; i <= steps; i++) {
+    double f = f0 * (1 + kRotorPpm * i / steps), c = 0, s = 0;
+    for (double x : g) {
+      double a = 2 * kPi * std::fmod((x - g0) * f, 1.0);
+      c += std::cos(a);
+      s += std::sin(a);
+    }
+    R = std::max(R, std::hypot(c, s) / g.size());
   }
-  double R = std::hypot(c, s) / g.size();
-  return g.size() * R * R >= kRotorP ? 1 : R < kRotorLow ? -1 : 0;
+  return g.size() * R * R >= kRotorP + std::log(apart) ? 1 : R < kRotorLow ? -1 : 0;
 }
 
 std::vector<double> Solver::Taus(const std::vector<std::string> &keys) const {
@@ -1640,13 +1649,15 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
                       [&](size_t a, size_t b) { return SecondBest(&c2[a * K], K) > SecondBest(&c2[b * K], K); });
     for (size_t i = 0; i < n2; i++) cand.push_back(top[o2[i]]);
   }
-  // Galaxy XR: a station counts only if its sightings follow its rotor (RotorVeto)
+  // Galaxy XR: a station counts only if its sightings follow its rotor (RotorVeto), told on the last WIN s of them, not
+  // ACQ_WIN's: a lit room gives 5-13 a minute within INLIER of a station, never enough in one minute to tell (7 Nov)
   std::vector<double> tau;
-  if (rotor_veto_) tau = Taus(keys);
+  Rays rv;
+  if (rotor_veto_) { tau = Taus(keys); rv = Bright(GetRays(std::max(now - WIN, since_))); }
   auto support = [&](const X4 &x, double gate) {
     std::vector<int> c;
     Support(x, S, Z, t, gate, c);
-    if (rotor_veto_) RotorVeto(x, S, Z, tau, r, true, c);
+    if (rotor_veto_) RotorVeto(x, S, Z, tau, rv, true, c);
     return Score(c);
   };
   bs = -1;
@@ -1685,7 +1696,7 @@ int Solver::ThinnedScore(const X4 &x, double now) {
   if (!t.size()) return 0;
   std::vector<int> c;
   Support(x, S, Z, t, INLIER, c);
-  if (rotor_veto_) RotorVeto(x, S, Z, Taus(keys), r, false, c);
+  if (rotor_veto_) RotorVeto(x, S, Z, Taus(keys), Bright(GetRays(std::max(now - WIN, since_))), false, c);
   return Score(c);
 }
 
