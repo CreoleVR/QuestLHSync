@@ -34,6 +34,7 @@ struct st {
   int ph[MAXC], phn[MAXC];                     // the short frame's k % 3, and its net votes (frame())
   int em[MAXC][3], nem[MAXC];                  // running mean (* 10) per k % 3, and the frames in it (frame())
   int e2[MAXC][2], n2[MAXC], hold2[MAXC];      // per k % 2: running mean, its frames, darker place + 1
+  u64 settle[MAXC];                            // no place held until then (frame())
 };
 // the place: trusted from PH_LOCK net votes, held to PH_MAX, PH_MISS off per vote elsewhere; lost after a PH_GAP (ns)
 #define PH_LOCK 10
@@ -48,6 +49,8 @@ struct st {
 #define E2_TAU 16
 #define E2_WARM 24
 #define E2_PCT 3
+// after a camera pause of 200 ms or more, no place is held for SETTLE_NS
+#define SETTLE_NS 6000000000ull
 extern struct st S;
 static u64 now(void) { struct ts t; clock_gettime(1, &t); return (u64)t.s * 1000000000ull + (u64)t.ns; }
 void set_bufs(u8 *scratch, u16 *cells, int *lab, char *out, int thr) {
@@ -201,6 +204,8 @@ static void frame(int i, u64 t) {
   // (the brightness means stay: frames picked up together after a stall can come in out of order, and a mean started
   // over from one of those took a long frame for the odd one; kept, such a frame counts 1/EM_TAU)
   if (S.last_t[c] && t - S.last_t[c] > PH_GAP) { S.phn[c] = 0; S.n2[c] = S.hold2[c] = 0; }
+  // restarted: a place learned from its start-up pattern would stick
+  if (S.last_t[c] && t - S.last_t[c] >= 200000000ull) S.settle[c] = t + SETTLE_NS;
   predict(c, t);
   S.last_t[c] = t;
   u32 n = (u32)(w * h);
@@ -250,7 +255,8 @@ static void frame(int i, u64 t) {
   if (S.n2[c] < 1000000) S.n2[c]++;
   if (oddp < 0 && cyc < 0) {
     int x = S.e2[c][0], y = S.e2[c][1], hi = x > y ? x : y, lw = x < y ? x : y;
-    if (S.n2[c] >= E2_WARM && lw * 100 < hi * (100 - E2_PCT)) S.hold2[c] = (x < y ? 0 : 1) + 1;
+    // an even alternation has no k % 3 place: drop a held one
+    if (S.n2[c] >= E2_WARM && lw * 100 < hi * (100 - E2_PCT)) { S.hold2[c] = (x < y ? 0 : 1) + 1; S.phn[c] = 0; }
     if (S.hold2[c]) place2 = p2 == S.hold2[c] - 1;
   }
   if (strict || cyc == 1 || oddp == p) {
@@ -258,6 +264,7 @@ static void frame(int i, u64 t) {
     else { S.ph[c] = p; if (S.phn[c] < PH_MAX) S.phn[c]++; }
     if (S.phn[c] <= 0) { S.ph[c] = p; S.phn[c] = 1; }
   }
+  if (t < S.settle[c]) { S.phn[c] = 0; S.n2[c] = S.hold2[c] = 0; place2 = -1; }
   // the odd place, else a held place, before the cycle test: found late, it names the wrong frame now and then
   int place = oddp >= 0 ? p == oddp : S.phn[c] >= PH_LOCK ? p == S.ph[c] : -1;
   int is_short = strict || (place >= 0 ? place : place2 >= 0 ? place2 : cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
