@@ -10,10 +10,13 @@
 #include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/types.h>
+#include <math.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <android/log.h>
+#include <android/looper.h>
+#include <android/sensor.h>
 
 #include "headset.h"
 
@@ -282,4 +285,90 @@ pid_t hs_capture_start(int out_fd, char *msg, size_t n) {
   if (pid < 0) return -1;
   snprintf(msg, n, "lhsight started in %s (pid %d); %s", hal_name, hal, note);
   return pid;
+}
+
+// ---------------------------------------------------------------- the accelerometer (headset.h: hs_gravity)
+// Meta's HMD IMU, as Android's sensor service hands it out (oculus.sensor.hmd_imu.1, type 65537, no permission needed):
+// data[0] the IMU's temperature, data[1..3] the accelerometer (m/s^2, the IMU's axes: the calibration's DeviceFromImu
+// turns them into the device's), data[4..6] the gyro, about 1000 events a second. The timestamps aren't Android's
+// usual CLOCK_BOOTTIME ns but the IMU's own clock (microseconds on a Quest Pro): their unit is told from how fast they
+// run against CLOCK_MONOTONIC over the first 2 s, and their offset is the smallest delay seen from a sample to its
+// reading (over 5 s windows, so the two clocks may drift)
+#define HMD_IMU 65537
+static ASensorManager *gsm;
+static ASensorEventQueue *gq;
+static int gnone;
+static double gunit;                     // timestamp units a second (0: not known yet)
+static double gu_ts0, gu_m0 = -1;        // the first sample's timestamp and when it was read, to tell the unit
+static double goff, gmin, gmin_since;   // CLOCK_MONOTONIC - the sample's time (s): in use, this window's least
+
+static double clk(clockid_t c) {
+  struct timespec t;
+  clock_gettime(c, &t);
+  return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+int hs_gravity(double sum[3], double *tsum) {
+  if (!gq) {
+    if (gnone) return 0;
+    gsm = ASensorManager_getInstanceForPackage("com.questlhsync");
+    const ASensor *imu = NULL;
+    ASensorList list;
+    int n = gsm ? ASensorManager_getSensorList(gsm, &list) : 0;
+    for (int i = 0; i < n && !imu; i++)
+      if (ASensor_getType(list[i]) == HMD_IMU) imu = list[i];
+    ALooper *lp = ALooper_forThread();
+    if (!lp) lp = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+    if (imu) gq = ASensorManager_createEventQueue(gsm, lp, 1, NULL, NULL);
+    if (!gq || ASensorEventQueue_registerSensor(gq, imu, 10000, 0) < 0) {
+      if (gq) ASensorManager_destroyEventQueue(gsm, gq);
+      gq = NULL;
+      gnone = 1;
+      hs_log("no headset IMU to read (oculus.sensor.hmd_imu): no G lines");
+      return 0;
+    }
+    gunit = 0;
+    gu_m0 = -1;
+    goff = 0;
+    gmin = 1e30;
+    gmin_since = clk(CLOCK_MONOTONIC);
+    hs_log("headset IMU on: G lines");
+  }
+  ASensorEvent ev[64];
+  ssize_t k;
+  int got = 0;
+  double now = clk(CLOCK_MONOTONIC);
+  while ((k = ASensorEventQueue_getEvents(gq, ev, 64)) > 0)
+    for (ssize_t i = 0; i < k; i++) {
+      if (ev[i].type != HMD_IMU) continue;
+      double ts = (double)ev[i].timestamp;
+      if (gu_m0 < 0) { gu_ts0 = ts; gu_m0 = now; }
+      if (!gunit) {
+        if (now - gu_m0 < 2) continue;  // the unit isn't known yet: these go
+        double r = (ts - gu_ts0) / (now - gu_m0), best = 1e3;  // ms, us or ns, whichever it runs nearest to
+        for (double u = 1e6; u <= 1e9; u *= 1e3)
+          if (fabs(log10(r / u)) < fabs(log10(r / best))) best = u;
+        gunit = best;
+        goff = now - ts / gunit;
+        hs_log(gunit == 1e3 ? "headset IMU clock: ms" : gunit == 1e6 ? "headset IMU clock: us" : "headset IMU clock: ns");
+      }
+      double d = now - ts / gunit;  // how late it's read, plus the clocks' offset: the least is the offset
+      if (d < gmin) gmin = d;
+      if (d < goff) goff = d;
+      for (int j = 0; j < 3; j++) sum[j] += ev[i].data[1 + j];
+      *tsum += ts / gunit + goff;
+      got++;
+    }
+  if (now - gmin_since >= 5 && gmin < 1e29) {  // the clocks may drift apart: the offset is the last window's least
+    goff = gmin;
+    gmin = 1e30;
+    gmin_since = now;
+  }
+  return got;
+}
+
+void hs_gravity_stop(void) {
+  if (!gq) return;
+  ASensorManager_destroyEventQueue(gsm, gq);
+  gq = NULL;
 }

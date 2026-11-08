@@ -7,7 +7,7 @@
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
-#define QLHS_VERSION 2
+#define QLHS_VERSION 3
 #define QLHS_RELEASE "1.28"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
@@ -31,6 +31,7 @@ enum QlhsCmd : int32_t {
   QLHS_CMD_RECORD_ON = 4,
   QLHS_CMD_RECORD_OFF = 5,
   QLHS_CMD_RECALIBRATE = 6,  // drop every learned and saved alignment of this headset and start over
+  QLHS_CMD_NEXT_HEADSET = 7, // leave this headset for another one that could be SteamVR's (net.h), for the session
 };
 
 #pragma pack(push, 8)
@@ -75,5 +76,8 @@ struct QlhsStatus {
   char log[8][120];
   volatile int32_t cmd_seq;  // overlay -> driver
   int32_t cmd;
+  char headset_why[64];  // why this headset is taken for SteamVR's ("streams with this PC", ...), "" when it's the only one
+  int32_t nheadsets;     // headsets that could be SteamVR's answering on the network (Switch headset from 2 on)
+  int32_t pad3;
 };
 #pragma pack(pop)

@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
           sync.SetChannels(chans);
         }
       }
-    } else if (kind == 'F') {
+    } else if (kind == 'F' || kind == 'G') {
       sync.OnLine(pc, sp + 1);
     } else if (kind == 'B') {  // worn and held lighthouse devices (reference frame)
       int dev;

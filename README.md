@@ -64,7 +64,9 @@ Each device has its own file in
    release, installs the driver to `%LOCALAPPDATA%\QuestLHSync\questlhsync`,
    registers it with SteamVR (in place of a copy you registered by hand) and
    offers an update whenever a newer release is out. It closes SteamVR if it's
-   running.
+   running. With `QuestLHSync-steamvr-<version>.zip` in the same folder (a
+   build of your own: `release.py`'s folder), it installs that one and doesn't
+   go online; **Downloads: on** lets it offer a newer release from GitHub too.
 
    Or by hand: extract the `questlhsync` folder from
    `QuestLHSync-steamvr-<version>.zip` somewhere permanent and, with SteamVR
@@ -99,6 +101,8 @@ controllers' and trackers' accelerometers level it as they move about.
 
 - **Pause corrections** holds lighthouse devices where they are.
 - **Record session** saves what the driver receives to a file, for bug reports.
+- **Switch headset** shows up when more than one headset answers: it leaves this
+  one for the next, for the rest of the session.
 - **Force recalibrate** drops everything learned about the alignment and starts
   over, for when it sits stuck on a wrong fit. It clears the sightings, the fit,
   the headset's saved alignment and pose timing, and an automatic reference frame
@@ -114,15 +118,28 @@ other's alignment or pose timing. The `state.json` of earlier versions moves to
 the first headset that connects. `stations.json`, the reference frame of your
 base stations, is shared by all headsets.
 
+### Several headsets in one place
+
+With two headsets of a kind on one network (two Quest Pros, each streamed to its
+own PC), each PC picks the one that streams with it: the streamer's connection
+to the headset shows on either end. The headset's line in the log, and the
+dashboard next to **HEADSET**, say why it was picked. When nothing tells (a
+cable, a streamer whose connection doesn't show), the headset last used with
+that streamer comes first, and **Switch headset** goes to the other one. A
+headset module before 1.29 doesn't report its connections: the PC's own still
+tell, for Virtual Desktop, ALVR and other streamers that keep a TCP connection.
+
 ## Settings
 
-Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`:
+Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`. SteamVR writes
+that file itself when it exits, so edit it with SteamVR closed. The log's
+`settings:` line, at each start, shows what was read.
 
 | Key | Default | |
 |---|---|---|
 | `enable` | `true` | `false` turns QuestLHSync off |
-| `host` | `""` | The headset's IP address(es), comma-separated, for networks that drop broadcasts |
-| `headset` | `""` | A headset serial to prefer when several answer |
+| `host` | `""` | The headset's IP address(es), comma-separated: asked straight (networks that drop broadcasts), and used ahead of other headsets |
+| `headset` | `""` | The headset to use when several answer: its serial, IP address, or its id (`headset.txt`, the log's `state for ...-<id>`) |
 | `anyHmd` | `false` | Use SteamVR's headset even when it isn't named a Quest Pro, 3, 3S or Steam Frame |
 | `record` | `false` | Record every session (same as the button) |
 | `gravity` | `true` | `false` turns levelling by the lighthouse devices' accelerometers off |
@@ -133,7 +150,9 @@ With a wired headset (SteamVR's headset is a lighthouse one, or tracked by a dri
 ## Troubleshooting
 
 - **"Looking for the headset":** the headset must be awake and on the same
-  network. If your router drops broadcasts, set `host`.
+  network. Many Wi-Fi networks don't pass broadcasts on to a headset: the PC
+  also asks the headsets it remembers, and the one its streamer is connected
+  to, straight. If it still doesn't find it, set `host`.
 - **"No camera frames":** the cameras only run while the headset tracks. Put it
   on. If it stays there, check `%LOCALAPPDATA%\QuestLHSync\questlhsync.log`:
   a `no camera buffers found` line means the headset part doesn't know this

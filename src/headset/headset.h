@@ -23,3 +23,8 @@ int hs_calibration(char **data, size_t *len, char *name, size_t n);
 // to tell the clients in msg ("I lhsyncd: <msg>"); 0 when it can't start yet, msg says why ("E <msg>"), tried again in
 // 5 s; -1 when it couldn't be started at all.
 pid_t hs_capture_start(int out_fd, char *msg, size_t n);
+// Optional (lhsyncd.c has empty defaults, so a headset without them still links): the headset's accelerometer, read
+// while a PC listens. hs_gravity adds the samples since its last call to sum (m/s^2, the IMU's own axes, summed) and
+// their times to tsum (s, CLOCK_MONOTONIC, summed) and returns how many there were; hs_gravity_stop lets the sensor go.
+int hs_gravity(double sum[3], double *tsum);
+void hs_gravity_stop(void);

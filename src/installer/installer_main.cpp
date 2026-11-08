@@ -1,4 +1,7 @@
-// QuestLHSync-steamvr-installer.exe: installs and updates the SteamVR driver from the latest GitHub release.
+// QuestLHSync-steamvr-installer.exe: installs and updates the SteamVR driver. With a QuestLHSync-steamvr-<ver>.zip next
+// to it (release.py's folder, a build of your own) it installs that one and doesn't go online, unless Downloads is
+// switched on (kept in %LOCALAPPDATA%\QuestLHSync\installer.json): then a newer GitHub release is offered too. Without
+// one, it installs the latest GitHub release.
 // Looks like the dashboard page (same colours, fonts and layout), drawn with GDI at the screen's own resolution. Downloads
 // releases/download/<tag>/QuestLHSync-steamvr-<ver>.zip with WinHTTP, unpacks its questlhsync/ folder to
 // %LOCALAPPDATA%\QuestLHSync\questlhsync, registers it with SteamVR (vrpathreg) and records the installed tag in
@@ -321,6 +324,9 @@ static uint32_t Crc32(const uint8_t *d, size_t n) {
 
 // ---------------------------------------------------------------- paths and installed state
 static fs::path g_root, g_driver, g_state;
+static fs::path g_local;           // a package next to the installer ("" for none)
+static std::wstring g_local_tag;   // ... its version, from its name
+static bool g_download = false;    // with a package next to the installer: look for newer releases on GitHub too
 
 static void InitPaths() {
   wchar_t b[MAX_PATH * 2];
@@ -330,11 +336,43 @@ static void InitPaths() {
   g_state = g_root / L"installed.json";
 }
 
+static fs::path PrefsFile() { return g_root / L"installer.json"; }
+
+// the newest QuestLHSync-steamvr-<ver>.zip in the installer's own folder
+static void FindLocal() {
+  wchar_t b[MAX_PATH * 2];
+  DWORD n = GetModuleFileNameW(nullptr, b, _countof(b));
+  if (!n || n >= _countof(b)) return;
+  std::error_code ec;
+  const std::wstring pre = L"QuestLHSync-steamvr-", ext = L".zip";
+  for (auto &e : fs::directory_iterator(fs::path(std::wstring(b, n)).parent_path(), ec)) {
+    std::wstring name = e.path().filename().wstring();
+    if (name.size() <= pre.size() + ext.size() || name.compare(0, pre.size(), pre) ||
+        name.compare(name.size() - ext.size(), ext.size(), ext))
+      continue;
+    std::wstring tag = name.substr(pre.size(), name.size() - pre.size() - ext.size());
+    if (tag.empty() || tag.find_first_not_of(L"0123456789.") != std::wstring::npos) continue;  // "installer", ...
+    if (g_local.empty() || Newer(tag, g_local_tag)) { g_local = e.path(); g_local_tag = tag; }
+  }
+}
+
 static std::string Slurp(const fs::path &p) {
   std::ifstream f(p, std::ios::binary);
   std::stringstream ss;
   ss << f.rdbuf();
   return ss.str();
+}
+
+static bool ReadDownload() {
+  std::string t = Slurp(PrefsFile());
+  size_t k = t.find("\"download\"");
+  return k != std::string::npos && t.find("true", k) == t.find_first_not_of(" \t\r\n:", k + 10);
+}
+
+static void WriteDownload(bool on) {
+  std::error_code ec;
+  fs::create_directories(g_root, ec);
+  std::ofstream(PrefsFile()) << "{\"download\":" << (on ? "true" : "false") << "}";
 }
 
 static std::wstring ReadInstalled() {
@@ -697,6 +735,7 @@ static void RunReg(const wchar_t *action, const fs::path &dir = g_driver) {
 struct Shared {
   std::mutex m;
   std::wstring latest, installed, msg = L"Checking for updates…";
+  bool local = false;  // latest is the package next to the installer
   uint32_t accent = 0;  // banner bar colour, 0 = follow the state
   std::vector<std::pair<std::wstring, std::wstring>> logs;
   int pct = 0;
@@ -808,29 +847,52 @@ static void StopSteamVr() {
 static void Check() {
   RunBg([] {
     Say(L"Checking for updates…");
-    std::wstring tag = LatestTag(), cur;
+    std::wstring tag, cur;
+    bool local = false;
+    if (g_local.empty() || g_download) {  // a package next to the installer: GitHub only when Downloads is on
+      try {
+        tag = LatestTag();
+      } catch (const Fail &) {
+        if (g_local.empty()) throw;  // offline: the package next to the installer still installs
+      }
+    }
+    if (!g_local.empty() && (tag.empty() || !Newer(tag, g_local_tag))) {
+      tag = g_local_tag;
+      local = true;
+    }
     {
       std::lock_guard<std::mutex> g(S.m);
       S.latest = tag;
+      S.local = local;
       cur = S.installed;
     }
-    if (cur.empty()) Say(L"Latest release is " + tag + L": ready to install.");
+    if (local)
+      Say(L"Package next to the installer: " + g_local.filename().wstring() +
+          (g_download ? L" (no newer release on GitHub)" : L" (downloads are off)"));
+    else if (cur.empty()) Say(L"Latest release is " + tag + L": ready to install.");
     else if (Newer(tag, cur)) Say(L"Update available: " + cur + L" → " + tag, col::amber);
     else Say(L"QuestLHSync is up to date.", col::green);
   });
 }
 
-static void Install(const std::wstring &tag) {
-  RunBg([tag] {
+static void Install(const std::wstring &tag, bool local) {
+  RunBg([tag, local] {
     VrPathReg();  // fail early if SteamVR is missing
-    Say(L"Downloading " + tag + L"…");
     std::vector<uint8_t> zip;
-    Http(std::wstring(RELEASES) + L"/download/" + tag + L"/" + PackageName(tag), true,
-         [&](const uint8_t *d, size_t n, uint64_t total) {
-           zip.insert(zip.end(), d, d + n);
-           if (total) SetProgress((int)std::min<uint64_t>(99, zip.size() * 100 / total));
-         });
-    if (zip.empty()) throw Fail{L"download failed: " + PackageName(tag) + L" not found"};
+    if (local) {
+      Say(L"Reading " + g_local.filename().wstring() + L"…");
+      std::string d = Slurp(g_local);
+      zip.assign(d.begin(), d.end());
+      if (zip.empty()) throw Fail{L"couldn't read " + g_local.wstring()};
+    } else {
+      Say(L"Downloading " + tag + L"…");
+      Http(std::wstring(RELEASES) + L"/download/" + tag + L"/" + PackageName(tag), true,
+           [&](const uint8_t *d, size_t n, uint64_t total) {
+             zip.insert(zip.end(), d, d + n);
+             if (total) SetProgress((int)std::min<uint64_t>(99, zip.size() * 100 / total));
+           });
+      if (zip.empty()) throw Fail{L"download failed: " + PackageName(tag) + L" not found"};
+    }
     StopSteamVr();
     Say(L"Installing…");
     std::error_code ec;
@@ -875,10 +937,10 @@ static void Draw() {
   std::vector<std::pair<std::wstring, std::wstring>> logs;
   uint32_t accent;
   int pct;
-  bool busy, err;
+  bool busy, err, local;
   {
     std::lock_guard<std::mutex> g(S.m);
-    latest = S.latest; installed = S.installed; msg = S.msg; accent = S.accent;
+    latest = S.latest; installed = S.installed; msg = S.msg; accent = S.accent; local = S.local;
     logs = S.logs; pct = S.pct; busy = S.busy; err = S.err;
   }
   bool outdated = !installed.empty() && !latest.empty() && Newer(latest, installed);
@@ -936,9 +998,9 @@ static void Draw() {
   row(x1, top + 168, L"Status", installed.empty() ? L"not installed" : outdated ? L"update available" : latest.empty() ? dash : L"up to date",
       outdated ? col::amber : col::text);
 
-  p.Text(x2 + 22, top + 18, L"LATEST RELEASE", label, col::faint);
+  p.Text(x2 + 22, top + 18, local ? L"PACKAGE" : L"LATEST RELEASE", label, col::faint);
   p.Text(x2 + 22, top + 44, latest.empty() ? dash : latest, big, !latest.empty() && !outdated ? col::green : col::text, 0, cw - 44);
-  row(x2, top + 100, L"Source", L"GitHub releases");
+  row(x2, top + 100, L"Source", local ? L"next to the installer" : L"GitHub releases");
   row(x2, top + 134, L"Package", latest.empty() ? dash : PackageName(latest));
   row(x2, top + 168, L"Registers via", L"vrpathreg");
 
@@ -966,7 +1028,8 @@ static void Draw() {
   int x = 48 + g_buttons[0].w + 16;
   g_buttons.push_back({x, by, 170, bh, 1, L"Uninstall", false, !busy && !installed.empty()});
   x += 170 + 16;
-  g_buttons.push_back({x, by, 250, bh, 2, L"Check for updates", false, !busy});
+  if (g_local.empty()) g_buttons.push_back({x, by, 250, bh, 2, L"Check for updates", false, !busy});
+  else g_buttons.push_back({x, by, 250, bh, 3, g_download ? L"Downloads: on" : L"Downloads: off", false, !busy});
   for (size_t i = 0; i < g_buttons.size(); i++) {
     auto &b = g_buttons[i];
     uint32_t fill = !b.enabled ? col::card : b.primary ? (int)i == g_hover ? 0x7aa0ff : col::blue : (int)i == g_hover ? col::line : col::card2;
@@ -986,14 +1049,21 @@ static int HitTest(LPARAM lp) {
 
 static void Click(int id) {
   if (id == 2) return Check();
+  if (id == 3) {  // Downloads: whether a package next to the installer gives way to a newer GitHub release
+    g_download = !g_download;
+    WriteDownload(g_download);
+    return Check();
+  }
   if (SteamVrRunning()) g_svr = true;  // Install/Uninstall stop it themselves
   if (id == 0) {
     std::wstring tag;
+    bool local;
     {
       std::lock_guard<std::mutex> g(S.m);
       tag = S.latest;
+      local = S.local;
     }
-    return Install(tag);
+    return Install(tag, local);
   }
   if (MessageBoxW(g_hwnd, L"Uninstall the QuestLHSync driver?", L"QuestLHSync", MB_YESNO | MB_ICONQUESTION) == IDYES)
     Uninstall();
@@ -1045,6 +1115,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR, int show) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
   g_k = GetDpiForSystem() / 96.0;
   InitPaths();
+  FindLocal();
+  g_download = ReadDownload();
   S.installed = ReadInstalled();
   g_svr = SteamVrRunning();
 
