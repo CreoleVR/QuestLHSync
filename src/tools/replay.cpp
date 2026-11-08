@@ -6,7 +6,7 @@
 // --learn: round-trip-less logs still learn the timing (starting from --expo), to test the estimator.
 // --learn-grid: learn the cameras' frame period as for headsets other than the Quest Pro, to test that.
 // --channel SERIAL=N: a base station's channel, for older logs.
-// --xf file: the transform applied to the lighthouse devices (raw -> Quest: pc_ns qw qx qy qz tx ty tz), every 0.25 s
+// --xf file: the transform applied to the lighthouse devices (raw -> Quest: pc_ns qw qx qy qz tx ty tz scale), every 0.25 s
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -51,11 +51,11 @@ int main(int argc, char **argv) {
   cfg.learn_timing = learn;
   cfg.learn_grid = learn_grid;
   Sync sync(cfg, logfn);
-  if (expo >= 0) sync.ForceExpo(expo);
   sync.SetStreamer("replay");
   sync.SetChannels(chans);
   std::string err;
   if (!sync.SetCalibration(ss.str(), &err)) { fprintf(stderr, "calibration: %s\n", err.c_str()); return 1; }
+  if (expo >= 0) sync.ForceExpo(expo);  // after the calibration, which sets the headset's own default
   FILE *out = outp.empty() ? nullptr : fopen(outp.c_str(), "w");
   FILE *xf = xfp.empty() ? nullptr : fopen(xfp.c_str(), "w");
   long ticks = 0;
@@ -109,13 +109,15 @@ int main(int argc, char **argv) {
     } else if (kind == 'Q') {  // QuestLHSync recordings: clock round trips "Q pc_send pc_recv hs"
       double a, b, h;
       if (sscanf(rest, "%lf %lf %lf", &a, &b, &h) == 3) sync.OnPing(a, b, h);
+    } else if (kind == 'I' && !strcmp(rest, "recalibrate")) {  // Force recalibrate pressed
+      sync.ForceRecalibrate();
     }
     while (pc >= next_tick) {
       bool step = sync.WillStep(next_tick);
       Transform x = sync.Tick(next_tick);
       if (xf && x.active && ticks++ % 5 == 0)
-        fprintf(xf, "%lld %.7f %.7f %.7f %.7f %.5f %.5f %.5f\n", (long long)(next_tick * 1e9), x.q.w, x.q.x, x.q.y, x.q.z,
-                x.t.x, x.t.y, x.t.z);
+        fprintf(xf, "%lld %.7f %.7f %.7f %.7f %.5f %.5f %.5f %.5f\n", (long long)(next_tick * 1e9), x.q.w, x.q.x, x.q.y, x.q.z,
+                x.t.x, x.t.y, x.t.z, x.scale);
       if (step && out) {
         auto st = sync.GetStatus(next_tick);
         if (st.has_x)

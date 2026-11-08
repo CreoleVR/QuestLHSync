@@ -1,6 +1,7 @@
 // lhsight: streaming bright-spot detector for the tracking cameras, run as a Frida CModule
 // inside the sensors HAL. Read-only on the dmabuf rings. For every new frame: a sampled mean
 // (exposure class), and on short-exposure frames the saturated blobs, then dimmer ones (centroid, size, peak).
+// (The Galaxy XR's reader, gxrsight.c, compiles this as plain C and hands it each frame already named: scan_frame.)
 // Output is text lines in a ring the JS side drains:
 //   F cam k t_us mean nblobs [x y npx peak]...      (x,y in pixels*10)
 typedef unsigned char u8; typedef unsigned short u16; typedef unsigned int u32; typedef unsigned long long u64;
@@ -33,6 +34,10 @@ struct st {
   int cyes[MAXC], cno[MAXC];                   // clearly darker frames the cycle took for short ones, and didn't
   int ph[MAXC], phn[MAXC];                     // the short frame's k % 3, and its net votes (frame())
   int em[MAXC][3], nem[MAXC];                  // running mean (* 10) per k % 3, and the frames in it (frame())
+  // the Galaxy XR (scan_frame): its short frames are near black (mean 0.1) and a sweep saturates (13-16 px, peak 255),
+  // so the frame is read once, where it lies (no copy: reading camera memory is what the scan costs), every other row in
+  // the search for bright cells, and without the dim pass (on it, its finds were lamps and noise)
+  int gxr;
 };
 // the place: trusted from PH_LOCK net votes, held to PH_MAX, PH_MISS off per vote elsewhere; lost after a PH_GAP (ns)
 #define PH_LOCK 10
@@ -62,6 +67,12 @@ static u32 hash(int i) {
   return h;
 }
 void prime(void) { for (int i = 0; i < S.nslots; i++) S.shash[i] = hash(i); }
+void set_gxr(int on) { S.gxr = on; }
+static int smean_of(const u8 *p, u32 n, u32 samples) {
+  u32 step = n / samples, s = 0, c = 0;
+  for (u32 o = step / 2; o < n; o += step) { s += p[o]; c++; }
+  return (int)(s * 10 / c);                  // mean * 10
+}
 static int smean(const u8 *p, u32 n) {
   u32 step = n / 4096, s = 0, c = 0;
   for (u32 o = step / 2; o < n; o += step) { s += p[o]; c++; }
@@ -80,6 +91,7 @@ int drain(char *dst, int cap) {
   S.tail += (u32)n;
   return n;
 }
+static void report(int c, u32 k, u64 t, const u8 *src, int w, int h, int mean, int is_short);
 static int find(int x) { while (S.lab[x] != x) { S.lab[x] = S.lab[S.lab[x]]; x = S.lab[x]; } return x; }
 static int rel_us(int c, u32 i, u64 t) { return (int)((long long)(S.ft[c][i % HIST] - t) / 1000); }  // frame i, us from t
 // when camera c's next frame is due, now that one was found at t. The cycle: the 1-4 frame shift the recent gaps
@@ -139,22 +151,54 @@ static int cycle_short(int c) {
 // The blobs of pixels >= T in scratch (w x h): 16x16 cells holding one, 8-connected, centroid of those pixels; added
 // to the arrays from nbl on, up to MAXB. Cells marked hot are left out, and the first pass marks its cells and
 // their neighbours (mark), so a later, dimmer pass doesn't take in a saturated blob's glow.
-static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk) {
+// img: the frame (scratch, or the camera buffer itself); rstep: every rstep-th row in the search for bright cells (the
+// centroids still take every pixel of a cell), 1 unless the width is a multiple of 8
+static int blobs(const u8 *img, int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *np, int *pk, int rstep) {
   u32 n = (u32)(w * h); int cw = w >> 4, ch = h >> 4, nc = cw * ch, hot = nc <= MAXCELL;
   for (int q = 0; q < nc; q++) S.cells[q] = 0;
   // fast reject: no byte > T - 1 in this word (at most 127: brighter thresholds only reject less)
   u64 add = 0x0101010101010101ull * (u64)(127 - (T - 1 > 127 ? 127 : T - 1));
-  const u64 *q8 = (const u64 *)S.scratch; u32 nw = n >> 3;
-  for (u32 j = 0; j < nw; j++) {
-    u64 x = q8[j];
-    if (!(((x + add) | x) & 0x8080808080808080ull)) continue;
-    for (int bb = 0; bb < 8; bb++) {
-      if ((int)((x >> (8 * bb)) & 0xFF) < T) continue;
-      u32 px = (j << 3) + bb; int y = (int)(px / (u32)w), xx = (int)(px - (u32)y * (u32)w);
-      if ((y >> 4) >= ch || (xx >> 4) >= cw) continue;  // the edge strip of a size that isn't a multiple of 16
-      int q = (y >> 4) * cw + (xx >> 4);
-      if (hot && S.hot[q]) continue;
-      if (S.cells[q] < 65535) S.cells[q]++;
+  const u64 *q8 = (const u64 *)img; u32 nw = n >> 3, rw = (u32)w >> 3;
+  if (w & 7 || !rw) rstep = 1;
+  u32 rs = rw ? rw : nw;
+  // a threshold of 128 or more sets its bytes' top bit: 64 bytes of a row (8 words) are passed over on their OR at once
+  int chunk = T >= 128 && rw && !(rw & 7);
+  for (u32 r0 = 0; r0 < nw; r0 += rs * (u32)rstep) {  // a row's words (rows left out: rstep)
+    u32 r1 = r0 + rs < nw ? r0 + rs : nw;
+    for (u32 j = r0; j < r1; j++) {
+      if (chunk && !(j & 7)) {
+        const u64 *c8 = q8 + j;
+        if (!((c8[0] | c8[1] | c8[2] | c8[3] | c8[4] | c8[5] | c8[6] | c8[7]) & 0x8080808080808080ull)) { j += 7; continue; }
+      }
+      u64 x = q8[j];
+      if (!(((x + add) | x) & 0x8080808080808080ull)) continue;
+      for (int bb = 0; bb < 8; bb++) {
+        if ((int)((x >> (8 * bb)) & 0xFF) < T) continue;
+        u32 px = (j << 3) + bb; int y = (int)(px / (u32)w), xx = (int)(px - (u32)y * (u32)w);
+        if ((y >> 4) >= ch || (xx >> 4) >= cw) continue;  // the edge strip of a size that isn't a multiple of 16
+        int q = (y >> 4) * cw + (xx >> 4);
+        if (hot && S.hot[q]) continue;
+        if (S.cells[q] < 65535) S.cells[q]++;
+      }
+    }
+  }
+  // rows left out: a blob reaching into a neighbouring cell with only those rows doesn't mark it, and its centroid would
+  // move (1 px on a recorded sweep). So a bright cell's unmarked neighbours are looked at in full
+  if (rstep > 1) {
+    for (int q = 0; q < nc; q++) {
+      if (!S.cells[q] || S.cells[q] == 65535) continue;
+      int cx = q % cw, cy = q / cw;
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+          int x2 = cx + dx, y2 = cy + dy, q2 = y2 * cw + x2;
+          if (x2 < 0 || y2 < 0 || x2 >= cw || y2 >= ch || S.cells[q2] || (hot && S.hot[q2])) continue;
+          int cnt = 0;
+          for (int y = y2 * 16; y < y2 * 16 + 16; y++) {
+            const u8 *row = img + (u32)y * (u32)w + x2 * 16;
+            for (int x = 0; x < 16; x++) cnt += row[x] >= T;
+          }
+          if (cnt) S.cells[q2] = 65535;  // found here: not grown from in turn
+        }
     }
   }
   // union 8-connected bright cells into blobs
@@ -179,7 +223,7 @@ static int blobs(int w, int h, int T, int mark, int nbl, u64 *sx, u64 *sy, u32 *
     if (bi < 0) { if (nbl == MAXB) continue; bi = nbl++; roots[bi] = r; sx[bi] = sy[bi] = 0; np[bi] = 0; pk[bi] = 0; }
     int x0 = (q % cw) * 16, y0 = (q / cw) * 16;
     for (int y = y0; y < y0 + 16; y++) {
-      const u8 *row = S.scratch + (u32)y * (u32)w;
+      const u8 *row = img + (u32)y * (u32)w;
       for (int x = x0; x < x0 + 16; x++) {
         int v = row[x];
         if (v > pk[bi]) pk[bi] = v;
@@ -246,6 +290,15 @@ static void frame(int i, u64 t) {
   // the odd place, else a held place, before the cycle test: found late, it names the wrong frame now and then
   int place = oddp >= 0 ? p == oddp : S.phn[c] >= PH_LOCK ? p == S.ph[c] : -1;
   int is_short = strict || (place >= 0 ? place : cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
+  report(c, k, t, S.slot[i], w, h, mean, is_short);
+}
+// a frame whose camera, time (ns, CLOCK_MONOTONIC) and exposure class the caller knows: the Galaxy XR's capture hook
+void scan_frame(u8 *p, int w, int h, int c, u64 t, int is_short) {
+  if (c < 0 || c >= MAXC || w <= 0 || h <= 0 || w > 4096 || h > 4096) return;
+  report(c, S.k[c]++, t, p, w, h, S.gxr ? smean_of(p, (u32)(w * h), 512) : smean(p, (u32)(w * h)), is_short);
+}
+static void report(int c, u32 k, u64 t, const u8 *src, int w, int h, int mean, int is_short) {
+  u32 n = (u32)(w * h);
   char line[2400]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);
@@ -253,15 +306,16 @@ static void frame(int i, u64 t) {
     return;
   }
   u64 t0 = now();
-  memcpy(S.scratch, S.slot[i], n);
+  const u8 *img = src;
+  if (!S.gxr) { memcpy(S.scratch, src, n); img = S.scratch; }
   // saturated blobs (base station dots, lamps), then dimmer ones (>= 4x the frame's mean, at least S.thr) in the cells
   // the saturated ones leave alone: a dot that doesn't saturate, in a room light enough to shorten the exposure
   u64 sx[MAXB], sy[MAXB]; u32 np[MAXB]; int pk[MAXB];
   int cw = w >> 4, ch = h >> 4, nc = cw * ch, T = mean * 4 / 10;
   if (T < S.thr) T = S.thr;
   for (int q = 0; q < nc && q < MAXCELL; q++) S.hot[q] = 0;
-  int nbl = blobs(w, h, 250, 1, 0, sx, sy, np, pk);
-  if (T < 250 && nc <= MAXCELL) nbl = blobs(w, h, T, 0, nbl, sx, sy, np, pk);
+  int nbl = blobs(img, w, h, 250, 1, 0, sx, sy, np, pk, S.gxr ? 2 : 1);
+  if (T < 250 && nc <= MAXCELL && !S.gxr) nbl = blobs(img, w, h, T, 0, nbl, sx, sy, np, pk, 1);
   S.scan_ns += now() - t0; S.nscan++;
   L = snprintf(line, sizeof line, "F %d %u %llu %d %d", c, k, t / 1000, mean, nbl);
   for (int e = 0; e < nbl && L < (int)sizeof line - 40; e++)

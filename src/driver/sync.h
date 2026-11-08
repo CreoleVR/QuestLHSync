@@ -37,6 +37,10 @@ constexpr double kLagFallback = 0.005;  // s, typical poll lag while the frame g
 constexpr double kExpoArrival = 0.020;  // s, grid -> exposure with the arrival-envelope clock (logs without round trips)
 constexpr double kExpoDefault = 0.018;  // s, grid -> pose time with the round-trip clock, before it's learned
                                         // (CreoleCast learns 18.5, a replayed streamer 20.8)
+// A Galaxy XR's sightings come too few to learn it (never in a week of sessions); against a tracker on a headset mount
+// (5.8 min, Virtual Desktop) the sightings of a turning head sat tightest at 35 ms (24-50 alike, 18 clearly worse), and
+// the driver's own unsure estimate once said 37 turning right, 52 left
+constexpr double kExpoGalaxyXR = 0.035;
 constexpr double kWmax = 60.0;          // deg/s: sightings while the head turns faster are skipped
 constexpr double kNearDeg = 5.0;        // deg: a fast-head sighting this close to a base station counts for timing
 constexpr int kTimingFirstN = 200;      // such sightings before the first (wide) timing estimate
@@ -99,6 +103,19 @@ constexpr int kLevelMemory = 60;
 // unless SteamVR re-solves its base stations under the frame and the level moves with them: a reading this far (deg)
 // from the mean is no scatter, and the mean starts over from it
 constexpr double kLevelJump = 0.6;
+// The headset's own tracking and lighthouse don't agree on a metre: on a Galaxy XR the head covers 0.92-0.99 of what a
+// tracker fixed to it does, differing by session (recordings, five sessions; the base stations' distances stay within
+// 0.5%), and the headset's pose reaches SteamVR as it is (1.0004). An alignment without it leaves ~12 cm at the feet.
+// Galaxy XR frames of three or more stations (Sync::ScaleStep): every kScaleEvery s the sightings read the scale, when
+// the head's sightings span kScaleSpan m (under that they say nothing: 0.67-0.87 from a seated head), within kScaleMin
+// to kScaleMax. A session's readings are averaged, up to kScaleMemory of them; until its first, the last session's holds,
+// and it's looked for every kScaleFirst s (a recording: the first reading 80 s after the head could have given one)
+constexpr double kScaleEvery = 60.0, kScaleFirst = 10.0, kScaleSpan = 1.0, kScaleMin = 0.88, kScaleMax = 1.05;
+constexpr int kScaleMemory = 10;
+// a pair of stations' reading (Sync::PairLevelStep) counts if its time slices agree within kPairLevelSd (deg): the
+// level check's across two stations came within 0.19. Its sightings' median error may reach kPairLevelMed, not
+// Solver::LEVEL_MED: a Galaxy XR's sit at 0.30-0.36 deg, and two stations leave the tilt along their line in them
+constexpr double kPairLevelSd = 0.2, kPairLevelMed = 0.4;
 // channel check (Solver::CheckIdentity): every kIdEvery s, and at the step after a new alignment. The stations are
 // mixed up when their sightings follow each other's rotor periods better than their own by kSwapGain in all; a place's
 // sightings name a rotor when they follow it by kNamed more than any other; and the alignment with the stations where
@@ -123,6 +140,10 @@ constexpr double kHeightBin = 0.05, kHeightTol = 0.2, kHeightKeep = 120.0;  // m
 // across more, the floor may have been set anew while the poses stopped (the boundary redone), and the kept height is
 // forgotten
 constexpr double kBrkJumpGap = 0.2;  // s
+// a Galaxy XR's head pose jumping this far from one pose to the next (Virtual Desktop restarted: a recording 1.24 m and 58
+// deg) is a new headset space: the alignment means nothing in it. Dropped, so the lighthouse devices hide (driver_main)
+// rather than stay metres off until it's found again (that recording: 62 s)
+constexpr double kBrkDrop = 0.5;  // m
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 constexpr double kUpward = 0.1;        // a camera whose axis climbs this much (of 1) looks up: the Frame's upper pair
@@ -136,6 +157,13 @@ struct CamCal {
   M3 R;  // device <- camera
   V3 t;
   double f = 0, fy = 0, cx = 0, cy = 0, k[6] = {}, p[2] = {};
+  // a Galaxy XR's lens (Optics::Load, "Lens"): a spline of the fisheye angle, then the curved window in front of it
+  bool lens = false;
+  double sp[6] = {}, off[2] = {}, rmax = 0, umax = 0;
+  V3 axis;
+  std::vector<double> win;
+  double Spline(double theta) const;
+  bool UnprojectLens(double px, double py, V3 &d) const;  // unit ray, camera frame; false: outside the calibrated part
   void Dist(double a, double b, double &u, double &v) const;
   bool Unproject(double px, double py, V3 &d) const;  // unit ray, camera frame
 };
@@ -215,6 +243,7 @@ class PoseHist {
   std::string brk_what() const { std::lock_guard<std::mutex> g(m_); return brk_what_; }
   // the last break's gap (s) and how far up the head jumped across it (m)
   void brk_jump(double &gap, double &dy) const { std::lock_guard<std::mutex> g(m_); gap = brk_gap_; dy = brk_dy_; }
+  double brk_dist() const { std::lock_guard<std::mutex> g(m_); return brk_d_; }
   void Clear() { std::lock_guard<std::mutex> g(m_); i_ = 0; pend_ = 0; }
 
  private:
@@ -222,7 +251,7 @@ class PoseHist {
   uint64_t i_ = 0;
   mutable std::mutex m_;
   std::atomic<int> brk_id_{0};
-  double brk_t_ = 0, brk_gap_ = 0, brk_dy_ = 0;
+  double brk_t_ = 0, brk_gap_ = 0, brk_dy_ = 0, brk_d_ = 0;
   std::string brk_what_;
   uint64_t pend_ = 0;  // a jump waiting for the poses after it: the index of the first pose past it
   bool Find(double t, uint64_t &i) const;  // newest index with time <= t (caller holds m_)
@@ -239,6 +268,7 @@ struct StationsFile {
   M3 anchor_R;
   M3 level;  // automatic frames: turns the frame level with the headset's gravity (Solver::Level)
   int level_n = 0;  // how many of the cameras' readings the level is the mean of (Sync::LevelStep)
+  double scale = 1;  // lighthouse metres -> the headset's (Sync::ScaleStep)
   std::map<std::string, V3> fix;  // measured positions, reference frame
   // automatic frames of three or more stations: each one's pose in the reference frame, before the level
   std::map<std::string, std::pair<V3, M3>> ref;
@@ -260,10 +290,13 @@ class Frame {
   bool layout() const { return f_.autogen && f_.ref.size() >= 3; }
   const std::string &left() const { return left_; }  // the station the layout fit leaves out: moved against the rest
   double miss() const { return miss_; }  // m: the layout fit's worst miss of the stations it keeps
-  void Apply(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + C_ * (p - o_); Ro = C_ * R; }
+  void Apply(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + s_ * (C_ * (p - o_)); Ro = C_ * R; }
   // before the level: what recordings hold, so a replay with the same stations.json levels them once
   void Unlevelled(V3 p, const M3 &R, V3 &po, M3 &Ro) const { po = oref_ + Cs_ * (p - o_); Ro = Cs_ * R; }
-  void Rotation(M3 &C, V3 &t) const { C = C_; t = oref_ - C_ * o_; }  // p_ref = C p_raw + t
+  void Rotation(M3 &C, V3 &t) const { C = C_; t = oref_ - s_ * (C_ * o_); }  // p_ref = scale() C p_raw + t
+  double scale() const { return s_; }
+  // p_ref = s C p_raw + At(s): the scale an alignment on its way is at (Sync::Tick)
+  V3 At(double s) const { return oref_ - s * (C_ * o_); }
   // levelled by gravity (gravity.h): tilt after the level; from the next Update
   void SetGravity(bool on, const M3 &tilt) { grav_ = on; G_ = tilt; }
   const M3 &gravity() const { return GC_; }  // the tilt in C_ (none: identity)
@@ -279,6 +312,7 @@ class Frame {
   M3 G_, GC_;
   bool grav_ = false;
   V3 o_, oref_;
+  double s_ = 1;
   int ok_ = -1;
   double deg_ = 0;
   std::string left_;
@@ -310,6 +344,7 @@ class Solver {
   static constexpr double SIG_LEVEL = 1.0 / kDeg, COND_LEVEL = 0.1 / kDeg, LEVEL_MED = 0.3;
   static constexpr int LEVEL_STATIONS = 3, LEVEL_CELLS = 3;
   struct LevelR { X4 x{}; M3 tilt; int stations = 0; double med = 0; };  // tilt about the pivot, then x
+  struct ScaleR { X4 x{}; double t = 1, span = 0, med = 0; int stations = 0, n = 0; };  // scale about the pivot, then x
   // a tilt about one horizontal axis (rad), how well its time slices agree on it (rad), the sightings' median error
   struct AxisR { double theta = 0, sd = 0, med = 0; int slices = 0; };
 
@@ -338,6 +373,10 @@ class Solver {
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
+  void SetRotorVeto(bool on) { rotor_veto_ = on; }  // see rotor_veto_
+  // station k's sightings of the last WIN s, under the current alignment, follow its rotor (RotorPhase; only with
+  // rotor_veto_: the frames' exact times)
+  bool FollowsRotor(size_t k);
   bool starved() const { return starved_; }
   double dot_size() const { return dot_; }  // sr * m (see FromStation)
   int resets() const { return resets_; }
@@ -356,8 +395,13 @@ class Solver {
   // below the base stations sideways, and with two stations in view the 4-DOF fit can't see it. The third station's
   // sightings can: refit with the stations tilted about pivot (reference frame). True if the sightings pin the tilt.
   bool Level(V3 pivot, LevelR &out);
-  bool LevelAxis(V3 pivot, V3 axis, AxisR &out);  // two stations: the tilt across them (Sync::LevelCheck)
+  // two stations: the tilt across them (Sync::LevelCheck, Sync::PairLevelStep). only: the stations that must each be
+  // seen from LEVEL_CELLS cells (all of them without); max_med: the sightings' median error it takes (deg)
+  bool LevelAxis(V3 pivot, V3 axis, AxisR &out, const std::vector<int> *only = nullptr, double max_med = LEVEL_MED);
   void Relevel(const X4 &x);  // the alignment for the stations as just levelled
+  // the scale of the stations about pivot that fits the sightings best, on top of theirs, and how far the head went among
+  // them (kScaleSpan). False: too few, or no minimum within +-8%
+  bool Scale(V3 pivot, ScaleR &out);
 
   // geometry, also used by Timing
   static void Predict(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, std::vector<V3> &P, std::vector<V3> &Zq);
@@ -412,6 +456,24 @@ class Solver {
   // (Starved)
   std::atomic<bool> dim_dots_{false};
   double DimGate() const { return starved_ ? INLIER : -1; }
+  // A Galaxy XR in a lit room sees its base stations' dots seldom and the lamps in nearly every short frame: a wrong
+  // alignment that lines the stations up with lamps gathers ACQ long before the right one (31 Oct 2026: 5 of 8
+  // acquisitions wrong, one with a single station sighting in the minute). Its exact frame times tell them apart: a
+  // station's sightings keep the phase of its rotor, a lamp's don't
+  std::atomic<bool> rotor_veto_{false};
+  std::vector<double> Taus(const std::vector<std::string> &keys) const;  // each station's rotor period, 0 unknown
+  // A station's support (c) goes unless its sightings under x, of r, follow its rotor (RotorPhase). strict (a new
+  // candidate): too few to tell go too; else (the current fit) only the ones that don't follow
+  void RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<double> &tau,
+                 const Rays &r, bool strict, std::vector<int> &c) const;
+  // the alignment from the lights r's rays meet at whose times follow a station's rotor (two or more): false without
+  bool RotorPoints(const Rays &r, const std::vector<double> &tau, const std::vector<V3> &S, const std::vector<V3> &Z,
+                   double now, X4 &x);
+  // the stations x puts in r's rays hold them under the layout, refit as named (x updated): a reflection at one doesn't
+  bool LayoutHolds(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now);
+  // each hypothesis' rotor evidence, all stations' but the best's (out): acquisition's ranking on a Galaxy XR
+  void RotorRank(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
+                 const std::vector<double> &tau, double gate, std::vector<double> &out) const;
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
   double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
   std::map<int, double> held_h_;  // s the fit held each height (kHeightBin steps), locked and pinned
@@ -477,7 +539,7 @@ struct SyncConfig {
   bool learn_grid = false;     // tools: learn the frame period even on a Quest Pro
 };
 
-struct Transform { bool active = false; Quat q; V3 t; };  // raw lighthouse -> Quest
+struct Transform { bool active = false; Quat q; V3 t; double scale = 1; };  // raw lighthouse -> Quest: scale q p + t
 
 class Sync {
  public:
@@ -610,9 +672,20 @@ class Sync {
   std::atomic<bool> hs_new_{false};
   void ApplyHeadset();
   void ApplyTiming();  // expo_ for the current streamer from timings_, the default if it has none (st_m_ held)
+  double DefaultExpo() const;
   void ClearAlignment();
   void Retime(double old_e, double new_e);
-  void LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  bool LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);  // true: three stations pinned it
+  void PairLevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  void ScaleStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
+  double last_scale_ = 0, applied_scale_ = 1, kept_scale_ = 1;
+  int scale_n_ = 0;  // this session's readings of the scale
+  std::map<std::string, std::pair<double, int>> pair_level_;  // each pair's last try and readings this session
+  // the level turned by part (on top of the one so far), the frame and the solver's stations with it, x the alignment
+  void TakeLevel(const M3 &part, const std::map<std::string, std::pair<V3, M3>> &raw, const X4 &x);
+  // the level a forced recalibration dropped with the frame, for the next one: SteamVR's frame -> the levelled one as
+  // it was (Frame::Anchored, the layout fit's turn and all), and how many readings the level was the mean of
+  struct KeptLevel { M3 turn; int n = 0; } kept_level_;
   void LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
   std::string left_seen_;  // the station the layout fit leaves out, since left_since_
   // since when no fit holds, since when the frame tilts off level (-1: not)
