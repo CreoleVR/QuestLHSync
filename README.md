@@ -18,6 +18,14 @@ Galaxy XR support is by [@stearnsbq](https://github.com/stearnsbq), with the
 [questlhsync-galaxy-xr](https://github.com/stearnsbq/questlhsync-galaxy-xr)
 headset module.
 
+> **This branch (`galaxy-xr-support` of koshisan/QuestLHSync)** is a separate,
+> experimental Galaxy XR port, built independently of the one above: its own
+> camera client on the headset (no Frida), the unit's factory lens
+> calibration, and an acquisition that tells base stations from lamps by
+> their rotors, for lit rooms. It isn't in the official releases. Status,
+> requirements and how it works: [docs/galaxy_xr.md](docs/galaxy_xr.md).
+> Draft PR: [CreoleVR/QuestLHSync#62](https://github.com/CreoleVR/QuestLHSync/pull/62).
+
 ![The QuestLHSync dashboard page](docs/dashboard.png)
 
 ## Requirements
@@ -26,6 +34,9 @@ headset module.
   [Magisk](https://github.com/topjohnwu/Magisk).
 - Or a **Steam Frame**. No root, no developer password: everything installs as
   your user.
+- Or, on this branch only, a **Samsung Galaxy XR** (SM-I610) on firmware
+  I610UEU2AZF3, rooted with DFRoot and KernelSU-GXR. See
+  [docs/galaxy_xr.md](docs/galaxy_xr.md).
 - **SteamVR base stations**, 1.0 or 2.0.
 - **Windows with SteamVR**, with the headset streamed by anything: Steam Link,
   Link, Air Link, Virtual Desktop, ALVR, CreoleCast...
@@ -60,11 +71,24 @@ Each device has its own file in
 
      Either way, SteamVR on the headset restarts once to load its driver.
 
+   - **Galaxy XR (this branch):** there's no release. Build the module with
+     `python magisk\build_module.py galaxy_xr` and install
+     `out\QuestLHSync-galaxy-xr-module-<version>.zip` as a KernelSU module.
+     Root doesn't survive a reboot, so after each one, once root is back:
+
+     ```
+     adb shell su -c "setsid sh /data/adb/modules/questlhsync/service.sh </dev/null >/dev/null 2>&1 &"
+     ```
+
 2. **PC:** run `QuestLHSync-steamvr-installer.exe`. It downloads the latest
    release, installs the driver to `%LOCALAPPDATA%\QuestLHSync\questlhsync`,
    registers it with SteamVR (in place of a copy you registered by hand) and
    offers an update whenever a newer release is out. It closes SteamVR if it's
    running.
+
+   For a **Galaxy XR**, build the driver from this branch (`build.bat`) and
+   register `driver\questlhsync` instead: the installer installs the official
+   release, which doesn't have this branch's Galaxy XR support.
 
    Or by hand: extract the `questlhsync` folder from
    `QuestLHSync-steamvr-<version>.zip` somewhere permanent and, with SteamVR
@@ -160,6 +184,7 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 - **Quest:** remove the module in the Magisk app and reboot.
 - **Steam Frame:** click **Uninstall** in QuestLHSync Installer, or run
   `QuestLHSync-frame/uninstall.sh` on the headset.
+- **Galaxy XR:** remove the module in KernelSU and reboot.
 - **PC:** with SteamVR closed, click **Uninstall** in the installer, or run
   `vrpathreg removedriver "C:\path\to\questlhsync"` and delete
   `%LOCALAPPDATA%\QuestLHSync`.
@@ -173,6 +198,7 @@ Python 3:
 build.bat                        SteamVR driver + dashboard app (SteamVR closed) + out\QuestLHSync-Installer.exe
 build.bat installer              only the installer
 python magisk\build_module.py    Quest module (Magisk), into out\
+python magisk\build_module.py galaxy_xr   Galaxy XR module (KernelSU, this branch), into out\
 python frame\build.py            Steam Frame package, into out\
 python release.py                the release files, into out\release-<version>\
 python install.py                register driver\questlhsync with SteamVR
