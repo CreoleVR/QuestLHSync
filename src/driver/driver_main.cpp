@@ -388,8 +388,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         continue;
       }
       if (cls == vr::TrackedDeviceClass_HMD && g_hmd.load() < 0) {
-        // a Quest Pro, 3, 3S or a Steam Frame, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link,
-        // CreoleCast, ...
+        // a Quest Pro, 3, 3S, 1 or a Steam Frame, whoever streams it: Link, Air Link, Virtual Desktop, ALVR,
+        // Steam Link, CreoleCast, ...
         std::string family;
         for (const std::string &p : {model, GetStr(c, vr::Prop_RenderModelName_String), serial,
                                      GetStr(c, vr::Prop_ManufacturerName_String)})
@@ -418,13 +418,13 @@ class Provider : public vr::IServerTrackedDeviceProvider {
           hmd_system_ = StreamerName(sys);
           g_sync->SetStreamer(sys);
           Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), hmd_system_.c_str(), !family.empty() || !any_hmd_ ? "" :
-                  " - not named a Quest Pro, 3, 3S or Steam Frame, used because anyHmd is set"));
+                  " - not named a Quest Pro, 3, 3S, 1 or Steam Frame, used because anyHmd is set"));
           continue;
         }
         std::lock_guard<std::mutex> g(hmd_m_);
         hmd_model_ = model.empty() ? "headset" : model;
         hmd_system_ = StreamerName(sys);
-        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3, 3S or Steam Frame: idle", i, hmd_model_.c_str(),
+        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3, 3S, 1 or Steam Frame: idle", i, hmd_model_.c_str(),
                 hmd_system_.c_str()));
       }
       g_kind[i] = kOther;

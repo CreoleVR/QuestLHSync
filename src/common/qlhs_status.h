@@ -12,7 +12,7 @@
 
 enum QlhsState : int32_t {
   QLHS_STARTING = 0,
-  QLHS_NO_HMD,       // SteamVR's headset isn't a Quest Pro, 3, 3S or Steam Frame (or there's none yet)
+  QLHS_NO_HMD,       // SteamVR's headset isn't a Quest Pro, 3, 3S, 1 or Steam Frame (or there's none yet)
   QLHS_SEARCHING,    // no QuestLHSync headset answers on the network
   QLHS_CONNECTING,
   QLHS_NO_CAMERAS,   // connected, but no camera frames come in

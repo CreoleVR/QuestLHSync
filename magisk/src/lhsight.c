@@ -33,6 +33,8 @@ struct st {
   int cyes[MAXC], cno[MAXC];                   // clearly darker frames the cycle took for short ones, and didn't
   int ph[MAXC], phn[MAXC];                     // the short frame's k % 3, and its net votes (frame())
   int em[MAXC][3], nem[MAXC];                  // running mean (* 10) per k % 3, and the frames in it (frame())
+  int hdr;                                     // the row above each image is the sensor's own (the Quest 1: set_hdr)
+  int pe1[MAXC], pe2[MAXC];                    // per camera: the exposures in the last two such rows
 };
 // the place: trusted from PH_LOCK net votes, held to PH_MAX, PH_MISS off per vote elsewhere; lost after a PH_GAP (ns)
 #define PH_LOCK 10
@@ -49,6 +51,13 @@ void set_bufs(u8 *scratch, u16 *cells, int *lab, char *out, int thr) {
   S.scratch = scratch; S.cells = cells; S.lab = lab; S.out = out; S.head = S.tail = 0; S.thr = thr;
 }
 void reset_slots(void) { S.nslots = 0; }
+void set_hdr(int on) { S.hdr = on; }
+// a buffer's sampled hash, 0 if those samples are all zero (lhsight.js: the Quest 1's buffers mapped twice)
+u32 region_hash(const u8 *p, u32 n) {
+  u32 step = n / 61, h = 2166136261u, any = 0;
+  for (u32 o = step / 2; o < n; o += step) { h ^= p[o]; h *= 16777619u; any |= p[o]; }
+  return any ? h : 0;
+}
 void add_slot(u8 *p, int w, int h, int cam) {
   int i = S.nslots++; S.slot[i] = p; S.sw[i] = w; S.sh[i] = h; S.cam[i] = cam; S.pend[i] = 0;
 }
@@ -246,6 +255,16 @@ static void frame(int i, u64 t) {
   // the odd place, else a held place, before the cycle test: found late, it names the wrong frame now and then
   int place = oddp >= 0 ? p == oddp : S.phn[c] >= PH_LOCK ? p == S.ph[c] : -1;
   int is_short = strict || (place >= 0 ? place : cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
+  // The Quest 1 (set_hdr): its frames alternate long and short, and the tests above, made for the Quest Pro's cycle,
+  // take part of them for the other kind. The sensor's row above the image has the frame's exposure (bytes 6-7,
+  // big-endian): a short frame's (2) is a small fraction of a long one's (hundreds). Against the longer of the two
+  // before it, so that two frames found out of order don't hide a short one
+  if (S.hdr) {
+    const u8 *hd = S.slot[i] - w;
+    int e = (hd[6] << 8) | hd[7], before = S.pe1[c] > S.pe2[c] ? S.pe1[c] : S.pe2[c];
+    is_short = e * 8 < before;
+    S.pe2[c] = S.pe1[c]; S.pe1[c] = e;
+  }
   char line[2400]; int L;
   if (!is_short) {
     L = snprintf(line, sizeof line, "F %d %u %llu %d -1\n", c, k, t / 1000, mean);

@@ -172,10 +172,10 @@ static pid_t hal_pid(char *name, size_t cap) {
   return found ? found : other;
 }
 
-// lhsight.js with this headset's cameras filled in, in the run dir: its path in out, the cameras (or why not) in note;
-// out "" on failure, with the reason in note
+// lhsight.js with this headset's cameras and codename filled in, in the run dir: its path in out, the cameras (or why
+// not) in note; out "" on failure, with the reason in note
 static void prepare_script(char *out, size_t cap, char *note, size_t ncap) {
-  char src[512], path[512], cams[512] = "";
+  char src[512], path[512], cams[512] = "", device[PROP_VALUE_MAX] = "";
   size_t len, cal_len;
   out[0] = 0;
   snprintf(src, sizeof src, "%s/lhsight.js", moddir);
@@ -186,16 +186,14 @@ static void prepare_script(char *out, size_t cap, char *note, size_t ncap) {
   free(cal);
   if (n) snprintf(note, ncap, "tracking cameras (id:width:height:scan) %s", cams);
   else snprintf(note, ncap, "no tracking cameras in the camera calibration: trying the Quest Pro's");
-  char *at = strstr(js, "@CAMS@");
+  __system_property_get("ro.product.device", device);
   snprintf(out, cap, "%s/lhsight.js", RUNDIR);
   FILE *f = fopen(out, "wb");
   if (!f) { snprintf(note, ncap, "can't write %s", out); out[0] = 0; free(js); return; }
-  if (at && n) {
-    fwrite(js, 1, at - js, f);
-    fputs(cams, f);
-    fputs(at + 6, f);
-  } else {
-    fwrite(js, 1, len, f);
+  for (const char *p = js; *p;) {
+    if (n && !strncmp(p, "@CAMS@", 6)) { fputs(cams, f); p += 6; }
+    else if (!strncmp(p, "@DEVICE@", 8)) { fputs(device, f); p += 8; }
+    else fputc(*p++, f);
   }
   fclose(f);
   chmod(out, 0644);

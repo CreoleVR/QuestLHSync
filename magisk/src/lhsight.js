@@ -16,6 +16,13 @@ var CAMS = (CAMS_SPEC.charAt(0) === "@" ? "0:1280:1024:0,1:1280:1024:0,2:640:480
 var SCAN = CAMS.filter(function (c) { return c.scan; });
 var MAXW = Math.max.apply(null, SCAN.map(function (c) { return c.w; }).concat([16]));
 var MAXH = Math.max.apply(null, SCAN.map(function (c) { return c.h; }).concat([16]));
+// The headset's codename (lhsyncd fills it in). The Quest 1's ("monterey") camera buffers aren't named (an older
+// kernel: "anon_inode:dmabuf"), hold a row of the sensor's own above the image (lhsight.c: set_hdr) and are mapped
+// twice while the cameras stream (distinct())
+var MONTEREY = "@DEVICE@".indexOf("monterey") === 0;
+var DMABUF = MONTEREY ? /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*(?:\/dmabuf(?::dmabuf(\d+))?|anon_inode:dmabuf)/
+                      : /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*\/dmabuf(?::dmabuf(\d+))?/;
+var HDR_ROWS = MONTEREY ? 1 : 0;
 var l = Process.getModuleByName("libc.so"), g = function (n) { return l.getExportByName(n); };
 var fopen = new NativeFunction(g("fopen"), "pointer", ["pointer", "pointer"]);
 var fgets = new NativeFunction(g("fgets"), "pointer", ["pointer", "int", "pointer"]);
@@ -32,17 +39,45 @@ var prime = F("prime", "void", []), poll = F("poll", "int", []), reset_slots = F
 var drain = F("drain", "int", ["pointer", "int"]);
 var n_drop = F("n_drop", "uint", []), scan_ns = F("scan_ns", "uint64", []), n_scan = F("n_scan", "uint", []);
 var n_poll = F("n_poll", "uint", []), idle_us = F("idle_us", "int", []);
+var set_hdr = F("set_hdr", "void", ["int"]), region_hash = F("region_hash", "uint", ["pointer", "uint"]);
 var scratchBuf = Memory.alloc(MAXW * MAXH), cellBuf = Memory.alloc((MAXW >> 4) * (MAXH >> 4) * 2);
 var labBuf = Memory.alloc((MAXW >> 4) * (MAXH >> 4) * 4);
 var outBuf = Memory.alloc(1 << 20), drainBuf = Memory.alloc(1 << 16), tsBuf = Memory.alloc(16);
 set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 64);
+set_hdr(HDR_ROWS);
 var PAGE = 4096;
-function bufSize(c) { return Math.ceil(c.w * c.h / PAGE) * PAGE; }  // one 8-bit frame, whole pages
+function bufSize(c) { return Math.ceil(c.w * (c.h + HDR_ROWS) / PAGE) * PAGE; }  // one 8-bit frame, whole pages
+// The Quest 1's sensors HAL maps each camera buffer a second time while the cameras stream. Two mappings of a buffer
+// hold the same bytes and two buffers never do (sensor noise), so they're told apart by content, looking three times:
+// a frame landing between two reads hides a pair. Of each pair the higher mapping stays, the HAL's own, which is
+// there while the cameras are off too
+function distinct(regs) {
+  var root = regs.map(function (r, i) { return i; });
+  var find = function (i) { while (root[i] !== i) i = root[i]; return i; };
+  for (var look = 0; look < 3; look++) {
+    if (look) usleep(30000);
+    var first = {};
+    regs.forEach(function (r, i) {
+      var h = region_hash(ptr(r.a), r.size);
+      if (!h) return;  // all zero: never written, alike without being one buffer
+      if (first[h] === undefined) first[h] = i;
+      else root[find(i)] = find(first[h]);
+    });
+  }
+  var keep = {};
+  regs.forEach(function (r, i) {
+    var k = find(i);
+    if (keep[k] === undefined || r.a > regs[keep[k]].a) keep[k] = i;
+  });
+  var out = Object.keys(keep).map(function (k) { return regs[keep[k]]; });
+  if (out.length < regs.length) console.log("I " + (regs.length - out.length) + " camera buffers mapped twice");
+  return out;
+}
 function discover() {
   reset_slots();
   var fp = fopen(Memory.allocUtf8String("/proc/self/maps"), Memory.allocUtf8String("r")), buf = Memory.alloc(512), all = [];
   while (!fgets(buf, 512, fp).isNull()) {
-    var m = /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*\/dmabuf(?::dmabuf(\d+))?/.exec(buf.readCString());
+    var m = DMABUF.exec(buf.readCString());
     if (!m) continue;
     var a = parseInt(m[1], 16), b = parseInt(m[2], 16);
     all.push({ a: a, size: b - a, id: m[3] === undefined ? -1 : parseInt(m[3], 10) });
@@ -57,6 +92,7 @@ function discover() {
   Object.keys(sizes).forEach(function (sz) {
     var cams = sizes[sz].sort(function (x, y) { return x.id - y.id; });
     var regs = all.filter(function (r) { return r.size === +sz; });
+    if (MONTEREY) regs = distinct(regs);
     var ids = cams.map(function (c) { return c.id; }).join("+");
     if (!regs.length || regs.length % cams.length) {
       console.log("W cameras " + ids + " (" + cams[0].w + "x" + cams[0].h + "): " + regs.length + " buffers, not " +
@@ -71,7 +107,7 @@ function discover() {
     }
     regs.forEach(function (r, k) {
       var c = cams[Math.floor(k / per)];
-      if (c.scan) { add_slot(ptr(r.a), c.w, c.h, c.id); n++; }
+      if (c.scan) { add_slot(ptr(r.a).add(c.w * HDR_ROWS), c.w, c.h, c.id); n++; }
     });
     cams.forEach(function (c) { if (c.scan) got.push(c.id + ":" + per); });
   });

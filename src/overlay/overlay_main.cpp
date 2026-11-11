@@ -143,7 +143,7 @@ static void StateText(const QlhsStatus &s, bool stale, std::wstring &title, std:
   switch (s.state) {
     case QLHS_NO_HMD:
       title = L"Waiting for a Quest or Steam Frame";
-      sub = s.hmd[0] ? L"SteamVR's headset isn't a Quest Pro, 3, 3S or Steam Frame, so the lighthouse space is left alone."
+      sub = s.hmd[0] ? L"SteamVR's headset isn't a Quest Pro, 3, 3S, 1 or Steam Frame, so the lighthouse space is left alone."
                      : L"Start your streaming app (Steam Link, Link, Air Link, Virtual Desktop, ALVR, ...).";
       color = col::grey;
       break;
