@@ -70,6 +70,9 @@ std::string QuestFamily(const std::string &text) {
   if (has("questpro") || has("seacliff")) return "Quest Pro";
   if (has("quest3") || has("eureka") || has("panther")) return "Quest 3";
   if (has("steamframe") || has("deckard")) return "Steam Frame";
+  // the first Quest: its codename, or its name with nothing after it ("Oculus Quest", lhsyncd's "Quest"), which a
+  // Quest 2's ("Oculus Quest 2") isn't
+  if (has("monterey") || s == "quest" || s == "oculusquest") return "Quest 1";
   return "";
 }
 

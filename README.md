@@ -22,7 +22,7 @@ headset module.
 
 ## Requirements
 
-- A **Quest Pro, Quest 3 or Quest 3S**, rooted with
+- A **Quest Pro, Quest 3, Quest 3S or Quest 1**, rooted with
   [Magisk](https://github.com/topjohnwu/Magisk).
 - Or a **Steam Frame**. No root, no developer password: everything installs as
   your user.
@@ -123,7 +123,7 @@ Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`:
 | `enable` | `true` | `false` turns QuestLHSync off |
 | `host` | `""` | The headset's IP address(es), comma-separated, for networks that drop broadcasts |
 | `headset` | `""` | A headset serial to prefer when several answer |
-| `anyHmd` | `false` | Use SteamVR's headset even when it isn't named a Quest Pro, 3, 3S or Steam Frame |
+| `anyHmd` | `false` | Use SteamVR's headset even when it isn't named a Quest Pro, 3, 3S, 1 or Steam Frame |
 | `record` | `false` | Record every session (same as the button) |
 | `gravity` | `true` | `false` turns levelling by the lighthouse devices' accelerometers off |
 | `steadyStations` | `true` | `false` lets SteamVR move base stations by each new measurement instead of their average |
