@@ -850,7 +850,7 @@ void Solver::Reset(const X4 &x) {
 
 void Solver::Clear() {
   std::lock_guard<std::mutex> g(m_);
-  rt_.clear(); rg_.clear(); ro_.clear(); rd_.clear(); rc_.clear(); rb_.clear();
+  rt_.clear(); rg_.clear(); ro_.clear(); rd_.clear(); rc_.clear(); rb_.clear(); ra_.clear();
   frames_.clear();
   has_x_ = has_anchor_ = has_acq_x_ = false;
   x_ = anchor_ = acq_x_ = X4{};
@@ -860,28 +860,32 @@ void Solver::Clear() {
   has_stat_ = false;
   acq_forced_ = acq_dim_ = false;
   starved_ = false;
+  dot_ = dot_said_ = 0;
   amb_state_ = 0;
   kept_said_ = -1e18;
   held_h_.clear();  // another headset, or a reference frame pinned anew: the height held means nothing now
   held_t_ = -1e18;
 }
 
-void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
+void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright, double sr) {
   std::lock_guard<std::mutex> g(m_);
   rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam); rb_.push_back(bright);
+  ra_.push_back((float)sr);
 }
 
 void Solver::Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
-                     const std::vector<double> &G, const std::vector<int> &C, const std::vector<char> &B) {
+                     const std::vector<double> &G, const std::vector<int> &C, const std::vector<char> &B,
+                     const std::vector<float> &A) {
   std::lock_guard<std::mutex> g(m_);
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), from) - rt_.begin();
-  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j); rb_.resize(j);
+  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j); rb_.resize(j); ra_.resize(j);
   rt_.insert(rt_.end(), T.begin(), T.end());
   ro_.insert(ro_.end(), O.begin(), O.end());
   rd_.insert(rd_.end(), D.begin(), D.end());
   rg_.insert(rg_.end(), G.begin(), G.end());
   rc_.insert(rc_.end(), C.begin(), C.end());
   rb_.insert(rb_.end(), B.begin(), B.end());
+  ra_.insert(ra_.end(), A.begin(), A.end());
 }
 
 void Solver::SetChannel(const std::string &serial, int channel) {
@@ -919,6 +923,7 @@ Solver::Rays Solver::GetRays(double t0) {
     rg_.erase(rg_.begin(), rg_.begin() + j);
     rc_.erase(rc_.begin(), rc_.begin() + j);
     rb_.erase(rb_.begin(), rb_.begin() + j);
+    ra_.erase(ra_.begin(), ra_.begin() + j);
   }
   Rays r;
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), t0) - rt_.begin();
@@ -928,6 +933,7 @@ Solver::Rays Solver::GetRays(double t0) {
   r.G.assign(rg_.begin() + j, rg_.end());
   r.C.assign(rc_.begin() + j, rc_.end());
   r.B.assign(rb_.begin() + j, rb_.end());
+  r.A.assign(ra_.begin() + j, ra_.end());
   return r;
 }
 
@@ -976,7 +982,7 @@ bool Solver::Triangulate(std::map<std::string, Seen> &out) {
     int k;
     double a;
     Nearest(P, Zq, r.O[n], r.D[n], k, a);
-    if (a < GATE) pick[k].push_back(n);
+    if (a < GATE && FromStation(r.A[n], P[k], r.O[n], dot_)) pick[k].push_back(n);
   }
   for (size_t k = 0; k < S.size(); k++) {
     if (pick[k].size() < 20) continue;
@@ -1070,7 +1076,7 @@ void Solver::Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3
   for (size_t n = 0; n < r.size(); n++) {
     int k; double a;
     Nearest(P, Zq, r.O[n], r.D[n], k, a);
-    if (a < gate) cnt[k]++;
+    if (a < gate && (r.A.empty() || FromStation(r.A[n], P[k], r.O[n], dot_))) cnt[k]++;
   }
 }
 
@@ -1185,7 +1191,8 @@ Solver::FitR Solver::Fit(const X4 &x0, const std::vector<V3> &S, const std::vect
       continue;
     }
     Nearest(P, Zq, r.O[n], r.D[n], kk[n], a);
-    if (a < (r.B.empty() || r.B[n] ? gate : std::min(gate, dim_gate))) { use[n] = 1; m++; }
+    if (a < (r.B.empty() || r.B[n] ? gate : std::min(gate, dim_gate)) &&
+        (r.A.empty() || FromStation(r.A[n], P[kk[n]], r.O[n], dot_))) { use[n] = 1; m++; }
   }
   out.n = m;
   if (m < 15) return out;
@@ -1383,7 +1390,7 @@ void Solver::BatchSupport(const std::vector<X4> &H, const std::vector<V3> &S, co
         double v = fr[k] ? cs[k] : -2;
         if (v > bv) { bv = v; best = (int)k; }
       }
-      if (cs[best] > cg && fr[best]) o[best]++;
+      if (cs[best] > cg && fr[best] && (r.A.empty() || FromStation(r.A[n], P[best], r.O[n], dot_))) o[best]++;
     }
   }
 }
@@ -1403,7 +1410,7 @@ Solver::Rays Solver::Bright(const Rays &r) const {
   for (size_t n = 0; n < r.size(); n++) {
     if (!r.B[n]) continue;
     o.T.push_back(r.T[n]); o.G.push_back(r.G[n]); o.O.push_back(r.O[n]); o.D.push_back(r.D[n]);
-    o.C.push_back(r.C[n]); o.B.push_back(1);
+    o.C.push_back(r.C[n]); o.B.push_back(1); o.A.push_back(r.A[n]);
   }
   return o;
 }
@@ -1419,6 +1426,7 @@ Solver::Rays Solver::Thin(const Rays &r) {
   for (size_t n : keep) {
     o.T.push_back(r.T[n]); o.O.push_back(r.O[n]); o.D.push_back(r.D[n]);
     if (!r.B.empty()) o.B.push_back(r.B[n]);
+    if (!r.A.empty()) o.A.push_back(r.A[n]);
   }
   return o;
 }
@@ -1501,6 +1509,23 @@ bool Solver::KeptHeight(double &h) const {
     if (kv.second > best) { best = kv.second; bin = kv.first; }
   h = bin * kHeightBin;
   return best >= kHeightKeep;
+}
+
+bool Solver::OnLamp(const X4 &x, const Rays &r, std::string &which) const {
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z, P, Zq;
+  Stations(keys, S, Z);
+  Predict(x, S, Z, P, Zq);
+  std::vector<int> fit(S.size(), 0), big(S.size(), 0);
+  for (size_t n = 0; n < r.size(); n++) {
+    int k;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < INLIER) (FromStation(r.A[n], P[k], r.O[n], dot_) ? fit : big)[k]++;
+  }
+  for (size_t k = 0; k < S.size(); k++)
+    if (big[k] > 2 * fit[k] + 5) { which = keys[k]; return true; }
+  return false;
 }
 
 int Solver::ThinnedScore(const X4 &x, double now) {
@@ -2153,6 +2178,8 @@ StepStat Solver::Step(double /*now*/) {
   double now = seen_ = newest;
   starved_ = Starved(GetRays(std::max(now - ACQ_WIN, since_)));
   StepStat st;
+  std::vector<double> sz;  // sr * m
+  int big = 0;
   if (!S.empty() && has_x_) {
     Rays r = GetRays(std::max(now - WIN, since_));
     if (r.size()) {
@@ -2189,6 +2216,11 @@ StepStat Solver::Step(double /*now*/) {
           in.push_back(a);
           double &l = st.last[keys[kk]];
           l = std::max(l, r.T[n]);
+          if (r.B[n] && !r.A.empty()) {
+            double d = norm(P[kk] - r.O[n]);
+            if (r.A[n] * d * d <= kMaxSource) sz.push_back(r.A[n] * d);
+            else big++;
+          }
         }
       }
       st.n = f.n;
@@ -2216,12 +2248,25 @@ StepStat Solver::Step(double /*now*/) {
     if (dt > 0) held_h_[(int)std::lround(x_[2] / kHeightBin)] += dt;
   }
   held_t_ = now;
+  if (locked && sz.size() >= 200 && sz.size() >= 4u * big) {
+    std::nth_element(sz.begin(), sz.begin() + sz.size() * 9 / 10, sz.end());
+    double v = sz[sz.size() * 9 / 10];
+    if (!(std::fabs(v / dot_said_ - 1) < 0.25)) {
+      dot_said_ = v;
+      log_(Fmt("base stations' dots: %.2e sr m (90%% of %d sightings); blobs over twice that, and %.0f cm^2, are lamps",
+               v, (int)sz.size(), kMaxSource * 1e4));
+    }
+    dot_ = v;
+  }
   if (now - last_acq_ > (locked ? 10 : 3)) {
     last_acq_ = now;
     X4 xa;
     int sa, tight;
     if (Acquire(now, xa, sa, tight)) {
-      int cur = has_x_ ? ThinnedScore(x_, now) : 0;
+      Rays ra = Bright(GetRays(std::max(now - ACQ_WIN, since_)));
+      std::string lamp, lamp_c;
+      bool on_lamp = OnLamp(xa, ra, lamp), cur_lamp = has_x_ && OnLamp(x_, ra, lamp_c);
+      int cur = has_x_ && !cur_lamp ? ThinnedScore(x_, now) : 0;
       st.has_acq = true; st.acq_sa = sa; st.acq_cur = cur; st.acq_tight = tight;
       // the mirror check's flip has the worn devices for evidence as well: half the support will do. A fit far off the
       // current one (four stations in a square fit about as well turned by 90 deg) goes by the worn or held devices
@@ -2244,6 +2289,12 @@ StepStat Solver::Step(double /*now*/) {
       bool wins = back ? (sa >= k * ACQ || tight >= k * TIGHT_N) && sa > 2 * cur + 5
                        : enough && (sa > 2 * cur + 5 || acq_forced_);
       if (!wins) {
+      } else if (on_lamp) {
+        if (now - kept_said_ > 60) {
+          kept_said_ = now;
+          log_(Fmt("acquisition: yaw %+.1f deg (support %d, was %d) would put %s on a lamp: the current fit stays",
+                   xa[0] * kDeg, sa, cur, lamp.c_str()));
+        }
       } else if (off_a && fav != 1) {
         if (now - kept_said_ > 60) {
           kept_said_ = now;
@@ -2257,9 +2308,10 @@ StepStat Solver::Step(double /*now*/) {
                    xa[0] * kDeg, sa, cur, how.c_str()));
         }
       } else {
-        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s%s", xa[0] * kDeg,
-                 xa[1], xa[2], xa[3], sa, tight, TIGHT_DEG, cur, acq_forced_ ? ", by the mirror check" : "",
-                 back ? ", back at the height the fit has held" : ""));
+        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s%s%s",
+                 xa[0] * kDeg, xa[1], xa[2], xa[3], sa, tight, TIGHT_DEG, cur,
+                 acq_forced_ ? ", by the mirror check" : "", back ? ", back at the height the fit has held" : "",
+                 cur_lamp ? (", the old fit had " + lamp_c + " on a lamp").c_str() : ""));
         Reset(xa);
         since_ = brk_;
       }
@@ -2372,7 +2424,7 @@ bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out) {
     for (size_t n = 0; n < r.size(); n++)
       if (r.T[n] >= t0 + (t1 - t0) * q / 4 && r.T[n] < t0 + (t1 - t0) * (q + 1) / 4 + (q == 3 ? 1 : 0)) {
         s.T.push_back(r.T[n]); s.G.push_back(r.G[n]); s.O.push_back(r.O[n]); s.D.push_back(r.D[n]);
-        s.C.push_back(r.C[n]); s.B.push_back(r.B[n]);
+        s.C.push_back(r.C[n]); s.B.push_back(r.B[n]); s.A.push_back(r.A[n]);
       }
     double th;
     if (s.size() >= 50 && fit(s, th, nullptr)) ts.push_back(th);
@@ -2394,8 +2446,8 @@ void Solver::Relevel(const X4 &x) {
 }
 
 // ================================================================ timing
-void Timing::Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright) {
-  rec_.push_back({tg, od, dd, hg, cam, bright});
+void Timing::Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright, double sr) {
+  rec_.push_back({tg, od, dd, hg, cam, bright, (float)sr});
   while (!rec_.empty() && (rec_.front().tg < tg - 120 || rec_.size() > 20000)) rec_.pop_front();
 }
 
@@ -2404,7 +2456,7 @@ void Timing::Record(double tg, V3 od, V3 dd, double hg, int cam, bool bright) {
 // pulled estimates toward it (3 ms instead of ~18 right after a seed). IRLS Gauss-Newton, Cauchy 0.3 deg, a weak pull
 // toward the start for directions the sightings don't pin. False unless both stations have slow sightings.
 static bool RefitSlow(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<V3> &O,
-                      const std::vector<V3> &D) {
+                      const std::vector<V3> &D, const std::vector<float> &A, double lim) {
   if (S.size() < 2 || O.size() < 30) return false;
   const X4 x0 = x;
   std::vector<V3> P, Zq;
@@ -2416,7 +2468,7 @@ static bool RefitSlow(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z,
     int k;
     double a;
     Solver::Nearest(P, Zq, O[i], D[i], k, a);
-    if (!(a < 1.0)) continue;
+    if (!(a < 1.0) || !FromStation(A[i], P[k], O[i], lim)) continue;
     use.push_back(i);
     ks.push_back(k);
     per[k]++;
@@ -2493,14 +2545,14 @@ static bool RefitSlow(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z,
 // later estimate searches near the current timing, and the whole range when its minimum lies at that search's edge:
 // a timing saved far off (a Frame's at -6.2 ms) could otherwise never move
 bool Timing::Estimate(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
-                      bool wide, double &best, int &n, Split &sp) {
+                      bool wide, double &best, int &n, Split &sp, double lim) {
   bool edge = false;
-  if (Search(poses, x, S, Z, cur, wide, best, n, sp, edge)) return true;
-  return !wide && edge && Search(poses, x, S, Z, cur, true, best, n, sp, edge);
+  if (Search(poses, x, S, Z, cur, wide, best, n, sp, edge, lim)) return true;
+  return !wide && edge && Search(poses, x, S, Z, cur, true, best, n, sp, edge, lim);
 }
 
 bool Timing::Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, double cur,
-                    bool wide, double &best, int &n, Split &sp, bool &edge) {
+                    bool wide, double &best, int &n, Split &sp, bool &edge, double lim) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   sp = {nan, nan, 0, 0, nan};
   edge = false;
@@ -2509,6 +2561,7 @@ bool Timing::Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S
   double lo = wide ? -0.04 : cur - 0.015, hi = wide ? 0.10 : cur + 0.015, step = wide ? 0.0025 : 0.001;
   std::vector<const Rec *> fast;
   std::vector<V3> so, sd;
+  std::vector<float> sa;
   double newest = rec_.back().tg;
   for (auto &r : rec_) {
     if (r.tg < newest - 120) continue;
@@ -2516,7 +2569,11 @@ bool Timing::Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S
     M3 R; V3 p;
     if (!poses.Speed(r.tg - cur, w)) continue;
     if (w < 10) {
-      if (!poses.Still(r.tg - cur) && poses.At(r.tg - cur, R, p)) { so.push_back(p + R * r.od); sd.push_back(R * r.dd); }
+      if (!poses.Still(r.tg - cur) && poses.At(r.tg - cur, R, p)) {
+        so.push_back(p + R * r.od);
+        sd.push_back(R * r.dd);
+        sa.push_back(r.sr);
+      }
       continue;
     }
     if (w < 15 || w > 150) continue;
@@ -2524,7 +2581,7 @@ bool Timing::Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S
     fast.push_back(&r);
   }
   X4 xs = x;
-  if (!RefitSlow(xs, S, Z, so, sd)) return false;
+  if (!RefitSlow(xs, S, Z, so, sd, sa, lim)) return false;
   std::vector<V3> P, Zq;
   Solver::Predict(xs, S, Z, P, Zq);
   // only sightings of a base station count: other lights would pad n and flatten the error curve. kNearDeg is wide
@@ -2535,7 +2592,7 @@ bool Timing::Search(const PoseHist &poses, const X4 &x, const std::vector<V3> &S
     if (!poses.At(r->tg - cur, R, p)) continue;
     int k; double a;
     Solver::Nearest(P, Zq, p + R * r->od, R * r->dd, k, a);
-    if (std::isfinite(a) && a < kNearDeg) near.push_back(r);
+    if (std::isfinite(a) && a < kNearDeg && FromStation(r->sr, P[k], p + R * r->od, lim)) near.push_back(r);
   }
   fast.swap(near);
   n = (int)fast.size();
@@ -2637,6 +2694,7 @@ void Sync::Retime(double old_e, double new_e) {
   std::vector<V3> O, D;
   std::vector<int> C;
   std::vector<char> B;
+  std::vector<float> A;
   for (auto &r : rec) {
     double t = r.tg - new_e, w;
     M3 R;
@@ -2648,8 +2706,9 @@ void Sync::Retime(double old_e, double new_e) {
     G.push_back(r.hg);
     C.push_back(r.cam);
     B.push_back(r.bright);
+    A.push_back(r.sr);
   }
-  solver_.Replace(rec.front().tg - old_e, T, O, D, G, C, B);
+  solver_.Replace(rec.front().tg - old_e, T, O, D, G, C, B, A);
 }
 
 static std::string Join(const std::string &dir, const char *name) {
@@ -3121,9 +3180,13 @@ void Sync::Use(const Shot &f) {
   for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
     if (npx > kMaxPx) { spots_.big++; continue; }
-    V3 o, d;
+    V3 o, d, o1, d1, o2, d2;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
-    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright);
+    double sr = 0;
+    if (optics_.Ray(cam, x10 / 10.0 + 0.5, y10 / 10.0 - 0.5, o1, d1) &&
+        optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 + 0.5, o2, d2))
+      sr = npx * norm(cross(d1 - d, d2 - d));
+    if (have_lag && cfg_.learn_timing) timing_.Record(grid_pc, o, d, hg, cam, b.peak >= kBright, sr);
     if (g_ray_dump) {
       V3 O = p + R * o, D = R * d;
       fprintf(g_ray_dump, "R %.6f %d %.6f %.6f %.6f %.7f %.7f %.7f %.6f %.6f %.6f %.1f %d\n", t, cam, O.x, O.y, O.z, D.x,
@@ -3131,7 +3194,7 @@ void Sync::Use(const Shot &f) {
     }
     if (w > kWmax) { spots_.fast++; continue; }
     bool bright = b.peak >= kBright;
-    solver_.Add(t, p + R * o, R * d, hg, cam, bright);  // dim ones too: they tell when the room is too light
+    solver_.Add(t, p + R * o, R * d, hg, cam, bright, sr);  // dim ones too: they tell when the room is too light
     if (bright || solver_.starved()) spots_.used++;
     else spots_.dim++;
   }
@@ -3578,7 +3641,7 @@ Transform Sync::Tick(double now) {
       double cur = expo_;
       {
         std::lock_guard<std::mutex> g(net_);
-        ok = timing_.Estimate(poses_, x, S, Z, cur, !timing_learned_, best, n, sp);
+        ok = timing_.Estimate(poses_, x, S, Z, cur, !timing_learned_, best, n, sp, solver_.dot_size());
       }
       if (!ok && std::isfinite(sp.left) && now - split_said_ >= 300) {
         split_said_ = now;
