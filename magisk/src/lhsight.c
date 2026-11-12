@@ -254,8 +254,8 @@ static void frame(int i, u64 t) {
   // the odd place, else a held place, before the cycle test: found late, it names the wrong frame now and then
   int place = oddp >= 0 ? p == oddp : S.phn[c] >= PH_LOCK ? p == S.ph[c] : -1;
   int is_short = strict || (place >= 0 ? place : cyc >= 0 ? cyc : alt && S.nostrict[c] >= 60 && S.nalt[c] * 4 >= S.nostrict[c]);
-  // Quest 1: the tests above misjudge its long/short alternation, so use the exposure in the header row (bytes 6-7,
-  // big-endian), against the larger of the previous two in case frames arrive out of order
+  // Quest 1: the tests above misjudge its long/short alternation, so use the exposure in the header row, 
+  // against the larger of the previous two in case frames arrive out of order
   if (S.hdr) {
     const u8 *hd = S.slot[i] - w;
     int e = (hd[6] << 8) | hd[7], before = S.pe1[c] > S.pe2[c] ? S.pe1[c] : S.pe2[c];

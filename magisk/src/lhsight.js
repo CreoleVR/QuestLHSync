@@ -44,8 +44,8 @@ set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 64);
 set_hdr(HDR_ROWS);
 var PAGE = 4096;
 function bufSize(c) { return Math.ceil(c.w * (c.h + HDR_ROWS) / PAGE) * PAGE; }  // one 8-bit frame, whole pages
-// Quest 1: the HAL maps each camera buffer twice while streaming. Pair mappings by content (three passes, as a frame
-// landing between reads hides a pair) and keep the higher one, the HAL's own, which persists when the cameras stop
+// Quest 1: the HAL maps each camera buffer twice while streaming. Pair mappings by content
+// and keep the higher one which persists when the cameras stop
 function distinct(regs) {
   var root = regs.map(function (r, i) { return i; });
   var find = function (i) { while (root[i] !== i) i = root[i]; return i; };
