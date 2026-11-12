@@ -52,7 +52,6 @@ void set_bufs(u8 *scratch, u16 *cells, int *lab, char *out, int thr) {
 }
 void reset_slots(void) { S.nslots = 0; }
 void set_hdr(int on) { S.hdr = on; }
-// sampled hash of a buffer, 0 if the samples are all zero (lhsight.js: distinct())
 u32 region_hash(const u8 *p, u32 n) {
   u32 step = n / 61, h = 2166136261u, any = 0;
   for (u32 o = step / 2; o < n; o += step) { h ^= p[o]; h *= 16777619u; any |= p[o]; }

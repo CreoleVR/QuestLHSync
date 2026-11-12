@@ -16,7 +16,6 @@ var CAMS = (CAMS_SPEC.charAt(0) === "@" ? "0:1280:1024:0,1:1280:1024:0,2:640:480
 var SCAN = CAMS.filter(function (c) { return c.scan; });
 var MAXW = Math.max.apply(null, SCAN.map(function (c) { return c.w; }).concat([16]));
 var MAXH = Math.max.apply(null, SCAN.map(function (c) { return c.h; }).concat([16]));
-// Quest 1 (codename filled in by lhsyncd): anonymous dmabufs, a header row above each image, buffers mapped twice
 var MONTEREY = "@DEVICE@".indexOf("monterey") === 0;
 var DMABUF = MONTEREY ? /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*(?:\/dmabuf(?::dmabuf(\d+))?|anon_inode:dmabuf)/
                       : /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*\/dmabuf(?::dmabuf(\d+))?/;
