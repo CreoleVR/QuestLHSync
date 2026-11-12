@@ -16,9 +16,7 @@ var CAMS = (CAMS_SPEC.charAt(0) === "@" ? "0:1280:1024:0,1:1280:1024:0,2:640:480
 var SCAN = CAMS.filter(function (c) { return c.scan; });
 var MAXW = Math.max.apply(null, SCAN.map(function (c) { return c.w; }).concat([16]));
 var MAXH = Math.max.apply(null, SCAN.map(function (c) { return c.h; }).concat([16]));
-// The headset's codename (lhsyncd fills it in). The Quest 1's ("monterey") camera buffers aren't named (an older
-// kernel: "anon_inode:dmabuf"), hold a row of the sensor's own above the image (lhsight.c: set_hdr) and are mapped
-// twice while the cameras stream (distinct())
+// Quest 1 (codename filled in by lhsyncd): anonymous dmabufs, a header row above each image, buffers mapped twice
 var MONTEREY = "@DEVICE@".indexOf("monterey") === 0;
 var DMABUF = MONTEREY ? /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*(?:\/dmabuf(?::dmabuf(\d+))?|anon_inode:dmabuf)/
                       : /^([0-9a-f]+)-([0-9a-f]+)\s+rw-s.*\/dmabuf(?::dmabuf(\d+))?/;
@@ -47,10 +45,8 @@ set_bufs(scratchBuf, cellBuf, labBuf, outBuf, 64);
 set_hdr(HDR_ROWS);
 var PAGE = 4096;
 function bufSize(c) { return Math.ceil(c.w * (c.h + HDR_ROWS) / PAGE) * PAGE; }  // one 8-bit frame, whole pages
-// The Quest 1's sensors HAL maps each camera buffer a second time while the cameras stream. Two mappings of a buffer
-// hold the same bytes and two buffers never do (sensor noise), so they're told apart by content, looking three times:
-// a frame landing between two reads hides a pair. Of each pair the higher mapping stays, the HAL's own, which is
-// there while the cameras are off too
+// Quest 1: the HAL maps each camera buffer twice while streaming. Pair mappings by content (three passes, as a frame
+// landing between reads hides a pair) and keep the higher one, the HAL's own, which persists when the cameras stop
 function distinct(regs) {
   var root = regs.map(function (r, i) { return i; });
   var find = function (i) { while (root[i] !== i) i = root[i]; return i; };
@@ -59,7 +55,7 @@ function distinct(regs) {
     var first = {};
     regs.forEach(function (r, i) {
       var h = region_hash(ptr(r.a), r.size);
-      if (!h) return;  // all zero: never written, alike without being one buffer
+      if (!h) return;  // unwritten buffers all match
       if (first[h] === undefined) first[h] = i;
       else root[find(i)] = find(first[h]);
     });
