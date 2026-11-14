@@ -342,7 +342,11 @@ class Solver {
   // the level: a tilt step of the reference frame is fitted with a weak prior (SIG_LEVEL) and kept only when the
   // sightings pin it (COND_LEVEL, like COND_YAW) and at least LEVEL_STATIONS stations hold LEVEL_CELLS inlier cells
   static constexpr double SIG_LEVEL = 1.0 / kDeg, COND_LEVEL = 0.1 / kDeg, LEVEL_MED = 0.3;
-  static constexpr int LEVEL_STATIONS = 3, LEVEL_CELLS = 3;
+  // ... and LEVEL_RAYS inlier rays each: with three cells and a dozen rays at one station the 6-DOF fit hangs the tilt
+  // on them, and a reflection or a lamp's edge there tilts it degrees (Galaxy XR, 14 Nov: 2.1 deg on 15 rays, the
+  // truth 1.1; 7 Nov and 14 Nov 22:18 read 6.7-7.1 deg on 6-28 rays at the third station and were only stopped by
+  // kMaxRot). The stations seen for real had 30 or more in five minutes
+  static constexpr int LEVEL_STATIONS = 3, LEVEL_CELLS = 3, LEVEL_RAYS = 30;
   struct LevelR { X4 x{}; M3 tilt; int stations = 0; double med = 0; };  // tilt about the pivot, then x
   struct ScaleR { X4 x{}; double t = 1, span = 0, med = 0; int stations = 0, n = 0; };  // scale about the pivot, then x
   // a tilt about one horizontal axis (rad), how well its time slices agree on it (rad), the sightings' median error
@@ -639,6 +643,7 @@ class Sync {
   X4 applied_{};
   double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, last_level_ = 0, lock_time_ = -1;
   double level_read_ = -1e9;  // the last reading LevelStep took
+  double jump_seen_ = 0;      // when a reading last said the level moved (a second one within 3 readings takes it)
   double split_said_ = -1e18;  // when a timing estimate too unsure to take was last logged
   int brk_seen_ = 0, resets_seen_ = 0;
   double last_prec_ = -1e18;

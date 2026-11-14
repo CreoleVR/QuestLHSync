@@ -2949,8 +2949,10 @@ bool Solver::Level(V3 pivot, LevelR &out) {
   level();
   std::vector<int> cells;
   Support(x, S, Z, Thin(r), INLIER, cells);
+  std::vector<int> nrays;
+  Support(x, S, Z, r, INLIER, nrays);
   int held = 0;
-  for (int c : cells) held += c >= LEVEL_CELLS;
+  for (size_t k = 0; k < cells.size(); k++) held += cells[k] >= LEVEL_CELLS && nrays[k] >= LEVEL_RAYS;
   std::vector<V3> P, Zq;
   Predict(x, S, Z, P, Zq);
   std::vector<double> in;
@@ -3977,9 +3979,21 @@ bool Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
   if (!solver_.Level(sfile_.anchor_p, lv)) return false;
   double step = RotDeg(lv.tilt);
   if (RotDeg(lv.tilt * sfile_.level) > kMaxRot) return true;  // past what a level can be
-  bool moved = sfile_.level_n > 0 && step > kLevelJump;
-  if (!moved && sfile_.level_n > 0 && now - level_read_ < kLevelEvery) return true;  // a move is followed at once
+  // a reading kLevelJump off the level is a move of SteamVR's frame only when the next one says so too: a lone one was
+  // a bad fit every time it was checked (seven jumps, 5-14 Nov, 0.6-1.9 deg, none with the frame moved; a mounted
+  // tracker had the level within 0.3 deg before each)
+  bool far = sfile_.level_n > 0 && step > kLevelJump;
+  bool moved = far && jump_seen_ > 0 && now - jump_seen_ < 3 * kLevelEvery;
+  if (far && !moved) {
+    jump_seen_ = now;
+    log_(Fmt("lighthouse frame: a reading %.2f deg off the level (%d base stations within %.2f deg): not taken alone, "
+             "the next one decides", step, lv.stations, lv.med));
+    return true;
+  }
+  if (!far) jump_seen_ = 0;
+  if (!moved && sfile_.level_n > 0 && now - level_read_ < kLevelEvery) return true;
   level_read_ = now;
+  jump_seen_ = 0;
   int n = moved ? 0 : std::min(sfile_.level_n, kLevelMemory - 1);
   double share = 1.0 / (n + 1);
   Quat q = ToQuat(lv.tilt);  // the reading's share of its turn, about the same axis
