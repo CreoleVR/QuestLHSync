@@ -107,6 +107,9 @@ constexpr double kLevelJump = 0.6;
 // and it's looked for every kScaleFirst s (a recording: the first reading 80 s after the head could have given one)
 constexpr double kScaleEvery = 60.0, kScaleFirst = 10.0, kScaleSpan = 1.0, kScaleMin = 0.88, kScaleMax = 1.05;
 constexpr int kScaleMemory = 10;
+// ... and only from a fit whose sightings' median error is under kScaleMed: every reading at 0.21-0.30 deg lay within
+// 1% of a mounted tracker's scale, every one at 0.41-0.50 was 3-5% off (a lamp or reflection in the fit), 5-14 Nov
+constexpr double kScaleMed = 0.30;
 // a pair of stations' reading (Sync::PairLevelStep) counts if its time slices agree within kPairLevelSd (deg): the
 // level check's across two stations came within 0.19. Its sightings' median error may reach kPairLevelMed, not
 // Solver::LEVEL_MED: a Galaxy XR's sit at 0.30-0.36 deg, and two stations leave the tilt along their line in them
@@ -233,6 +236,8 @@ class PoseHist {
   bool Still(double t, double span = 2.0, double rot = 0.1, double pos = 0.002) const;
   bool Speed(double t, double &w, double span = 0.08) const;  // deg/s
   bool Latest(V3 &p, double *t = nullptr) const;
+  // how far the head went in [t0, t1]: the 2-98% span of its place, each axis, over the poses by time (m); 0 without
+  double Travel(double t0, double t1) const;
   int brk_id() const { return brk_id_; }
   double brk_t() const { return brk_t_; }
   std::string brk_what() const { std::lock_guard<std::mutex> g(m_); return brk_what_; }
@@ -402,7 +407,10 @@ class Solver {
   void Relevel(const X4 &x);  // the alignment for the stations as just levelled
   // the scale of the stations about pivot that fits the sightings best, on top of theirs, and how far the head went among
   // them (kScaleSpan). False: too few, or no minimum within +-8%
-  bool Scale(V3 pivot, ScaleR &out);
+  // travel: how far the head went over the window (PoseHist::Travel), the parallax there is; the rays' own camera
+  // origins said 1.2 m from a head that turned in place (the cameras sit 10 cm off the pivot, and a head that looks one
+  // way for minutes weighs that way's rays), and 0.13 m was the truth
+  bool Scale(V3 pivot, double travel, ScaleR &out);
 
   // geometry, also used by Timing
   static void Predict(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, std::vector<V3> &P, std::vector<V3> &Zq);

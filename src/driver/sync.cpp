@@ -635,6 +635,27 @@ bool PoseHist::At(double t, M3 &R, V3 &p) const {
   return true;
 }
 
+double PoseHist::Travel(double t0, double t1) const {
+  std::lock_guard<std::mutex> g(m_);
+  uint64_t hi, lo;
+  if (!Find(t1, hi)) return 0;
+  if (!Find(t0, lo)) lo = i_ > (uint64_t)N ? i_ - N : 0;
+  if (hi <= lo) return 0;
+  uint64_t stride = std::max<uint64_t>(1, (hi - lo + 1) / 4096);  // ~4000 poses, evenly in time
+  std::vector<double> xs, ys, zs;
+  for (uint64_t k = lo; k <= hi; k += stride) {
+    const V3 &p = ring_[k % N].p;
+    xs.push_back(p.x); ys.push_back(p.y); zs.push_back(p.z);
+  }
+  if (xs.size() < 20) return 0;
+  auto span = [](std::vector<double> &v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() * 98 / 100] - v[v.size() * 2 / 100];
+  };
+  double sx = span(xs), sy = span(ys), sz = span(zs);
+  return std::sqrt(sx * sx + sy * sy + sz * sz);
+}
+
 bool PoseHist::Still(double t, double span, double rot, double pos) const {
   std::lock_guard<std::mutex> g(m_);
   uint64_t hi;
@@ -3020,8 +3041,8 @@ bool Solver::LevelAxis(V3 pivot, V3 axis, AxisR &out, const std::vector<int> *on
 // The 4-DOF fit's stations scaled about pivot, over a grid of scales: the one the thinned sightings (one per head cell and
 // direction, so that a seated stretch doesn't outweigh the walk) miss least by, between its neighbours. A head that
 // hasn't gone anywhere can't tell: a station's direction only says its distance by parallax.
-bool Solver::Scale(V3 pivot, ScaleR &out) {
-  if (!has_x_) return false;
+bool Solver::Scale(V3 pivot, double travel, ScaleR &out) {
+  if (!has_x_ || travel < kScaleSpan) return false;
   std::vector<std::string> keys;
   std::vector<V3> S0, Z0;
   Stations(keys, S0, Z0);
@@ -3039,19 +3060,7 @@ bool Solver::Scale(V3 pivot, ScaleR &out) {
         if (!all.B.empty()) r.B.push_back(all.B[n]);
       }
   }
-  // 2-98%: a stand-up of 25 s in a seated session is a tenth of the rays, fewer of the thinned ones, and all the
-  // parallax there is; 5-95% lost it (7 Nov: 0.55 m of height read as 0.11)
-  auto span = [](std::vector<double> &v) {
-    std::sort(v.begin(), v.end());
-    return v[v.size() * 98 / 100] - v[v.size() * 2 / 100];
-  };
-  {  // no need to search if the head hasn't gone anywhere
-    std::vector<double> xs, ys, zs;
-    for (const V3 &o : r.O) { xs.push_back(o.x); ys.push_back(o.y); zs.push_back(o.z); }
-    if (r.size() < 50) return false;
-    double sx = span(xs), sy = span(ys), sz = span(zs);
-    if (std::sqrt(sx * sx + sy * sy + sz * sz) < kScaleSpan) return false;
-  }
+  if (r.size() < 50) return false;
   V3 mid{};
   for (const V3 &p : S0) mid = mid + p;
   mid = (1.0 / S0.size()) * mid;
@@ -3094,21 +3103,18 @@ bool Solver::Scale(V3 pivot, ScaleR &out) {
   out.t = 1 + (best - kGrid + 0.5 * (a - c) / den) * 0.01;
   if (!at(out.t, x_, fit, nullptr)) return false;
   out.x = fit;
-  // how far the head went among the sightings that fit, each way (5-95%), and from how many stations
+  // the sightings that fit, their median error, and from how many stations
   std::vector<V3> P, Zq;
   Predict(fit, S, Z0, P, Zq);
-  std::vector<double> in, xs, ys, zs;
+  std::vector<double> in;
   for (size_t n = 0; n < r.size(); n++) {
     int k;
     double m;
     Nearest(P, Zq, r.O[n], r.D[n], k, m);
-    if (m >= 1.0) continue;
-    in.push_back(m);
-    xs.push_back(r.O[n].x); ys.push_back(r.O[n].y); zs.push_back(r.O[n].z);
+    if (m < 1.0) in.push_back(m);
   }
   if ((int)in.size() < 50) return false;
-  double sx = span(xs), sy = span(ys), sz = span(zs);
-  out.span = std::sqrt(sx * sx + sy * sy + sz * sz);
+  out.span = travel;
   out.n = (int)in.size();
   out.med = Median(in);
   std::vector<int> cells;
@@ -4004,9 +4010,10 @@ void Sync::ScaleStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
     return;
   if (!(BodyDist(solver_.x()) < kLevelBody)) return;
   Solver::ScaleR sr;
-  if (!solver_.Scale(sfile_.anchor_p, sr)) return;
+  if (!solver_.Scale(sfile_.anchor_p, poses_.Travel(now - Solver::WIN, now), sr)) return;
   double read = sfile_.scale * sr.t;
-  bool held = sr.span >= kScaleSpan && sr.stations >= Solver::LEVEL_STATIONS && read >= kScaleMin && read <= kScaleMax;
+  bool held = sr.span >= kScaleSpan && sr.stations >= Solver::LEVEL_STATIONS && read >= kScaleMin && read <= kScaleMax &&
+              sr.med <= kScaleMed;
   Rec(now, "I scale %.4f %.4f %.2f %d %d %.3f %d %d", read, sfile_.scale, sr.span, sr.stations, sr.n, sr.med, scale_n_, held);
   if (!held) return;
   int n = std::min(scale_n_, kScaleMemory - 1);
