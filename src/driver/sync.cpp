@@ -1553,10 +1553,110 @@ static double RotorZ(const std::vector<double> &g, double tau, double *R_out = n
   return g.size() * R * R - std::log(apart);
 }
 
-static int RotorPhase(const std::vector<double> &g, double tau) {
-  constexpr int kRotorMin = 12;
-  constexpr double kRotorLow = 0.3, kRotorP = 4.6;
+// The raw times' coherence is held near 0.5 by the base's two sweep planes, not by noise: they cross the camera about
+// a third of a turn apart (tilted -+30 deg about the rotor axis), so the sightings split into two phases 120 deg
+// +- twice the elevation apart (recordings, 4 sessions 30 Oct-5 Nov: the coherence the planes predict from where the
+// camera was matched the measured one to the third digit). Each sighting's phase less the angle at which its plane
+// sweeps the camera, though, is the base's own: 87-99% of a station's sightings within +-2.5 deg of it (median 1 deg:
+// the 144 us exposure is 2.6 deg of rotor), lamps, reflections and the other stations' sightings 1.4-4% (chance 2.8%).
+
+// rotor angles (rad, at the base's sync) at which its planes 0 and 1 sweep through direction v (base station frame,
+// looking down -z); flip swaps the planes' tilts (the base's model type: these recordings' three bases flipped).
+// The bases' own calibration (tilt, phase, curve; under a degree) is left out
+static void PlaneAngles(V3 v, bool flip, double &a0, double &a1) {
+  constexpr double kSixth = kPi / 6;
+  double rho = std::max(std::hypot(v.x, v.z), 1e-9), b = std::atan2(-v.z, v.x) + kSixth;
+  double e = std::asin(std::max(-1.0, std::min(1.0, std::tan(kSixth) * v.y / rho)));
+  a0 = flip ? b - e : b + e;
+  a1 = (flip ? b + e : b - e) + 2 * kPi / 3;
+}
+
+// direction from a base station to the camera that saw it along d (Quest space), in the station's frame: R its
+// rotation (reference frame), x the alignment
+static V3 InStation(const X4 &x, const M3 &R, V3 d) {
+  return T(R) * RyMul(std::cos(x[0]), -std::sin(x[0]), V3{-d.x, -d.y, -d.z});
+}
+
+// The sweep model on sightings at headset times g, seen from directions v (InStation): the most of them that one rotor
+// phase puts within +-kPlaneHalf of either plane, searched over the frequency within ppm_w of 1/tau * (1 + ppm_c) and
+// both plane tilts. z: the log likelihood ratio of a station's sightings (kPlaneQ of them in) against chance (each
+// sighting in with p = 2 windows of the turn), less what the search tries: + for a station, - for a lamp
+struct PlaneR { int n = 0, in = 0; bool flip = false; double z = 0, ppm = 0; };
+static constexpr int kPlaneBins = 720, kPlaneHalf = 5;  // 0.5 deg bins, a window of 11: +-2.75 deg
+static constexpr double kPlaneQ = 0.9;
+static PlaneR PlaneFit(const std::vector<double> &g, const std::vector<V3> &v, double tau, double ppm_c, double ppm_w) {
+  PlaneR best;
+  const size_t n = g.size();
+  best.n = (int)n;
+  if (n < 2 || v.size() != n || !(tau > 0)) return best;
+  auto mm = std::minmax_element(g.begin(), g.end());
+  const double g0 = *mm.first, span = std::max(*mm.second - g0, 1.0), f0 = 1 / tau;
+  constexpr int W = 2 * kPlaneHalf + 1;
+  const double df = (double)W / kPlaneBins / span / 2;  // half a window over the span
+  const int nf = std::min(4000, (int)std::ceil(ppm_w * f0 / df));
+  std::vector<double> a[2][2], th(n);
+  for (int fl = 0; fl < 2; fl++) {
+    a[fl][0].resize(n);
+    a[fl][1].resize(n);
+    for (size_t j = 0; j < n; j++) PlaneAngles(v[j], fl == 1, a[fl][0][j], a[fl][1][j]);
+  }
+  std::vector<int> h(kPlaneBins + W);
+  int bm = -1;
+  double bf = f0;
+  for (int i = -nf; i <= nf; i++) {
+    const double f = f0 * (1 + ppm_c) + df * i;
+    for (size_t j = 0; j < n; j++) {
+      double c = (g[j] - g0) * f;
+      th[j] = c - std::floor(c);  // turns
+    }
+    for (int fl = 0; fl < 2; fl++) {
+      std::fill(h.begin(), h.end(), 0);
+      for (size_t j = 0; j < n; j++)
+        for (int p = 0; p < 2; p++) {
+          double u = th[j] - a[fl][p][j] / (2 * kPi);
+          u -= std::floor(u);
+          h[std::min(kPlaneBins - 1, (int)(u * kPlaneBins))]++;
+        }
+      for (int b = 0; b < W; b++) h[kPlaneBins + b] = h[b];
+      int s = 0;
+      for (int b = 0; b < W; b++) s += h[b];
+      int m = s;
+      for (int b = 1; b < kPlaneBins; b++) { s += h[b + W - 1] - h[b - 1]; m = std::max(m, s); }
+      if (m > bm) { bm = m; bf = f; best.flip = fl == 1; }
+    }
+  }
+  const double p = 2.0 * W / kPlaneBins;
+  bm = std::min<int>(bm, (int)n);
+  best.in = bm;
+  best.ppm = (bf / f0 - 1) * 1e6;
+  // the first sighting in sets the phase; the frequencies and tilts tried cost their log
+  best.z = (bm - 1) * std::log(kPlaneQ / p) + (n - bm) * std::log((1 - kPlaneQ) / (1 - p)) - std::log(2.0 * (2 * nf + 1));
+  return best;
+}
+
+// the frequency searched about the learned drift: the bases' crystals spread 1-3 ppm about it (the recordings: one
+// headset 24.4-27.4 ppm slow against all three, in every session)
+static constexpr double kPlanePpm = 4e-6;
+
+static constexpr int kRotorMin = 12, kPlaneMin = 4, kPlaneMinOut = 6;
+static constexpr double kRotorLow = 0.3, kRotorP = 4.6;
+
+// a station's rotor evidence on its sightings g from v: the sweep model's with the drift known, else the raw times'
+static double RotorEvidence(const std::vector<double> &g, const std::vector<V3> &v, double tau, double drift) {
+  if (std::isfinite(drift)) return PlaneFit(g, v, tau, drift * 1e-6, kPlanePpm).z;
+  return RotorZ(g, tau);
+}
+
+// +1: the sightings follow the rotor, -1: they don't, 0: can't tell. Raw times: Rayleigh at kRotorP, kRotorMin or more
+// under kRotorLow out. The sweep model (drift known): kPlaneMin sightings all in reach kRotorP (6.7); out at -kRotorP,
+// kPlaneMinOut or more (a lamp's 6 with one in: -15)
+static int RotorPhase(const std::vector<double> &g, const std::vector<V3> &v, double tau, double drift) {
   if (!(tau > 0)) return 1;
+  if (std::isfinite(drift)) {
+    if ((int)g.size() < kPlaneMin) return 0;
+    double z = PlaneFit(g, v, tau, drift * 1e-6, kPlanePpm).z;
+    return z >= kRotorP ? 1 : ((int)g.size() >= kPlaneMinOut && z <= -kRotorP) ? -1 : 0;
+  }
   if ((int)g.size() < kRotorMin) return 0;
   double R;
   double z = RotorZ(g, tau, &R);
@@ -1567,25 +1667,32 @@ static int RotorPhase(const std::vector<double> &g, double tau) {
 // as Score does support: all but the best station's (yaw needs two). A hypothesis that lines a lamp up with a station
 // has rays there in numbers but no phase: in a lit room (7 Nov, 5-13 station sightings a minute among ~6000 spots)
 // support alone ranked lamp hypotheses over the right one every time
-void Solver::RotorRank(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
-                       const std::vector<double> &tau, double gate, std::vector<double> &out) const {
+void Solver::RotorRank(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<M3> &Rs,
+                       const Rays &r, const std::vector<double> &tau, double gate, std::vector<double> &out) const {
   size_t K = S.size();
   out.assign(H.size(), 0.0);
   std::vector<V3> P, Zq;
   std::vector<std::vector<double>> g(K);
+  std::vector<std::vector<V3>> vs(K);
+  const double drift = drift_;
+  const bool plane = std::isfinite(drift) && Rs.size() == K;
   for (size_t h = 0; h < H.size(); h++) {
     Predict(H[h], S, Z, P, Zq);
     for (auto &v : g) v.clear();
+    for (auto &v : vs) v.clear();
     for (size_t n = 0; n < r.size(); n++) {
       if (!std::isfinite(r.G[n])) continue;
       int k;
       double a;
       Nearest(P, Zq, r.O[n], r.D[n], k, a);
-      if (a < gate) g[k].push_back(r.G[n]);
+      if (a < gate) {
+        g[k].push_back(r.G[n]);
+        if (plane) vs[k].push_back(InStation(H[h], Rs[k], r.D[n]));
+      }
     }
     double sum = 0, best = 0;
     for (size_t k = 0; k < K; k++) {
-      double z = std::max(0.0, RotorZ(g[k], tau[k]));
+      double z = std::max(0.0, RotorEvidence(g[k], vs[k], tau[k], plane ? drift : NAN));
       sum += z;
       best = std::max(best, z);
     }
@@ -1758,20 +1865,25 @@ std::vector<double> Solver::Taus(const std::vector<std::string> &keys) const {
   return tau;
 }
 
-void Solver::RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<double> &tau,
-                       const Rays &r, bool strict, std::vector<int> &c) const {
+void Solver::RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<M3> &Rs,
+                       const std::vector<double> &tau, const Rays &r, bool strict, std::vector<int> &c) const {
   std::vector<V3> P, Zq;
   Predict(x, S, Z, P, Zq);
+  const double drift = Rs.size() == S.size() ? (double)drift_ : NAN;
   std::vector<std::vector<double>> g(S.size());
+  std::vector<std::vector<V3>> vs(S.size());
   for (size_t n = 0; n < r.size(); n++) {
     if (!std::isfinite(r.G[n])) continue;
     int k;
     double a;
     Nearest(P, Zq, r.O[n], r.D[n], k, a);
-    if (a < INLIER) g[k].push_back(r.G[n]);
+    if (a < INLIER) {
+      g[k].push_back(r.G[n]);
+      if (std::isfinite(drift)) vs[k].push_back(InStation(x, Rs[k], r.D[n]));
+    }
   }
   for (size_t k = 0; k < S.size() && k < c.size(); k++) {
-    int ph = RotorPhase(g[k], tau[k]);
+    int ph = RotorPhase(g[k], vs[k], tau[k], drift);
     if (ph < 0 || (strict && ph == 0)) c[k] = 0;
   }
 }
@@ -1787,15 +1899,116 @@ bool Solver::FollowsRotor(size_t k) {
   Rays r = Bright(GetRays(std::max(seen_ - WIN, since_)));
   std::vector<V3> P, Zq;
   Predict(x_, S, Z, P, Zq);
+  std::vector<M3> Rs = Rots(keys);
+  const double drift = drift_;
   std::vector<double> g;
+  std::vector<V3> vs;
   for (size_t n = 0; n < r.size(); n++) {
     if (!std::isfinite(r.G[n])) continue;
     int kk;
     double a;
     Nearest(P, Zq, r.O[n], r.D[n], kk, a);
-    if (kk == (int)k && a < INLIER) g.push_back(r.G[n]);
+    if (kk == (int)k && a < INLIER) {
+      g.push_back(r.G[n]);
+      vs.push_back(InStation(x_, Rs[k], r.D[n]));
+    }
   }
-  return RotorPhase(g, tau[k]) > 0;
+  return RotorPhase(g, vs, tau[k], drift) > 0;
+}
+
+// Stations whose sightings under x (within INLIER) follow their sweep planes at kPlaneAccept: 5 all in (8.5), where a
+// lamp's or another station's sightings got all of 4 in 0-0.1% of the time (recordings, the sweep phases' offline
+// check). An alignment that puts a station on a lamp, a reflection or another station has its sightings fail there.
+// 0 while the drift isn't known
+int Solver::PlaneStations(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<M3> &Rs,
+                          const std::vector<double> &tau, const Rays &r) const {
+  constexpr double kPlaneAccept = 2 * kRotorP;
+  const double drift = drift_;
+  if (!std::isfinite(drift) || Rs.size() != S.size()) return 0;
+  std::vector<V3> P, Zq;
+  Predict(x, S, Z, P, Zq);
+  std::vector<std::vector<double>> g(S.size());
+  std::vector<std::vector<V3>> vs(S.size());
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!std::isfinite(r.G[n])) continue;
+    int k;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < INLIER) { g[k].push_back(r.G[n]); vs[k].push_back(InStation(x, Rs[k], r.D[n])); }
+  }
+  int ok = 0;
+  for (size_t k = 0; k < S.size(); k++)
+    if (tau.size() == S.size() && tau[k] > 0 && (int)g[k].size() >= kPlaneMin &&
+        PlaneFit(g[k], vs[k], tau[k], drift * 1e-6, kPlanePpm).z >= kPlaneAccept)
+      ok++;
+  return ok;
+}
+
+std::vector<M3> Solver::Rots(const std::vector<std::string> &keys) const {
+  std::vector<M3> R(keys.size(), Ry(0));
+  std::lock_guard<std::mutex> g(m_);
+  for (size_t k = 0; k < keys.size(); k++) {
+    auto it = S_.find(keys[k]);
+    if (it != S_.end()) R[k] = it->second.second;
+  }
+  return R;
+}
+
+// The drift from each station's sightings of the last WIN s within INLIER of where the fit puts it: the sweep model
+// over +-kRotorPpm (unknown) or kPlanePpm about the drift (known), a station taken with kDriftN sightings or more over
+// kDriftSpan s, kDriftIn of them in and z at kDriftZ; the drift the median of the stations'. A station with
+// kDriftN that the model holds for under half of its sightings is logged once: its sightings stay on the raw test
+// while no station holds (the drift stays unknown)
+bool Solver::LearnRotorDrift(double now, std::string &said) {
+  constexpr int kDriftN = 30;
+  constexpr double kDriftSpan = 60, kDriftIn = 0.8, kDriftZ = 20, kRotorPpmWide = 100e-6;
+  said.clear();
+  if (!rotor_veto_ || !has_x_) return false;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z;
+  Stations(keys, S, Z);
+  std::vector<double> tau = Taus(keys);
+  std::vector<M3> Rs = Rots(keys);
+  Rays r = Bright(GetRays(std::max(now - WIN, since_)));
+  std::vector<V3> P, Zq;
+  Predict(x_, S, Z, P, Zq);
+  size_t K = S.size();
+  std::vector<std::vector<double>> g(K);
+  std::vector<std::vector<V3>> vs(K);
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!std::isfinite(r.G[n])) continue;
+    int k;
+    double a;
+    Nearest(P, Zq, r.O[n], r.D[n], k, a);
+    if (a < INLIER) { g[k].push_back(r.G[n]); vs[k].push_back(InStation(x_, Rs[k], r.D[n])); }
+  }
+  const double was = drift_;
+  const bool known = std::isfinite(was);
+  std::vector<double> ppm;
+  std::string per;
+  for (size_t k = 0; k < K; k++) {
+    if (!(tau[k] > 0) || (int)g[k].size() < kDriftN) continue;
+    auto mm = std::minmax_element(g[k].begin(), g[k].end());
+    if (*mm.second - *mm.first < kDriftSpan) continue;
+    PlaneR p = known ? PlaneFit(g[k], vs[k], tau[k], was * 1e-6, kPlanePpm) : PlaneFit(g[k], vs[k], tau[k], 0, kRotorPpmWide);
+    if (p.in >= kDriftIn * p.n && p.z >= kDriftZ) {
+      ppm.push_back(p.ppm);
+      per += Fmt("%s%s %+.1f (%d/%d%s)", per.empty() ? "" : ", ", keys[k].c_str(), p.ppm, p.in, p.n, p.flip ? "" : " unflipped");
+    } else if (p.in < 0.5 * p.n && !model_said_.count(keys[k])) {
+      model_said_.insert(keys[k]);
+      said += Fmt("%srotor model: %s's sightings follow the sweep planes only %d of %d (best %+.1f ppm): the raw "
+                  "rotor test stays for it", said.empty() ? "" : "; ", keys[k].c_str(), p.in, p.n, p.ppm);
+    }
+  }
+  if (ppm.empty()) return false;
+  std::sort(ppm.begin(), ppm.end());
+  double d = ppm[ppm.size() / 2];
+  if (ppm.size() % 2 == 0) d = 0.5 * (d + ppm[ppm.size() / 2 - 1]);
+  if (known && std::fabs(d - was) < 0.5) return false;
+  drift_ = d;
+  said = Fmt("rotor drift: %+.1f ppm%s, from %s", d, known ? Fmt(" (was %+.1f)", was).c_str() : "", per.c_str()) +
+         (said.empty() ? "" : "; " + said);
+  return true;
 }
 
 static int SecondBest(const int *c, size_t K) {  // Solver::Score's: all but the best
@@ -1818,7 +2031,8 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   // of them, not ACQ_WIN's: a lit room gives 5-13 a minute within INLIER of a station, never enough in one minute (7 Nov)
   std::vector<double> tau;
   Rays rv;
-  if (rotor_veto_) { tau = Taus(keys); rv = Bright(GetRays(std::max(now - WIN, since_))); }
+  std::vector<M3> Rs;
+  if (rotor_veto_) { tau = Taus(keys); Rs = Rots(keys); rv = Bright(GetRays(std::max(now - WIN, since_))); }
   std::vector<X4> H;
   Hypotheses(t, S, H);
   std::vector<X4> cand;
@@ -1853,7 +2067,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
     size_t n2 = std::min<size_t>(5, o2.size());
     if (rotor_veto_) {  // Galaxy XR: by the stations' rotor evidence (RotorRank), on the last WIN s of sightings
       std::vector<double> zr;
-      RotorRank(top, S, Z, rv, tau, 1.5, zr);
+      RotorRank(top, S, Z, Rs, rv, tau, 1.5, zr);
       std::partial_sort(o2.begin(), o2.begin() + n2, o2.end(), [&](size_t a, size_t b) { return zr[a] > zr[b]; });
     } else {
       std::vector<int> all(t.size()), c2;
@@ -1867,7 +2081,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   auto support = [&](const X4 &x, double gate) {
     std::vector<int> c;
     Support(x, S, Z, t, gate, c);
-    if (rotor_veto_) RotorVeto(x, S, Z, tau, rv, true, c);
+    if (rotor_veto_) RotorVeto(x, S, Z, Rs, tau, rv, true, c);
     return Score(c);
   };
   // the candidates refit, the best taken: by support, or on a Galaxy XR by rotor evidence (RotorRank) among those with
@@ -1889,7 +2103,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   }
   if (rotor_veto_ && !fitted.empty()) {
     std::vector<double> zr;
-    RotorRank(fitted, S, Z, rv, tau, INLIER, zr);
+    RotorRank(fitted, S, Z, Rs, rv, tau, INLIER, zr);
     double bz = -1;
     for (size_t i = 0; i < fitted.size(); i++)
       if (fsup[i] > 0 && zr[i] > bz) { best = fitted[i]; bs = fsup[i]; bz = zr[i]; have = true; }
@@ -1900,6 +2114,7 @@ bool Solver::Acquire(double now, X4 &best, int &bs, int &tight) {
   if (!have) return false;
   CheckMirror(best, bs, S, Z, r, t, now);
   if (rotor_veto_) bs = support(best, INLIER);  // the mirror check's pick, vetoed alike
+  acq_plane_ = rotor_veto_ && PlaneStations(best, S, Z, Rs, tau, rv) >= 2;
   acq_x_ = best; has_acq_x_ = true;
   tight = support(best, TIGHT_DEG);
   return true;
@@ -1922,7 +2137,7 @@ int Solver::ThinnedScore(const X4 &x, double now) {
   if (!t.size()) return 0;
   std::vector<int> c;
   Support(x, S, Z, t, INLIER, c);
-  if (rotor_veto_) RotorVeto(x, S, Z, Taus(keys), Bright(GetRays(std::max(now - WIN, since_))), false, c);
+  if (rotor_veto_) RotorVeto(x, S, Z, Rots(keys), Taus(keys), Bright(GetRays(std::max(now - WIN, since_))), false, c);
   return Score(c);
 }
 
@@ -2645,7 +2860,9 @@ StepStat Solver::Step(double /*now*/) {
       bool far = has_x_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
       int fav = far ? BodyFavours(xa, x_, dn, dc, how) : 0;
       int need = far && !fav ? 2 * ACQ : ACQ;
-      bool enough = sa >= k * need || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2);
+      // the sweep planes' phase vouches for the stations (PlaneStations): half the support, not far off a current fit
+      bool enough = sa >= k * need || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2) ||
+                    (acq_plane_ && !far && sa >= k * ACQ / 2);
       // The height decides first: a candidate off the kept height doesn't take over without the worn devices for it
       // (lamps line up with a wrong alignment at any height; a head that sat still leaves the held fit's thinned
       // support a handful), and if a wrong fit got in, one at the kept height takes it back on plain support
@@ -2669,9 +2886,10 @@ StepStat Solver::Step(double /*now*/) {
                    xa[0] * kDeg, sa, cur, how.c_str()));
         }
       } else {
-        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s%s", xa[0] * kDeg,
+        log_(Fmt("acquired: yaw %+.2f deg t [%.3f %.3f %.3f] support %d (%d within %.1f deg, was %d)%s%s%s", xa[0] * kDeg,
                  xa[1], xa[2], xa[3], sa, tight, TIGHT_DEG, cur, acq_forced_ ? ", by the mirror check" : "",
-                 back ? ", back at the height the fit has held" : ""));
+                 back ? ", back at the height the fit has held" : "",
+                 acq_plane_ ? ", the sweep planes vouching" : ""));
         Reset(xa);
         since_ = brk_;
       }
@@ -3219,6 +3437,8 @@ void Sync::LoadState() {
   saved_cs_.clear();
   saved_timings_.clear();
   has_saved_ = false;
+  solver_.SetRotorDrift(NAN);  // this headset's, or none
+  saved_drift_ = NAN;
   seeded_ = true;
   std::string text;
   JVal d;
@@ -3235,6 +3455,12 @@ void Sync::LoadState() {
     for (auto &kv : t->o)
       if (kv.second.t == JVal::Num) timings_[kv.first] = kv.second.n;
   }
+  if (const JVal *rp = d.get("rotor_ppm"))  // the headset clock against the rotors (Solver::SetRotorDrift)
+    if (rp->t == JVal::Num && std::fabs(rp->n) < 100) {
+      solver_.SetRotorDrift(rp->n);
+      saved_drift_ = rp->n;
+      log_(Fmt("rotor drift %+.1f ppm (state.json): the rotor checks use the sweep planes", rp->n));
+    }
   seeded_ = quest_.empty();
 }
 
@@ -3251,7 +3477,11 @@ void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs, bool forc
     auto it = saved_timings_.find(kv.first);
     moved = moved || it == saved_timings_.end() || std::fabs(kv.second - it->second) > 0.0001;
   }
+  const double drift = solver_.rotor_drift();
+  moved = moved || std::isfinite(drift) != std::isfinite(saved_drift_) ||
+          (std::isfinite(drift) && std::fabs(drift - saved_drift_) > 0.05);
   if (!moved) return;  // under 0.01 deg / 1 mm / 0.1 ms: the file already has it
+  saved_drift_ = drift;
   saved_x_ = x;
   saved_cs_ = cs;
   saved_timings_ = timings_;
@@ -3267,7 +3497,9 @@ void Sync::SaveState(const X4 &x, const std::map<std::string, V3> &cs, bool forc
   s += Fmt("%s},\n \"x\": [%.9f, %.9f, %.9f, %.9f],\n \"pose_timing\": {", cs.empty() ? "" : "\n ", x[0], x[1], x[2], x[3]);
   first = true;
   for (auto &kv : timings_) { s += Fmt("%s\n  \"%s\": %.5f", first ? "" : ",", kv.first.c_str(), kv.second); first = false; }
-  s += Fmt("%s},\n \"saved\": \"%s\"\n}\n", timings_.empty() ? "" : "\n ", Now().c_str());
+  s += Fmt("%s}", timings_.empty() ? "" : "\n ");
+  if (std::isfinite(drift)) s += Fmt(",\n \"rotor_ppm\": %.2f", drift);
+  s += Fmt(",\n \"saved\": \"%s\"\n}\n", Now().c_str());
   WriteFileAtomic(state_path_, s);
 }
 
@@ -4263,6 +4495,18 @@ Transform Sync::Tick(double now) {
     if (now - last_check_ >= 60 && TwoFit(solver_.has_x(), st) && st.cond) {
       last_check_ = now;
       LevelCheck(now);
+    }
+    // the headset clock's drift against the rotors: until known every 30 s, then every 5 min to follow it
+    if (TwoFit(solver_.has_x(), st) && st.cond && st.has_med && st.med < 0.3 &&
+        now - last_drift_ >= (std::isfinite(solver_.rotor_drift()) ? 300 : 30)) {
+      last_drift_ = now;
+      std::string said;
+      bool set = solver_.LearnRotorDrift(now, said);
+      if (!said.empty()) log_(said);
+      if (set) {
+        Rec(now, "I rotor drift %.2f", solver_.rotor_drift());
+        SaveState(x, cs);
+      }
     }
   }
   // slew toward the solution, faster while the head turns or walks (kSlew*), jump if far (acquisition)

@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <random>
@@ -370,6 +371,14 @@ class Solver {
   // station k's sightings of the last WIN s, under the current alignment, follow its rotor (RotorPhase; only with
   // rotor_veto_: the frames' exact times)
   bool FollowsRotor(size_t k);
+  // The headset's clock against the base stations' rotors (ppm, NaN unknown): learned on a locked fit
+  // (LearnRotorDrift), kept in state.json. Known, the rotor checks use the sweep planes' phase (PlaneFit) instead of
+  // the raw times' coherence (RotorZ): 4 sightings tell a station from a lamp, where the raw times take 12 or more
+  void SetRotorDrift(double ppm) { drift_ = ppm; }
+  double rotor_drift() const { return drift_; }
+  // fits the sweep model to each station's sightings of the last WIN s under the current alignment; true when it set
+  // or moved the drift (said: what to log), or found a station the model doesn't hold for (said, false)
+  bool LearnRotorDrift(double now, std::string &said);
   bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
@@ -436,6 +445,10 @@ class Solver {
   MotionFn motion_;
   bool acq_forced_ = false;  // the last acquisition overruled the current fit by the mirror check
   bool acq_dim_ = false;     // ... was found on dim rays too (Bright): it needs twice the support
+  // ... has two stations or more whose sightings follow their sweep planes (PlaneStations): half the support will do
+  bool acq_plane_ = false;
+  int PlaneStations(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<M3> &Rs,
+                    const std::vector<double> &tau, const Rays &r) const;
   std::atomic<bool> starved_{false};  // the recent rays are under 5% bright, of 200 or more (see Bright)
   bool Starved(const Rays &r) const;
   // the Steam Frame: its cameras seldom see a base station's dot saturate (a recording: 95% of the sightings of the
@@ -448,10 +461,14 @@ class Solver {
   // acquisitions wrong, one with a single station sighting in the minute). Its exact frame times tell them apart: a
   // station's sightings keep the phase of its rotor, a lamp's don't
   std::atomic<bool> rotor_veto_{false};
+  std::atomic<double> drift_{std::numeric_limits<double>::quiet_NaN()};  // see SetRotorDrift
+  std::set<std::string> model_said_;  // stations LearnRotorDrift found the sweep model not to hold for, logged once
   std::vector<double> Taus(const std::vector<std::string> &keys) const;  // each station's rotor period, 0 unknown
+  std::vector<M3> Rots(const std::vector<std::string> &keys) const;      // each station's rotation (as S_ has it)
   // A station's support (c) goes unless its sightings under x, of r, follow its rotor (RotorPhase). strict (a new
   // candidate): too few to tell go too; else (the current fit) only the ones that don't follow
-  void RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<double> &tau,
+  void RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<M3> &Rs,
+                 const std::vector<double> &tau,
                  const Rays &r, bool strict, std::vector<int> &c) const;
   // the alignment from the lights r's rays meet at whose times follow a station's rotor (two or more): false without
   bool RotorPoints(const Rays &r, const std::vector<double> &tau, const std::vector<V3> &S, const std::vector<V3> &Z,
@@ -459,7 +476,8 @@ class Solver {
   // the stations x puts in r's rays hold them under the layout, refit as named (x updated): a reflection at one doesn't
   bool LayoutHolds(X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double now);
   // each hypothesis' rotor evidence, all stations' but the best's (out): acquisition's ranking on a Galaxy XR
-  void RotorRank(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r,
+  void RotorRank(const std::vector<X4> &H, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<M3> &Rs,
+                 const Rays &r,
                  const std::vector<double> &tau, double gate, std::vector<double> &out) const;
   int amb_state_ = 0;        // the mirror check's last outcome, logged when it changes
   double kept_said_ = -1e18;  // the last log of a far acquisition the worn devices turned down
@@ -679,6 +697,7 @@ class Sync {
   double left_since_ = 0, bad_since_ = -1, tilt_since_ = -1;
   void LevelCheck(double now);
   double last_check_ = 0, check_said_ = -1e18;
+  double last_drift_ = -1e18, saved_drift_ = std::numeric_limits<double>::quiet_NaN();  // Solver::LearnRotorDrift
   // automatic frames of two stations: the other station's place (StationsFile::place) from the cameras
   bool TwoStations(const std::map<std::string, std::pair<V3, M3>> &raw, std::string &other) const;
   void PlaceStep(const std::map<std::string, std::pair<V3, M3>> &raw, double now);
