@@ -142,6 +142,7 @@ int main(int argc, char **argv) {
   printf("replayed %ld lines (%.0f s of log) in %.1f s; expo %.1f ms%s\n", nl, tnow - t0, secs, st.expo * 1000,
          st.timing_learned ? " (learned)" : "");
   printf("%s\n", Sync::Describe({}, sync.spots()).c_str());
+  printf("steady lights' rays left out: %lld\n", sync.steady_rays());
   if (out) fclose(out);
   if (xf) fclose(xf);
   if (g_ray_dump) {

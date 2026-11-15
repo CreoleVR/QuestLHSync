@@ -67,6 +67,9 @@ constexpr int kLampPx = 20;             // blobs this big are steady lights (the
 constexpr double kPoseWait = 0.1;       // s
 constexpr double kFrozen = 10.0;        // s: SteamVR's headset this still while the cameras see the room move
 constexpr double kKeep = 600.0;         // s of rays kept
+// steady lights (Solver::MarkSteady): the same place within kSteadyDeg in three frames of kSteadySpan s, no two of them
+// within kSteadyTurn of whole turns of any rotor apart; held kSteadyHold s past the last such three
+constexpr double kSteadyDeg = 0.7, kSteadySpan = 0.25, kSteadyHold = 1.0, kSteadyTurn = 0.025;
 constexpr double kMoved = 0.25;         // m: SteamVR has a measured station this far off: it was moved
 constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much against the reference
 // an automatic frame's layout fit: a station kMoved off against the others, no fit within kMoved, or the frame tilted
@@ -377,6 +380,7 @@ class Solver {
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
   void SetRotorVeto(bool on) { rotor_veto_ = on; }  // see rotor_veto_
+  long long steady_rays() const { return steady_n_; }  // the rays left out as steady lights' so far (MarkSteady)
   // station k's sightings of the last WIN s, under the current alignment, follow its rotor (RotorPhase; only with
   // rotor_veto_: the frames' exact times)
   bool FollowsRotor(size_t k);
@@ -388,6 +392,7 @@ class Solver {
   // fits the sweep model to each station's sightings of the last WIN s under the current alignment; true when it set
   // or moved the drift (said: what to log), or found a station the model doesn't hold for (said, false)
   bool LearnRotorDrift(double now, std::string &said);
+  std::string SteadyAt(double now);  // the stations a steady light sits at, to log (once each)
   bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
@@ -435,6 +440,16 @@ class Solver {
   std::vector<V3> ro_, rd_;
   std::vector<int> rc_;
   std::vector<char> rb_;
+  // 1: a steady light's ray (MarkSteady). They stay in the store for the next frames' sake and never leave it (GetRays)
+  std::vector<char> rs_;
+  struct Steady { int cam; V3 d; double g; };  // a steady light: the camera, where (Quest space), its last three in a row
+  std::vector<Steady> steady_;
+  std::atomic<long long> steady_n_{0};  // bright rays marked so far
+  bool NoRotor(double d1, double d2) const;
+  size_t steady_done_ = 0;  // the rays before it have been looked at (MarkPending)
+  void MarkPending();
+  std::set<std::string> steady_said_;  // the stations SteadyAt logged
+  void MarkSteady(size_t n);
   std::map<std::string, std::pair<V3, M3>> S_;
   std::map<std::string, int> ch_;
   std::map<std::string, V3> fix_;
@@ -580,6 +595,7 @@ class Sync {
   Transform Tick(double now);
   bool WillStep(double now) const { return now - last_step_ >= 1.0; }
   void ForceExpo(double e) { expo_ = e; }
+  long long steady_rays() const { return solver_.steady_rays(); }  // Solver::MarkSteady
   // commands
   // a reference frame to level by gravity (gravity.h): SteamVR's frame -> the reference frame before gravity's tilt
   // (rotation), the frame's turn on top of that now, and which reference frame (key). False when the cameras level it
@@ -602,8 +618,15 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0; };
-  Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
+  // steady: of the bright spots passed on, the steady lights' (Solver::MarkSteady), taken off used
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, steady = 0; };
+  Spots spots() {
+    std::lock_guard<std::mutex> g(net_);
+    Spots s = spots_;
+    s.steady = (long)std::min<long long>(solver_.steady_rays(), s.used);
+    s.used -= s.steady;
+    return s;
+  }
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
     std::vector<V3> Z;
@@ -710,6 +733,7 @@ class Sync {
   double left_since_ = 0, bad_since_ = -1, tilt_since_ = -1;
   void LevelCheck(double now);
   double last_check_ = 0, check_said_ = -1e18;
+  double last_steady_ = -1e18;  // Solver::SteadyAt
   double last_drift_ = -1e18, saved_drift_ = std::numeric_limits<double>::quiet_NaN();  // Solver::LearnRotorDrift
   // automatic frames of two stations: the other station's place (StationsFile::place) from the cameras
   bool TwoStations(const std::map<std::string, std::pair<V3, M3>> &raw, std::string &other) const;

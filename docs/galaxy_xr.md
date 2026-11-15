@@ -44,6 +44,35 @@ Replays: a lit session that didn't lock now locks at 63 s, 0.5–1.2 cm off; one
 station only stays unlocked (it locked 0.6–0.9 m off before); the others lock as before. Background:
 [galaxy_xr_lamp_filter.md](galaxy_xr_lamp_filter.md).
 
+## Steady lights
+
+A light one camera sees at one place (0.7 deg) in three short frames running is no base station (`Solver::MarkSteady`,
+`NoRotor`): a station's two sweep planes cross a camera at two phases of its rotor's turn, so of three sightings two are
+of the same plane, a whole number of turns apart, and from one short frame to the next (66.69 ms) the rotors go on by
+0.338-0.359 of a turn (channels 1-3; no channel comes within 9 deg of a whole turn in one frame or two). Such a light's
+rays are left out of everything (they stay in the solver's store for the next frames' sake and never leave it), and the
+light is held for 1 s past its last three in a row, so a frame it was missed in lets nothing through. The frames are
+taken as they came: the frame grid's period can't be relied on here (15 Nov live: 33.345 ms learned, from the frames
+after the frame pattern came back on).
+
+15 Nov, daytime, an IR floodlight next to LHB-769877C9 (8 px in the cameras, 5-14 cm): a 45 px blob in 91-97% of three
+cameras' short frames, 10 900 rays in 260 s within 0.5 deg of where the right alignment put the station. The station's
+own sweeps merged with the blob and showed only as it growing (by 6 px or more 137 times, coherent with channel 1's
+rotor at -27 ppm). The running fit took the station to the light, and after *Force recalibrate* the right alignment
+came up as a candidate again and again and was thrown out each time, as the rays at the station's place had no rotor
+phase (`RotorVeto`): nothing was acquired for hours.
+
+Replays: of that recording's 55 549 bright spots 43 124 are a steady light's; seeded with the day before's station
+places, the station gets 1-11 rays of the light where it got 10 416, and the fit follows the two stations still seen.
+The other recordings acquire as before or sooner (7 Nov: 51 s for 63, 29 for 72, 29 for 23; 14 Nov: 49 for 68, 33 for
+36), as far off the mounted tracker as before. In the log: `acquiring, ...: N a steady light's, lit frame after frame
+as no base station is`, and once per station `LHB-...: a steady light X deg from its place ...: left out`.
+
+What it can't do: a station whose sweeps merge with a steady light in the cameras isn't seen at all while the light
+is on, and with one station left in view nothing can be acquired from scratch. The blob's growth is the station's
+sweep and could be used (not done: no tracker on the mount in that recording to check it against). Keep such a light
+off, or well away from the station (15 Nov's would have needed 30 cm or more at 4 m).
+
 ## The lighthouse scale
 
 Galaxy XR frames of three or more base stations: lighthouse devices are placed by `scale * q * p + t`. Every minute

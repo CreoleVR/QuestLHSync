@@ -968,7 +968,10 @@ void Solver::Reset(const X4 &x) {
 
 void Solver::Clear() {
   std::lock_guard<std::mutex> g(m_);
-  rt_.clear(); rg_.clear(); ro_.clear(); rd_.clear(); rc_.clear(); rb_.clear();
+  rt_.clear(); rg_.clear(); ro_.clear(); rd_.clear(); rc_.clear(); rb_.clear(); rs_.clear();
+  steady_.clear();
+  steady_said_.clear();
+  steady_done_ = 0;
   frames_.clear();
   has_x_ = has_anchor_ = has_acq_x_ = false;
   x_ = anchor_ = acq_x_ = X4{};
@@ -987,19 +990,138 @@ void Solver::Clear() {
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright) {
   std::lock_guard<std::mutex> g(m_);
   rt_.push_back(t); ro_.push_back(o); rd_.push_back(d); rg_.push_back(gt); rc_.push_back(cam); rb_.push_back(bright);
+  rs_.push_back(0);
+  MarkPending();
+}
+
+// The rays not yet looked at for steady lights (MarkSteady), once every station's channel is known: the cameras' spots
+// come seconds before SteamVR's base stations do, and a lamp's rays of those seconds stayed for the five minutes after
+void Solver::MarkPending() {
+  if (!rotor_veto_ || S_.empty()) return;
+  for (auto &s : S_) {
+    auto it = ch_.find(s.first);
+    if (it == ch_.end() || !(RotorPeriod(it->second) > 0)) return;
+  }
+  while (steady_done_ < rt_.size()) MarkSteady(steady_done_++);
+}
+
+// True if no base station can have made three sightings d1 and d2 s apart (m_ held). A station's two sweep planes
+// cross a camera at two phases of its rotor's turn, so of three sightings two are of the same plane, a whole number of
+// turns apart to within what an exposure reaches (2.6 deg of rotor; kSteadyTurn is 9). From one short frame to the
+// next the turn goes on by 0.338, 0.345, 0.359 of itself for channels 1-3 (66.69 ms), so no three frames running hold
+// such a pair, while a frame, the next and the third after do (1.014). Every station's channel has to be known for it,
+// and the frame times exact (rotor_veto_)
+bool Solver::NoRotor(double d1, double d2) const {
+  if (!rotor_veto_ || S_.empty()) return false;
+  for (auto &s : S_) {
+    auto it = ch_.find(s.first);
+    double tau = it == ch_.end() ? 0 : RotorPeriod(it->second);
+    if (!(tau > 0)) return false;
+    for (double d : {d1, d2, d1 + d2}) {
+      double f = d / tau;
+      f -= std::floor(f);
+      if (std::min(f, 1 - f) < kSteadyTurn) return false;
+    }
+  }
+  return true;
+}
+
+// Ray n, just stored, is a steady light's if its camera saw a light at its place (kSteadyDeg, Quest space) in two
+// frames of the kSteadySpan s before that no rotor has it lit in along with this one (NoRotor): a lamp's three short
+// frames running. The three are marked, and the light kept kSteadyHold s past its last such three: until then every
+// ray at its place is its own, or a frame it was missed in would let the next two through. Marked rays stay in the
+// store for the next frames' sake and never leave it (GetRays). The frames are taken as they came, not by the frame
+// period: the grid had learned half of it that day (33.345 ms, from the frames after the pattern came back on).
+// 15 Nov 2026, an IR floodlight 1.4 deg (8 px) beside a station: a 45 px blob in 91-97% of three cameras' short frames,
+// 10 900 rays in 260 s within 0.5 deg of where the right alignment put the station, whose own sweeps showed only as the
+// blob growing by 6 px or more (137 times, in the rotor's phase). The rotor test threw the station out for the rays
+// there (and the right alignment with it, every time it came up: nothing was acquired for hours), and before that the
+// running fit had taken the station to the light
+void Solver::MarkSteady(size_t n) {
+  const double g = rg_[n];
+  if (!std::isfinite(g) || !rotor_veto_) return;
+  const int cam = rc_[n];
+  const V3 d = rd_[n];
+  const double cg = std::cos(kSteadyDeg / kDeg);
+  size_t ix[8];  // the light in the frames before, the latest first
+  double dg[8];
+  int m = 0;
+  for (size_t i = n; i-- > 0 && m < 8;) {
+    double e = g - rg_[i];
+    if (e > kSteadySpan + 0.1 || e < -1) break;  // a frame's rays come one camera after the other; < 0: another clock
+    if (rc_[i] != cam || !(e > 1e-4 && e <= kSteadySpan) || !(dot(rd_[i], d) >= cg)) continue;
+    if (m && std::fabs(e - dg[m - 1]) < 1e-4) continue;  // the same frame's
+    ix[m] = i; dg[m++] = e;
+  }
+  for (size_t i = 0; i < steady_.size();) {  // the lights not lit so for kSteadyHold are forgotten
+    if (std::fabs(g - steady_[i].g) <= kSteadyHold) i++;
+    else { steady_[i] = steady_.back(); steady_.pop_back(); }
+  }
+  size_t at = 0;
+  while (at < steady_.size() && !(steady_[at].cam == cam && dot(steady_[at].d, d) >= cg)) at++;
+  auto mark = [&](size_t i) { if (!rs_[i]) { rs_[i] = 1; steady_n_ += rb_[i] != 0; } };
+  for (int a = 0; a < m; a++)
+    for (int b = a + 1; b < m; b++) {
+      if (!NoRotor(dg[a], dg[b] - dg[a])) continue;
+      mark(n); mark(ix[a]); mark(ix[b]);
+      if (at == steady_.size()) steady_.push_back({cam, d, g});
+      else steady_[at] = {cam, d, g};
+      return;
+    }
+  if (at < steady_.size()) mark(n);
+}
+
+// The stations a steady light sits at: kMany or more of its rays in the last minute within kNear of where the alignment
+// puts the station. What to log, each station once. The light's rays are left out wherever it is; at a station it costs
+// the station's own sightings too if the two merge in the cameras (15 Nov: 8 px apart, a 45 px blob)
+std::string Solver::SteadyAt(double now) {
+  constexpr double kNear = 2.0;
+  constexpr size_t kMany = 150;
+  std::string said;
+  if (!rotor_veto_ || !has_x_) return said;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z, P, Zq;
+  Stations(keys, S, Z);
+  Predict(x_, S, Z, P, Zq);
+  std::vector<std::vector<double>> ang(S.size());
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (size_t n = std::lower_bound(rt_.begin(), rt_.end(), now - 60) - rt_.begin(); n < rt_.size(); n++) {
+      if (!rs_[n]) continue;
+      int k;
+      double a;
+      Nearest(P, Zq, ro_[n], rd_[n], k, a);
+      if (a < kNear) ang[k].push_back(a);
+    }
+  }
+  for (size_t k = 0; k < S.size(); k++) {
+    if (ang[k].size() < kMany || steady_said_.count(keys[k])) continue;
+    steady_said_.insert(keys[k]);
+    std::nth_element(ang[k].begin(), ang[k].begin() + ang[k].size() / 2, ang[k].end());
+    said += Fmt("%s%s: a steady light %.1f deg from its place (%d sightings in the last minute, lit frame after frame as "
+                "no base station is): left out. If the station's sweeps merge with it in the cameras, the station "
+                "isn't seen: keep the light off, or well away from the station",
+                said.empty() ? "" : "; ", keys[k].c_str(), ang[k][ang[k].size() / 2], (int)ang[k].size());
+  }
+  return said;
 }
 
 void Solver::Replace(double from, const std::vector<double> &T, const std::vector<V3> &O, const std::vector<V3> &D,
                      const std::vector<double> &G, const std::vector<int> &C, const std::vector<char> &B) {
   std::lock_guard<std::mutex> g(m_);
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), from) - rt_.begin();
-  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j); rb_.resize(j);
+  for (size_t n = j; n < rs_.size(); n++) steady_n_ -= rs_[n] && rb_[n];  // marked again below
+  steady_done_ = std::min(steady_done_, j);
+  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j); rb_.resize(j); rs_.resize(j);
+  steady_.clear();
   rt_.insert(rt_.end(), T.begin(), T.end());
   ro_.insert(ro_.end(), O.begin(), O.end());
   rd_.insert(rd_.end(), D.begin(), D.end());
   rg_.insert(rg_.end(), G.begin(), G.end());
   rc_.insert(rc_.end(), C.begin(), C.end());
   rb_.insert(rb_.end(), B.begin(), B.end());
+  rs_.resize(rt_.size(), 0);
+  MarkPending();
 }
 
 void Solver::SetChannel(const std::string &serial, int channel) {
@@ -1037,9 +1159,20 @@ Solver::Rays Solver::GetRays(double t0) {
     rg_.erase(rg_.begin(), rg_.begin() + j);
     rc_.erase(rc_.begin(), rc_.begin() + j);
     rb_.erase(rb_.begin(), rb_.begin() + j);
+    rs_.erase(rs_.begin(), rs_.begin() + j);
+    steady_done_ -= std::min(steady_done_, j);
   }
+  MarkPending();
   Rays r;
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), t0) - rt_.begin();
+  if (std::find(rs_.begin() + j, rs_.end(), 1) != rs_.end()) {  // without the steady lights' rays
+    for (size_t n = j; n < rt_.size(); n++) {
+      if (rs_[n]) continue;
+      r.T.push_back(rt_[n]); r.O.push_back(ro_[n]); r.D.push_back(rd_[n]); r.G.push_back(rg_[n]);
+      r.C.push_back(rc_[n]); r.B.push_back(rb_[n]);
+    }
+    return r;
+  }
   r.T.assign(rt_.begin() + j, rt_.end());
   r.O.assign(ro_.begin() + j, ro_.end());
   r.D.assign(rd_.begin() + j, rd_.end());
@@ -3919,6 +4052,7 @@ std::string Sync::Describe(const Spots &a, const Spots &b) {
   part(b.still - a.still, "while the headset was still");
   part(b.fast - a.fast, "while it turned fast");
   part(b.big - a.big, "lamps or windows");
+  part(b.steady - a.steady, "a steady light's, lit frame after frame as no base station is");
   part(b.other - a.other, "without a headset pose");
   part(b.dim - a.dim, "dim, kept for a room too light for the dots to saturate");
   return Fmt("%ld bright spots, %ld used", n, b.used - a.used) + (why.empty() ? "" : " (" + why + ")");
@@ -4516,6 +4650,11 @@ Transform Sync::Tick(double now) {
     if (now - last_check_ >= 60 && TwoFit(solver_.has_x(), st) && st.cond) {
       last_check_ = now;
       LevelCheck(now);
+    }
+    if (solver_.has_x() && now - last_steady_ >= 30) {  // a steady light at a station's place: said once
+      last_steady_ = now;
+      std::string said = solver_.SteadyAt(now);
+      if (!said.empty()) log_(said);
     }
     // the headset clock's drift against the rotors: until known every 30 s, then every 5 min to follow it
     if (TwoFit(solver_.has_x(), st) && st.cond && st.has_med && st.med < 0.3 &&
