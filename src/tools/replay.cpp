@@ -129,7 +129,8 @@ int main(int argc, char **argv) {
       next_print += 10;
       auto st = sync.GetStatus(pc);
       std::string sts;
-      for (auto &e : st.st) sts += " " + e.serial + ":" + std::to_string(e.support);
+      for (auto &e : st.st)  // sightings under the alignment / by its rotor whatever the alignment
+        sts += " " + e.serial + ":" + std::to_string(e.support) + "/" + std::to_string(e.rotor) + (e.steady ? "*" : "");
       if (st.has_x)
         printf("%6.0fs yaw %+.3f t [%.1f %.1f %.1f] cm n %d med %.3f%s%s expo %.1f ms\n", pc - t0, st.x[0] * kDeg, st.x[1] * 100,
                st.x[2] * 100, st.x[3] * 100, st.n, st.med, sts.c_str(), st.cond ? " cond" : "", st.expo * 1000);

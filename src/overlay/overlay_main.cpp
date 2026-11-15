@@ -1,7 +1,8 @@
 // QuestLHSync.exe: the SteamVR dashboard page. Started by the driver each session, exits with SteamVR.
 // Reads the driver's status from the shared memory (qlhs_status.h), draws it with GDI at 2x and downsamples
 // (anti-aliased shapes and text), and sends the buttons back as commands.
-//   QuestLHSync.exe --preview out.png [locked|acquiring|still|frozen|searching|nohmd]   renders a sample page, no VR
+//   QuestLHSync.exe --preview out.png [locked|acquiring|still|frozen|searching|nohmd|onestation|twostations|steady]
+//                                                                           renders a sample page, no VR
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -163,13 +164,28 @@ static void StateText(const QlhsStatus &s, bool stale, std::wstring &title, std:
       sub = L"SteamVR shows base stations only while a lighthouse device (tracker, controller) is on. Turn one on.";
       color = col::amber;
       break;
-    case QLHS_ACQUIRING:
+    case QLHS_ACQUIRING: {
       title = L"Finding the base stations";
-      sub = s.head_still == 2 ? L"SteamVR isn't getting your head's motion. Is SteamVR's view in the headset, not a desktop view?"
-            : s.head_still   ? L"The headset isn't moving, so its camera frames wait. Put it on and look around the room."
-                             : L"Look around the room so the cameras catch both base stations' flashes.";
+      // the stations the cameras see by their rotors, whatever the alignment (where the headset's frame times tell)
+      int known = 0, seen = 0;
+      const QlhsStation *one = nullptr;
+      for (int i = 0; i < std::min(s.nst, 8); i++) {
+        known += s.st[i].rotor >= 0;
+        if (s.st[i].rotor > 0) { seen++; one = &s.st[i]; }
+      }
+      const wchar_t *lights = s.steady_lights ? L" One right beside a steady light can't be seen." : L"";
+      if (s.head_still == 2) sub = L"SteamVR isn't getting your head's motion. Is SteamVR's view in the headset, not a desktop view?";
+      else if (s.head_still) sub = L"The headset isn't moving, so its camera frames wait. Put it on and look around the room.";
+      else if (known && seen == 1)
+        sub = L"The cameras see only " + Wide(one->serial) + L". Two base stations have to be in view." + lights;
+      else if (known && seen >= 2)
+        sub = F(L"The cameras see %d base stations. Keep them in view and move your head a little, so they are seen from a few places.", seen);
+      else if (known)
+        sub = std::wstring(L"No base station's flashes seen yet. Look around the room toward them.") + lights;
+      else sub = L"Look around the room so the cameras catch both base stations' flashes.";
       color = col::amber;
       break;
+    }
     case QLHS_LOCKED:
       title = s.paused ? L"Locked, corrections paused" : L"Locked";
       sub = s.paused ? L"Lighthouse devices stay where they are until you resume."
@@ -246,15 +262,23 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
   for (int i = 0; i < std::min(s.nst, 4); i++) {
     const QlhsStation &st = s.st[i];
     int y = top + 50 + i * 60;
-    bool fresh = st.last_seen >= 0 && st.last_seen < 15;
-    p.Dot(x2 + 30, y + 15, 6, fresh ? col::green : st.last_seen >= 0 ? col::amber : col::faint);
+    // without an alignment no sighting is a station's by its place: then what its rotor names, if the headset can tell
+    bool by_rotor = !has && st.rotor >= 0;
+    double seen = by_rotor ? st.rotor_seen : st.last_seen;
+    bool fresh = seen >= 0 && seen < 15;
+    p.Dot(x2 + 30, y + 15, 6, fresh ? col::green : seen >= 0 ? col::amber : col::faint);
     p.Text(x2 + 46, y, Wide(st.serial), body, col::text, 0, cw - 150);
     std::wstring role = st.anchor ? L"anchor" : st.measured ? L"measured" : L"";
     if (!role.empty()) p.Text(x2 + cw - 22, y + 3, role, small, col::blue, 2);
-    std::wstring info = L"seen " + Ago(st.last_seen);
-    if (has) info += F(L"  ·  %d sightings", st.support);
+    std::wstring info;
+    if (by_rotor) info = st.rotor > 0 ? L"seen " + Ago(st.rotor_seen) + F(L"  ·  %d flashes in 5 min", st.rotor) : L"not seen";
+    else {
+      info = L"seen " + Ago(st.last_seen);
+      if (has) info += F(L"  ·  %d sightings", st.support);
+    }
     if (st.dist > 0) info += F(L"  ·  %.1f m", st.dist);
-    p.Text(x2 + 46, y + 28, info, small, col::dim, 0, cw - 68);
+    if (st.steady) info = L"steady light at its place" + (has ? F(L"  ·  %d sightings", st.support) : std::wstring());
+    p.Text(x2 + 46, y + 28, info, small, st.steady ? col::amber : col::dim, 0, cw - 68);
   }
 
   // alignment card
@@ -417,6 +441,7 @@ static QlhsStatus Sample(const char *kind) {
   s.st[0].anchor = 1; s.st[0].support = 432; s.st[0].last_seen = 0.4; s.st[0].dist = 3.4;
   strcpy(s.st[1].serial, "LHB-5E6F7A8B");
   s.st[1].measured = 1; s.st[1].support = 337; s.st[1].last_seen = 6.2; s.st[1].dist = 2.1;
+  for (auto &e : s.st) e.rotor = -1;  // a Quest: its frame times don't tell
   s.state = QLHS_LOCKED;
   s.locked = 1; s.cond = 1;
   s.yaw_deg = -5.76; s.t[0] = -1.071; s.t[1] = 2.124; s.t[2] = 2.432;
@@ -430,6 +455,28 @@ static QlhsStatus Sample(const char *kind) {
   if (!strcmp(kind, "still")) { s.head_still = 1; s.sight_rate = 0; s.spot_rate = 12; kind = "acquiring"; }
   if (!strcmp(kind, "frozen")) { s.head_still = 2; s.sight_rate = 0; s.spot_rate = 12; kind = "acquiring"; }
   if (!strcmp(kind, "acquiring")) { s.state = QLHS_ACQUIRING; s.locked = 0; s.med_deg = -1; s.nfit = 0; s.yaw_deg = 0; s.locked_for = -1; s.st[1].last_seen = -1; s.st[1].support = 0; s.expo_learned = 0; s.expo_ms = 15; }
+  // a Galaxy XR after Force recalibrate: one station seen by its rotor, one seldom, one behind a steady light
+  bool one = !strcmp(kind, "onestation"), two = !strcmp(kind, "twostations"), steady = !strcmp(kind, "steady");
+  if (one || two || steady) {
+    strcpy(s.headset, "Galaxy XR");
+    s.nst = 3;
+    strcpy(s.st[0].serial, "LHB-ED72E88C");
+    strcpy(s.st[1].serial, "LHB-769877C9");
+    strcpy(s.st[2].serial, "LHB-383A2F82");
+    s.st[1].measured = 0;
+    s.st[0].rotor = 98; s.st[0].rotor_seen = 0.8;
+    s.st[1].rotor = 0; s.st[1].rotor_seen = -1;
+    s.st[2].rotor = two ? 31 : 0; s.st[2].rotor_seen = two ? 22 : -1;
+    s.steady_lights = 2;
+    if (steady) {  // seeded from the last session's places, a steady light at one
+      s.st[0].support = 212; s.st[0].last_seen = 0.6;
+      s.st[1].support = 2; s.st[1].last_seen = 140; s.st[1].steady = 1; s.st[1].dist = 4.0;
+      s.st[2].support = 20; s.st[2].last_seen = 31; s.st[2].dist = 3.7;
+    } else {
+      s.state = QLHS_ACQUIRING; s.locked = 0; s.med_deg = -1; s.nfit = 0; s.yaw_deg = 0; s.locked_for = -1;
+      for (int i = 0; i < 3; i++) { s.st[i].last_seen = -1; s.st[i].support = 0; s.st[i].dist = 0; }
+    }
+  }
   if (!strcmp(kind, "searching")) { s.state = QLHS_SEARCHING; s.headset_addr[0] = 0; s.cam_fps = 0; s.rtt_ms = 0; s.locked = 0; s.nfit = 0; s.med_deg = -1; s.yaw_deg = 0; s.locked_for = -1; }
   if (!strcmp(kind, "nohmd")) { s.state = QLHS_NO_HMD; strcpy(s.hmd, "PlayStation VR2"); }
   if (!strcmp(kind, "paused")) s.paused = 1;

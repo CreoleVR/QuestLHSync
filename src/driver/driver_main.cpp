@@ -661,7 +661,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       t->st[i].measured = e.measured;
       t->st[i].last_seen = e.last_seen;
       t->st[i].dist = e.dist;
+      t->st[i].rotor = e.rotor;
+      t->st[i].rotor_seen = e.rotor_seen;
+      t->st[i].steady = e.steady;
     }
+    t->steady_lights = s.steady_lights;
     t->locked = s.locked;
     t->cond = s.cond;
     t->yaw_deg = s.has_x ? s.x[0] * kDeg : 0;

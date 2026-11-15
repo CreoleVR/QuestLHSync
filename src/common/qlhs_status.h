@@ -7,7 +7,7 @@
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
-#define QLHS_VERSION 2
+#define QLHS_VERSION 3
 #define QLHS_RELEASE "1.26"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
@@ -39,9 +39,13 @@ struct QlhsStation {
   int32_t support;    // sightings that fit it now
   int32_t anchor;     // 1: the reference frame's anchor station
   int32_t measured;   // 1: sits where stations.json measured it
-  int32_t pad;
+  // sightings of the last 5 min its rotor names, whatever the alignment (Solver::RotorSeenStep); < 0: not known (the
+  // headset's frame times aren't exact)
+  int32_t rotor;
   double last_seen;   // s since the cameras last saw it, < 0: not yet
   double dist;        // m from the headset
+  double rotor_seen;  // s since the last of rotor, < 0: none
+  int32_t steady, pad;  // 1: a steady light sits at its place (alignment known)
 };
 
 struct QlhsStatus {
@@ -75,5 +79,6 @@ struct QlhsStatus {
   char log[8][120];
   volatile int32_t cmd_seq;  // overlay -> driver
   int32_t cmd;
+  int32_t steady_lights, pad3;  // steady lights in view now (Solver::MarkSteady)
 };
 #pragma pack(pop)

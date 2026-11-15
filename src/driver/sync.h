@@ -393,6 +393,12 @@ class Solver {
   // or moved the drift (said: what to log), or found a station the model doesn't hold for (said, false)
   bool LearnRotorDrift(double now, std::string &said);
   std::string SteadyAt(double now);  // the stations a steady light sits at, to log (once each)
+  // what the cameras see of each station whatever the alignment, for the dashboard and the log
+  void RotorSeenStep(double now);
+  // n: station serial's sightings of the last WIN s that its rotor names (-1: not known), last: the latest one's time,
+  // steady: a steady light at its place (SteadyAt). Returns the steady lights in view
+  int RotorSeen(const std::string &serial, int &n, double &last, bool &steady) const;
+  std::string SeenText() const;  // the same for the log, empty if not known
   bool starved() const { return starved_; }
   int resets() const { return resets_; }
   X4 x() const { return x_; }
@@ -449,6 +455,10 @@ class Solver {
   size_t steady_done_ = 0;  // the rays before it have been looked at (MarkPending)
   void MarkPending();
   std::set<std::string> steady_said_;  // the stations SteadyAt logged
+  std::set<std::string> steady_at_;    // ... has a steady light at now (m_)
+  std::map<std::string, std::pair<int, double>> rotor_seen_;  // RotorSeenStep: sightings, the latest one's time (m_)
+  bool rotor_seen_ok_ = false;
+  int steady_lights_ = 0;
   void MarkSteady(size_t n);
   std::map<std::string, std::pair<V3, M3>> S_;
   std::map<std::string, int> ch_;
@@ -613,8 +623,15 @@ class Sync {
     double med = -1, expo = 0, rtt = 0, cam_fps = 0, spot_rate = 0, sight_rate = 0, lag_cm = 0, locked_for = -1;
     int head_still = 0;  // 1: still for 2 s; 2: still for kFrozen s while the cameras see the room move
     int n = 0, nstations = 0;
-    struct St { std::string serial; int support = 0; bool anchor = false, measured = false; double last_seen = -1, dist = 0; };
+    // rotor, rotor_seen, steady: see QlhsStation
+    struct St {
+      std::string serial;
+      int support = 0, rotor = -1;
+      bool anchor = false, measured = false, steady = false;
+      double last_seen = -1, dist = 0, rotor_seen = -1;
+    };
     std::vector<St> st;
+    int steady_lights = 0;
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
@@ -734,6 +751,7 @@ class Sync {
   void LevelCheck(double now);
   double last_check_ = 0, check_said_ = -1e18;
   double last_steady_ = -1e18;  // Solver::SteadyAt
+  double last_seen_step_ = -1e18;  // Solver::RotorSeenStep
   double last_drift_ = -1e18, saved_drift_ = std::numeric_limits<double>::quiet_NaN();  // Solver::LearnRotorDrift
   // automatic frames of two stations: the other station's place (StationsFile::place) from the cameras
   bool TwoStations(const std::map<std::string, std::pair<V3, M3>> &raw, std::string &other) const;

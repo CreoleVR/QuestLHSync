@@ -1078,7 +1078,11 @@ std::string Solver::SteadyAt(double now) {
   constexpr double kNear = 2.0;
   constexpr size_t kMany = 150;
   std::string said;
-  if (!rotor_veto_ || !has_x_) return said;
+  if (!rotor_veto_ || !has_x_) {
+    std::lock_guard<std::mutex> g(m_);
+    steady_at_.clear();
+    return said;
+  }
   std::vector<std::string> keys;
   std::vector<V3> S, Z, P, Zq;
   Stations(keys, S, Z);
@@ -1093,6 +1097,9 @@ std::string Solver::SteadyAt(double now) {
       Nearest(P, Zq, ro_[n], rd_[n], k, a);
       if (a < kNear) ang[k].push_back(a);
     }
+    steady_at_.clear();
+    for (size_t k = 0; k < S.size(); k++)
+      if (ang[k].size() >= kMany) steady_at_.insert(keys[k]);
   }
   for (size_t k = 0; k < S.size(); k++) {
     if (ang[k].size() < kMany || steady_said_.count(keys[k])) continue;
@@ -2017,6 +2024,140 @@ std::vector<double> Solver::Taus(const std::vector<std::string> &keys) const {
     if (it != ch_.end()) tau[k] = RotorPeriod(it->second);
   }
   return tau;
+}
+
+// n R^2 of sighting times g at three times the rotor's frequency, as RotorZ's at the rotor's own, and 0 unless the
+// sightings leave a third of the turn empty. A base's two sweep planes cross a camera a third of a turn apart, less or
+// more by twice its elevation from the base, so at the third harmonic they fall together, where the rotor's own
+// frequency holds them at a coherence of 0.5 (15 Nov, two stations from a seat: 0.49 and 0.51 for 1.00 and 1.00). The
+// short frames come nearly a third of a turn apart too (0.338 of one for channel 1), so a light that blinks in step
+// with the frames is as coherent there, on three phases a third apart (15 Nov: lights below the head, the
+// controllers' LEDs by the look of it, and ceiling lamps: 15-44 rays, 10-17 here), where a station's two planes leave
+// the third empty: of the three thirds about the mean phase the emptiest may hold kThirdStray of the sightings
+static double ThirdZ(const std::vector<double> &g, double tau) {
+  constexpr double kRotorPpm = 100e-6, kThirdStray = 0.08;
+  if (g.size() < 2 || !(tau > 0)) return 0;
+  auto mm = std::minmax_element(g.begin(), g.end());
+  double g0 = *mm.first, span = *mm.second - g0, f0 = 1 / tau, apart = std::max(1.0, 2 * kRotorPpm * 3 * f0 * span);
+  int steps = (int)std::ceil(2 * apart);  // each way
+  double R = 0, bf = f0, th = 0;
+  for (int i = -steps; i <= steps; i++) {
+    double f = f0 * (1 + kRotorPpm * i / steps), c = 0, s = 0;
+    for (double x : g) {
+      double a = 2 * kPi * std::fmod((x - g0) * 3 * f, 1.0);
+      c += std::cos(a);
+      s += std::sin(a);
+    }
+    double r = std::hypot(c, s) / g.size();
+    if (r > R) { R = r; bf = f; th = std::atan2(s, c); }
+  }
+  int n3[3] = {0, 0, 0};
+  for (double x : g) {
+    double u = (x - g0) * bf - th / (6 * kPi);
+    n3[(int)std::floor(3 * (u - std::floor(u)) + 0.5) % 3]++;
+  }
+  if (*std::min_element(n3, n3 + 3) > std::max(1.0, kThirdStray * g.size())) return 0;
+  return g.size() * R * R - std::log(apart);
+}
+
+// What the cameras see of each base station whatever the alignment: the sightings of the last WIN s that a rotor names.
+// The bright rays (no steady lights') are strung into lights by direction: a ray within kSeenDeg of a light's last one,
+// kSeenGap s after it at most, is the light's next, so a head that moves takes the light along. A light of kRotorMin
+// rays or more is the station whose rotor its times follow by kSeenZ and twice any other channel's: at the third
+// harmonic (ThirdZ), or at twice kSeenZ at the rotor's own frequency (RotorZ: a station seen from far off its level,
+// whose planes cross further than a third of a turn apart). Either way the sightings must span kSeenTurns turns of
+// what the third harmonic slips from frame to frame (10.014, 10.035, 10.077 of its turns for channels 1-3: 19, 8 and
+// 3.5 s), or any light's frames would keep a phase. A sweep's reflection keeps the phase and counts as its station
+// here. For the dashboard and the log: sightings were a station's only under an alignment, so without one every
+// station read "not seen" whatever the cameras saw (15 Nov: 233 sightings of one station and 67 of another in 260 s,
+// the third behind a steady light, and no word of any of it). Checked against where the alignment had the stations
+// (6 recordings): see docs/galaxy_xr.md
+void Solver::RotorSeenStep(double now) {
+  constexpr double kSeenDeg = 1.5, kSeenGap = 60, kSeenZ = 10, kSeenTurns = 4;
+  if (!rotor_veto_) return;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z;
+  Stations(keys, S, Z);
+  std::vector<double> tau = Taus(keys);
+  Rays r = Bright(GetRays(now - WIN));
+  struct Light { V3 d, o; double t; std::vector<double> g; };
+  std::vector<Light> L;
+  std::vector<int> live;  // the lights a ray can still join
+  const double cg = std::cos(kSeenDeg / kDeg);
+  for (size_t n = 0; n < r.size(); n++) {
+    if (!std::isfinite(r.G[n])) continue;
+    int b = -1;
+    double bd = cg;
+    for (size_t i = 0; i < live.size();) {
+      const Light &l = L[live[i]];
+      if (r.T[n] - l.t > kSeenGap) { live[i] = live.back(); live.pop_back(); continue; }
+      double c = dot(l.d, r.D[n]);
+      if (c >= bd) { bd = c; b = live[i]; }
+      i++;
+    }
+    if (b < 0) { L.push_back({r.D[n], r.O[n], r.T[n], {}}); b = (int)L.size() - 1; live.push_back(b); }
+    L[b].d = r.D[n];
+    L[b].o = r.O[n];
+    L[b].t = r.T[n];
+    L[b].g.push_back(r.G[n]);
+  }
+  std::map<std::string, std::pair<int, double>> seen;
+  const double P = frame_p_;
+  bool ok = !keys.empty() && P > 0;
+  for (size_t k = 0; k < keys.size(); k++) {
+    seen[keys[k]] = {0, -1e18};
+    ok = ok && tau[k] > 0;
+  }
+  for (auto &l : L) {
+    if (!ok || (int)l.g.size() < kRotorMin) continue;
+    auto mm = std::minmax_element(l.g.begin(), l.g.end());
+    const double span = *mm.second - *mm.first;
+    int bk = -1;
+    double b1 = 0, b2 = 0;
+    for (size_t k = 0; k < keys.size(); k++) {
+      double f = std::fmod(3 * P / tau[k], 1.0);
+      if (span * std::min(f, 1 - f) / P < kSeenTurns) continue;
+      double z = std::max(ThirdZ(l.g, tau[k]), RotorZ(l.g, tau[k]) / 2);
+      if (z > b1) { b2 = b1; b1 = z; bk = (int)k; }
+      else b2 = std::max(b2, z);
+    }
+    if (bk < 0 || b1 < kSeenZ || b1 < 2 * b2) continue;
+    auto &e = seen[keys[bk]];
+    e.first += (int)l.g.size();
+    e.second = std::max(e.second, l.t);
+  }
+  std::lock_guard<std::mutex> g(m_);
+  rotor_seen_ = seen;
+  rotor_seen_ok_ = ok;
+  // the steady lights in view: those kept now, one for all the cameras that see it (3 deg)
+  std::vector<V3> lights;
+  const double c3 = std::cos(3.0 / kDeg), gl = rg_.empty() ? 0 : rg_.back();
+  for (auto &s : steady_) {
+    if (!(std::fabs(gl - s.g) <= kSteadyHold)) continue;
+    bool has = false;
+    for (auto &d : lights) has = has || dot(d, s.d) >= c3;
+    if (!has) lights.push_back(s.d);
+  }
+  steady_lights_ = (int)lights.size();
+}
+
+int Solver::RotorSeen(const std::string &serial, int &n, double &last, bool &steady) const {
+  std::lock_guard<std::mutex> g(m_);
+  n = -1;
+  last = -1e18;
+  auto it = rotor_seen_.find(serial);
+  if (rotor_veto_ && rotor_seen_ok_ && it != rotor_seen_.end()) { n = it->second.first; last = it->second.second; }
+  steady = steady_at_.count(serial) > 0;
+  return rotor_veto_ ? steady_lights_ : 0;
+}
+
+std::string Solver::SeenText() const {
+  std::lock_guard<std::mutex> g(m_);
+  if (!rotor_veto_ || !rotor_seen_ok_) return "";
+  std::string s;
+  for (auto &kv : rotor_seen_)
+    s += Fmt("%s%s %d", s.empty() ? "" : ", ", kv.first.c_str(), kv.second.first);
+  return "by their rotors, last 5 min: " + s + Fmt("; %d steady light%s in view", steady_lights_, steady_lights_ == 1 ? "" : "s");
 }
 
 void Solver::RotorVeto(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const std::vector<M3> &Rs,
@@ -4561,13 +4702,20 @@ Transform Sync::Tick(double now) {
       last_st_ = st;
       has_last_st_ = true;
     }
+    if (now - last_seen_step_ >= 5) {  // what the cameras see of each station, whatever the alignment
+      last_seen_step_ = now;
+      solver_.RotorSeenStep(now);
+    }
     // not acquired: what became of the cameras' bright spots, after a minute and then every 5
     if (locked_) sum_t_ = -1;
     else {
       Spots sp = spots();
       if (sum_t_ < 0) { sum_t_ = now; sum_sp_ = sp; sum_n_ = 0; }
       else if (now - sum_t_ >= (sum_n_ ? 300 : 60)) {
-        if (sp.frames > sum_sp_.frames) log_(Fmt("acquiring, last %.0f s: ", now - sum_t_) + Describe(sum_sp_, sp));
+        if (sp.frames > sum_sp_.frames) {
+          std::string seen = solver_.SeenText();
+          log_(Fmt("acquiring, last %.0f s: ", now - sum_t_) + Describe(sum_sp_, sp) + (seen.empty() ? "" : "; " + seen));
+        }
         sum_t_ = now; sum_sp_ = sp; sum_n_++;
       }
     }
@@ -4782,6 +4930,9 @@ Sync::Status Sync::GetStatus(double now) {
     e.support = it == st.per.end() ? 0 : it->second;
     auto lt = st.last.find(keys[i]);
     e.last_seen = lt == st.last.end() ? -1 : std::max(0.0, now - lt->second);
+    double rl;
+    s.steady_lights = solver_.RotorSeen(keys[i], e.rotor, rl, e.steady);
+    e.rotor_seen = e.rotor > 0 ? std::max(0.0, now - rl) : -1;
     if (s.has_x && hh) e.dist = norm(Ry(s.x[0]) * S[i] + V3{s.x[1], s.x[2], s.x[3]} - head);
     s.st.push_back(e);
   }

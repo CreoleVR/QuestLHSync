@@ -74,6 +74,36 @@ is on, and with one station left in view nothing can be acquired from scratch. T
 sweep and could be used (not done: no tracker on the mount in that recording to check it against). Keep such a light
 off, or well away from the station (15 Nov's would have needed 30 cm or more at 4 m).
 
+## What the cameras see, whatever the alignment
+
+A sighting was a station's only by its place under an alignment, so the dashboard had nothing to show without one: on
+15 Nov, after *Force recalibrate*, every station read "seen not yet" for hours while the cameras saw one station 233
+times and another 67 times in 260 s, the third sat behind a steady light, and the alignment (which needs two) couldn't
+come. Now the rotors say what is seen (`Solver::RotorSeenStep`, every 5 s on the last 5 min):
+
+- the bright rays (no steady lights') are strung into lights by direction, a ray within 1.5 deg of a light's last one
+  being its next, so a head that moves takes the light along
+- a light of 12 rays or more is the station whose rotor its times follow at the third harmonic (`ThirdZ`): the two
+  sweep planes cross a camera a third of a turn apart, so at three times the rotor's frequency they fall together
+  (coherence 1.00 for both stations seen from the seat, where the rotor's own frequency gives 0.49 and 0.51), and
+  12-15 sightings name a station where the rotor's own frequency takes 40
+- the short frames come about a third of a turn apart too, so a light that blinks in step with the frames is coherent
+  there as well, on three phases; a station's two planes leave the third empty, and only that counts. The sightings
+  also have to span 4 turns of what the third harmonic slips from frame to frame (19, 8 and 3.5 s for channels 1-3)
+- a sweep's reflection keeps the phase and counts as its station
+
+Against where the alignment had the stations (6 recordings, every light named at every step): 3 412 right (within
+3 deg), 138 within 3-10 deg of the named station (all LHB-769877C9: a reflection beside it, by the look of it), none
+further off. Before the empty third was asked for, lights 40-106 deg from any station were named (ceiling lamps and
+lights below the head, 15-44 rays). In the 15 Nov recording LHB-ED72E88C is named after 45 s, LHB-383A2F82 after
+120 s, LHB-769877C9 never.
+
+The dashboard, without an alignment: each station's row reads "seen ... · N flashes in 5 min" or "not seen", and the
+headline says what is missing: only one station in view (and that one beside a steady light can't be seen), or two
+seen that the head has yet to see from a few places. With an alignment the rows are as before; a station with a
+steady light at its place says so. The log's `acquiring, ...` line ends with the same counts. Other headsets (no exact
+frame times) show what they did.
+
 ## The lighthouse scale
 
 Galaxy XR frames of three or more base stations: lighthouse devices are placed by `scale * q * p + t`. Every minute
