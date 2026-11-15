@@ -64,8 +64,9 @@ phase (`RotorVeto`): nothing was acquired for hours.
 
 Replays: of that recording's 55 549 bright spots 43 124 are a steady light's; seeded with the day before's station
 places, the station gets 1-11 rays of the light where it got 10 416, and the fit follows the two stations still seen.
-The other recordings acquire as before or sooner (7 Nov: 51 s for 63, 29 for 72, 29 for 23; 14 Nov: 49 for 68, 33 for
-36), as far off the mounted tracker as before. In the log: `acquiring, ...: N a steady light's, lit frame after frame
+The other recordings acquire about when they did or sooner (7 Nov: 63 s for 63, 36 for 72, 29 for 23; 14 Nov: 40 for
+68, 33 for 36), as far off the mounted tracker as before; the 14 Nov night session (2.9 h) runs the same, but for one
+acquisition 20 s after a pose break where it stayed unlocked for 73 s before. In the log: `acquiring, ...: N a steady light's, lit frame after frame
 as no base station is`, and once per station `LHB-...: a steady light X deg from its place ...: left out`.
 
 What it can't do: a station whose sweeps merge with a steady light in the cameras isn't seen at all while the light
