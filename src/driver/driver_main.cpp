@@ -81,7 +81,7 @@ static std::string DataDir() {
 }
 
 // ---------------------------------------------------------------- the transform the hook applies
-struct Xf { int active; Quat q; double t[3]; };
+struct Xf { int active; Quat q; double t[3]; double s; };
 static std::atomic<uint32_t> g_xf_seq{0};
 static Xf g_xf_buf{};
 
@@ -91,6 +91,7 @@ static void WriteXf(const Transform &x) {
   g_xf_buf.active = x.active;
   g_xf_buf.q = x.q;
   g_xf_buf.t[0] = x.t.x; g_xf_buf.t[1] = x.t.y; g_xf_buf.t[2] = x.t.z;
+  g_xf_buf.s = x.s;
   std::atomic_thread_fence(std::memory_order_release);
   g_xf_seq.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -206,6 +207,17 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
     return true;
   }
   vr::HmdQuaternion_t xq{x.q.w, x.q.x, x.q.y, x.q.z};
+  // the scale (Transform::s): the whole pose's place in the raw universe, WorldFromDriver (p + R head) + t, times s,
+  // so every length in it: rotations and angular velocities keep
+  if (x.s != 1 && std::isfinite(x.s) && x.s > 0) {
+    for (int i = 0; i < 3; i++) {
+      p.vecPosition[i] *= x.s;
+      p.vecDriverFromHeadTranslation[i] *= x.s;
+      p.vecWorldFromDriverTranslation[i] *= x.s;
+      p.vecVelocity[i] *= x.s;
+      p.vecAcceleration[i] *= x.s;
+    }
+  }
   double wt[3];
   Rotate(xq, p.vecWorldFromDriverTranslation, wt);
   p.qWorldFromDriverRotation = Mul(xq, p.qWorldFromDriverRotation);
@@ -292,7 +304,8 @@ static std::string GetStr(vr::PropertyContainerHandle_t c, vr::ETrackedDevicePro
 static std::string StreamerName(const std::string &driver) {
   static const char *const names[][2] = {{"oculus_virtualdesktop", "Virtual Desktop"}, {"oculus", "Quest Link"},
                                          {"creolecast", "CreoleCast"}, {"vrlink", "Steam Link"},
-                                         {"alvr_server", "ALVR"}};
+                                         {"alvr_server", "ALVR"},
+                                         {"pico", "PICO Connect"}};
   for (auto &n : names)
     if (driver == n[0]) return n[1];
   return driver;
@@ -388,7 +401,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         continue;
       }
       if (cls == vr::TrackedDeviceClass_HMD && g_hmd.load() < 0) {
-        // a Quest Pro, 3, 3S or a Steam Frame, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link,
+        // a Quest Pro, 3, 3S, a Steam Frame or a PICO 4, whoever streams it: Link, Air Link, Virtual Desktop, ALVR, Steam Link,
         // CreoleCast, ...
         std::string family;
         for (const std::string &p : {model, GetStr(c, vr::Prop_RenderModelName_String), serial,
@@ -418,13 +431,13 @@ class Provider : public vr::IServerTrackedDeviceProvider {
           hmd_system_ = StreamerName(sys);
           g_sync->SetStreamer(sys);
           Log(Fmt("HMD %u: %s via %s%s", i, hmd_model_.c_str(), hmd_system_.c_str(), !family.empty() || !any_hmd_ ? "" :
-                  " - not named a Quest Pro, 3, 3S or Steam Frame, used because anyHmd is set"));
+                  " - not named a Quest Pro, 3, 3S, Steam Frame or PICO 4, used because anyHmd is set"));
           continue;
         }
         std::lock_guard<std::mutex> g(hmd_m_);
         hmd_model_ = model.empty() ? "headset" : model;
         hmd_system_ = StreamerName(sys);
-        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3, 3S or Steam Frame: idle", i, hmd_model_.c_str(),
+        Log(Fmt("HMD %u: %s via %s isn't a Quest Pro, 3, 3S, Steam Frame or PICO 4: idle", i, hmd_model_.c_str(),
                 hmd_system_.c_str()));
       }
       g_kind[i] = kOther;

@@ -1,7 +1,13 @@
-"""Builds the QuestLHSync Magisk module: out/QuestLHSync-quest-module-<version>.zip
+"""Builds the QuestLHSync Magisk modules: out/QuestLHSync-quest-module-<version>.zip and
+out/QuestLHSync-pico4-module-<version>.zip (python build_module.py [quest|pico4], both without an argument)
 
+  Quest:
   lhsyncd       ../src/headset/lhsyncd.c (shared with the Steam Frame) + src/quest.c, NDK clang for arm64 (Android 10+)
   lhsight.js    src/lhsight.js with src/lhsight.c inlined (Frida CModule), no time limit
+  PICO 4 (module_pico/ in place of module/'s customize.sh and module.prop):
+  lhsyncd       ../src/headset/lhsyncd.c + src/pico.c
+  picosight.js  src/picosight.js with src/picosight.c inlined
+  Both:
   frida-inject  Frida 17.10.0 android-arm64, downloaded once from Frida's GitHub release into frida/ (checked by hash)
 
 The NDK comes from ANDROID_NDK_HOME / ANDROID_NDK_ROOT, else the newest one in the Android SDK (ANDROID_HOME or
@@ -60,37 +66,54 @@ def frida_inject():
     return data
 
 
-def main():
+TARGETS = {
+    # target: (backend, script, its CModule, folder with customize.sh and module.prop.in, zip name)
+    "quest": ("quest.c", "lhsight.js", "lhsight.c", "module", "quest"),
+    "pico4": ("pico.c", "picosight.js", "picosight.c", "module_pico", "pico4"),
+}
+
+
+def build(target):
+    backend, script, csrc, extra, zname = TARGETS[target]
     os.makedirs(os.path.join(HERE, "build"), exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
-    daemon = os.path.join(HERE, "build", "lhsyncd")
+    daemon = os.path.join(HERE, "build", f"lhsyncd-{target}")
     subprocess.run([clang(), "--target=aarch64-linux-android29", "-O2", "-Wall", "-Wno-unused-result", "-fPIE", "-pie",
                     f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}", os.path.join(HEADSET, "lhsyncd.c"),
-                    os.path.join(HERE, "src", "quest.c"), "-llog", "-s", "-o", daemon],
+                    os.path.join(HERE, "src", backend), "-llog", "-lm", "-s", "-o", daemon],
                    check=True)
-    js = open(os.path.join(HERE, "src", "lhsight.js"), encoding="utf-8").read()
-    c = open(os.path.join(HERE, "src", "lhsight.c"), encoding="utf-8").read()
+    js = open(os.path.join(HERE, "src", script), encoding="utf-8").read()
+    c = open(os.path.join(HERE, "src", csrc), encoding="utf-8").read()
     js = js.replace("@CSRC@", c).replace("@DUR@", "0")
-    prop = open(os.path.join(HERE, "module", "module.prop.in"), encoding="utf-8").read()
+    prop = open(os.path.join(HERE, extra, "module.prop.in"), encoding="utf-8").read()
     prop = prop.replace("@VERSION@", VERSION).replace("@CODE@", str(CODE))
-    zpath = os.path.join(OUT, f"QuestLHSync-quest-module-{VERSION.lstrip('v')}.zip")
+    zpath = os.path.join(OUT, f"QuestLHSync-{zname}-module-{VERSION.lstrip('v')}.zip")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         def add(name, data, mode=0o644):
             info = zipfile.ZipInfo(name, date_time=(2026, 10, 3, 0, 0, 0))
             info.external_attr = (0o100000 | mode) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             z.writestr(info, data)
-        m = os.path.join(HERE, "module")
         for rel in ("META-INF/com/google/android/update-binary", "META-INF/com/google/android/updater-script",
                     "service.sh", "customize.sh", "uninstall.sh"):
-            add(rel, lf(open(os.path.join(m, rel), encoding="utf-8").read()), 0o755 if rel.endswith((".sh", "binary")) else 0o644)
+            folder = extra if os.path.exists(os.path.join(HERE, extra, rel)) else "module"
+            add(rel, lf(open(os.path.join(HERE, folder, rel), encoding="utf-8").read()),
+                0o755 if rel.endswith((".sh", "binary")) else 0o644)
         add("module.prop", lf(prop))
-        add("lhsight.js", lf(js))
+        add(script, lf(js))
         add("lhsyncd", open(daemon, "rb").read(), 0o755)
         add("frida-inject", frida_inject(), 0o755)
     print(f"built {zpath} ({os.path.getsize(zpath) / 1e6:.1f} MB)")
     return zpath
 
 
+def main(argv):
+    targets = argv or list(TARGETS)
+    for t in targets:
+        if t not in TARGETS:
+            sys.exit(f"unknown target {t}: {', '.join(TARGETS)}")
+    return [build(t) for t in targets]
+
+
 if __name__ == "__main__":
-    sys.exit(0 if main() else 1)
+    sys.exit(0 if main(sys.argv[1:]) else 1)

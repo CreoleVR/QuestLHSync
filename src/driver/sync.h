@@ -53,10 +53,18 @@ constexpr int kTimingBoot = 200;
 constexpr double kTimingCI = 0.006;  // s
 constexpr int kMaxPx = 400;             // bigger blobs are lamps/windows, not a laser dot
 constexpr double kMaxSource = 0.008;    // m^2
+// The PICO 4 sees a 1.0 base station by its sync flash, not a laser dot: LEDs bright enough to light the room, whose
+// saturated bloom grows with the tracker's gain (one headset, 3 m away: 70-220 px at gain 48, up to 1300 px at 240;
+// ~1.8e-5 sr a pixel). Taken by its size it would be a source of up to ~0.2 m^2, so for it the size tests are this much
+// wider, and lamps are told by where they are (no station there) rather than how big they look
+constexpr int kMaxPxBloom = 4000;
+constexpr double kMaxSourceBloom = 1.0;  // m^2
+// the size test in force: kMaxSource, or kMaxSourceBloom for a headset whose stations bloom (Sync::SetCalibration)
+inline std::atomic<double> g_max_source{kMaxSource};
 // lim: the dots' size learned, sr * m (0: none yet)
 inline bool FromStation(double sr, V3 p, V3 o, double lim) {
   double d2 = dot(p - o, p - o);
-  return sr * d2 <= kMaxSource || (lim > 0 && sr * std::sqrt(d2) <= 2 * lim);
+  return sr * d2 <= g_max_source.load(std::memory_order_relaxed) || (lim > 0 && sr * std::sqrt(d2) <= 2 * lim);
 }
 // blobs this bright: a base station's dot, or a lamp. Dimmer ones (module 1.6 on) are mostly other lights, a few
 // percent station dots: they count only in a room too light for the dots to saturate (Solver::starved), and then in
@@ -130,12 +138,17 @@ constexpr double kUpward = 0.1;        // a camera whose axis climbs this much (
 // ---------------------------------------------------------------- optics
 struct CamCal {
   bool valid = false;
-  bool use = true;  // the cameras that look where base stations hang (the Frame's two upper ones); all on a Quest
+  bool use = true;  // the cameras that look where base stations hang (the Frame's and PICO 4's upper ones); all on a Quest
   int w = 0, h = 0;
   double ir = 1.0;  // near-IR laser image scale about the centre: kIR for the Quest side cameras
   M3 R;  // device <- camera
   V3 t;
   double f = 0, fy = 0, cx = 0, cy = 0, k[6] = {}, p[2] = {};
+  // the lens: Meta's Fisheye62 (k, p in its order), or, for the PICO 4's Kalibr models, Mei's unified model (xi) with
+  // radial-tangential distortion (k[0], k[1]; p in OpenCV's order p1, p2), or a pinhole with that distortion
+  enum Model { kFisheye62, kMeiRadTan, kRadTan };
+  Model model = kFisheye62;
+  double xi = 0;
   void Dist(double a, double b, double &u, double &v) const;
   bool Unproject(double px, double py, V3 &d) const;  // unit ray, camera frame
 };
@@ -151,9 +164,12 @@ class Optics {
   bool Used(int cam) const { return cam >= 0 && cam < kMaxCam && cams_[cam].valid && cams_[cam].use; }  // sightings count
   std::string Unused() const;  // "0, 1": the calibrated cameras left out, "" for none
   const std::string &device() const { return device_; }       // "Seacliff" (Quest Pro), "Eureka" (Quest 3), ...
-  enum Headset { kQuest, kFrame, kGalaxyXR };
+  enum Headset { kQuest, kFrame, kGalaxyXR, kPico };
   Headset headset() const { return headset_; }     // whose calibration it is
   bool exact_time() const { return exact_time_; }  // frame times are the frames' own, no poll lag to take off
+  bool bloom() const { return headset_ == kPico; }   // stations seen as blooming sync flashes (kMaxPxBloom)
+  // its tracking's own space can be a few percent off SteamVR's lighthouse space in size (Sync::scale_)
+  bool scaled() const { return headset_ == kPico; }
 
  private:
   CamCal cams_[kMaxCam];
@@ -477,7 +493,8 @@ struct SyncConfig {
   bool learn_grid = false;     // tools: learn the frame period even on a Quest Pro
 };
 
-struct Transform { bool active = false; Quat q; V3 t; };  // raw lighthouse -> Quest
+// raw lighthouse -> Quest: q * (s * p) + t. s: the lighthouse space's size against the headset's (Sync::scale_)
+struct Transform { bool active = false; Quat q; V3 t; double s = 1; };
 
 class Sync {
  public:
@@ -542,6 +559,11 @@ class Sync {
   std::mutex net_;  // headset-side state (optics, clock, grid, timing records)
   Optics optics_;
   bool have_optics_ = false;
+  // The lighthouse space's size against the headset's (Tick's thread): the cameras' distance between two base stations
+  // over SteamVR's. 1 but for a headset whose tracking can be off in size (Optics::scaled): a PICO 4 through PICO
+  // Connect put two stations 4.15 m apart that SteamVR has 4.36 m apart, and the factory lens model fit its sightings
+  // best (0.23 deg), any lens scale worse: its own space was 4.8% small, which a yaw and a shift can't take up
+  double scale_ = 1, scale_said_ = 1;
   Clock clock_;
   FrameGrid grid_;
   bool grid_quest_ = true;             // a Quest's frame grid (otherwise learned)

@@ -4,6 +4,7 @@ built, one per device:
   QuestLHSync-steamvr-installer.exe        installs and updates the SteamVR driver (downloads the zip below)
   QuestLHSync-steamvr-<version>.zip        the SteamVR driver folder questlhsync/ (driver, dashboard app, openvr_api.dll)
   QuestLHSync-quest-module-<version>.zip   the Quest's Magisk module
+  QuestLHSync-pico4-module-<version>.zip   the PICO 4's Magisk module
   QuestLHSync-frame-module-<version>.tar.gz  the Steam Frame's package
   QuestLHSync-frame-installer.flatpak      the Steam Frame's installer app, when out/ has one (built on arm64 Linux)
 
@@ -27,6 +28,7 @@ DRIVER = os.path.join(HERE, "driver", "questlhsync")
 BIN = os.path.join(DRIVER, "bin", "win64")
 INSTALLER = os.path.join(HERE, "out", "QuestLHSync-Installer.exe")
 MODULE = os.path.join(HERE, "out", f"QuestLHSync-quest-module-{VERSION.lstrip('v')}.zip")
+PICO = os.path.join(HERE, "out", f"QuestLHSync-pico4-module-{VERSION.lstrip('v')}.zip")
 FRAME = os.path.join(HERE, "out", f"QuestLHSync-frame-{VERSION}.tar.gz")
 NOTICES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
 
@@ -48,8 +50,8 @@ def steamvr_zip(out):
             z.write(os.path.join(HERE, f), f)
 
 
-def module_zip(out):
-    with zipfile.ZipFile(MODULE) as src, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+def module_zip(out, built=MODULE):
+    with zipfile.ZipFile(built) as src, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for info in src.infolist():  # as built: Magisk reads its META-INF and module.prop from it
             z.writestr(info, src.read(info))
         for f in NOTICES:
@@ -74,6 +76,8 @@ def main():
         (os.path.join(BIN, "QuestLHSync.exe"), newest("src/overlay", "src/common", "third_party"), "build.bat"),
         (INSTALLER, newest("src/installer"), "build.bat installer"),
         (MODULE, newest("magisk/src", "magisk/module", "src/headset"), "python magisk\\build_module.py"),
+        (PICO, newest("magisk/src", "magisk/module", "magisk/module_pico", "src/headset"),
+         "python magisk\\build_module.py"),
         (FRAME, newest("frame/src", "frame/driver", "frame/package", "src/headset"),
          "python frame\\build.py"),
     ]
@@ -87,6 +91,7 @@ def main():
     shutil.copy2(INSTALLER, os.path.join(dest, "QuestLHSync-steamvr-installer.exe"))
     steamvr_zip(os.path.join(dest, f"QuestLHSync-steamvr-{ver}.zip"))
     module_zip(os.path.join(dest, f"QuestLHSync-quest-module-{ver}.zip"))
+    module_zip(os.path.join(dest, f"QuestLHSync-pico4-module-{ver}.zip"), PICO)
     frame_tar(os.path.join(dest, f"QuestLHSync-frame-module-{ver}.tar.gz"))
     flatpaks = sorted(glob.glob(os.path.join(HERE, "out", "QuestLHSync-frame-installer*.flatpak")), key=os.path.getmtime)
     if flatpaks:

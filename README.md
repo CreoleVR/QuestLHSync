@@ -26,6 +26,8 @@ headset module.
   [Magisk](https://github.com/topjohnwu/Magisk).
 - Or a **Steam Frame**. No root, no developer password: everything installs as
   your user.
+- Or a **PICO 4** (A8110), rooted with Magisk, streamed by PICO Connect or
+  anything else. New: see [PICO 4](#pico-4).
 - **SteamVR base stations**, 1.0 or 2.0.
 - **Windows with SteamVR**, with the headset streamed by anything: Steam Link,
   Link, Air Link, Virtual Desktop, ALVR, CreoleCast...
@@ -47,6 +49,8 @@ Each device has its own file in
      adb shell su -c "magisk --install-module /sdcard/Download/QuestLHSync-quest-module-<version>.zip"
      adb reboot
      ```
+
+   - **PICO 4:** the same with `QuestLHSync-pico4-module-<version>.zip`.
 
    - **Steam Frame:** in Desktop Mode, open `QuestLHSync-frame-installer.flatpak`
      in Discover, then start **QuestLHSync Installer** and click **Install**. Or
@@ -157,7 +161,7 @@ patches nothing on disk. On the Frame, `lhsyncd` logs to the user journal
 
 ## Uninstall
 
-- **Quest:** remove the module in the Magisk app and reboot.
+- **Quest, PICO 4:** remove the module in the Magisk app and reboot.
 - **Steam Frame:** click **Uninstall** in QuestLHSync Installer, or run
   `QuestLHSync-frame/uninstall.sh` on the headset.
 - **PC:** with SteamVR closed, click **Uninstall** in the installer, or run
@@ -172,7 +176,7 @@ Python 3:
 ```
 build.bat                        SteamVR driver + dashboard app (SteamVR closed) + out\QuestLHSync-Installer.exe
 build.bat installer              only the installer
-python magisk\build_module.py    Quest module (Magisk), into out\
+python magisk\build_module.py    Quest and PICO 4 modules (Magisk), into out\ (or name one: quest, pico4)
 python frame\build.py            Steam Frame package, into out\
 python release.py                the release files, into out\release-<version>\
 python install.py                register driver\questlhsync with SteamVR
@@ -192,9 +196,9 @@ and the GNOME SDK:
 `release.py` adds it to the release files as `QuestLHSync-frame-installer.flatpak`
 when it's in `out/`.
 
-`lhsyncd`'s core (`src/headset/lhsyncd.c`) is shared by both headsets; each adds
+`lhsyncd`'s core (`src/headset/lhsyncd.c`) is shared by all headsets; each adds
 its own side behind `src/headset/headset.h` (`magisk/src/quest.c`,
-`frame/src/frame.c`).
+`magisk/src/pico.c`, `frame/src/frame.c`).
 
 ## License
 

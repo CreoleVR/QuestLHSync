@@ -1,7 +1,8 @@
 """QuestLHSync installer for a source checkout (the release zip needs no Python: see README.md).
 
   python install.py          PC (SteamVR closed): register driver\\questlhsync with SteamVR, in place
-  python install.py headset  Quest Pro, 3 or 3S over adb: install the Magisk module and start lhsyncd now (no reboot)
+  python install.py headset  Quest Pro, 3, 3S or PICO 4 over adb: install its Magisk module and start lhsyncd now
+                             (no reboot)
   python install.py remove   PC (SteamVR closed): unregister the driver (%LOCALAPPDATA%\\QuestLHSync is kept)
 """
 import json
@@ -17,6 +18,7 @@ from build_module import VERSION  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVER = os.path.join(HERE, "driver", "questlhsync")
 MODULE = os.path.join(HERE, "out", f"QuestLHSync-quest-module-{VERSION.lstrip('v')}.zip")
+PICO_MODULE = os.path.join(HERE, "out", f"QuestLHSync-pico4-module-{VERSION.lstrip('v')}.zip")
 
 
 def vrpathreg():
@@ -63,8 +65,6 @@ def adb_exe():
 
 
 def headset():
-    if not os.path.exists(MODULE):
-        sys.exit(f"build the module first: python magisk\\build_module.py ({MODULE} missing)")
     adb_path = adb_exe()
 
     def adb(*args, check=True, **kw):
@@ -72,18 +72,23 @@ def headset():
 
     devs = [l.split()[0] for l in adb("devices").stdout.splitlines()[1:] if l.strip().endswith("device")]
     names = {"seacliff": "Quest Pro", "eureka": "Quest 3", "panther": "Quest 3S"}
-    quest = []
+    found = []
     for dev in devs:
         code = adb("-s", dev, "shell", "getprop ro.product.device", check=False).stdout.strip()
-        quest += [(dev, names[k]) for k in names if code.startswith(k)]
-    if not quest:
-        sys.exit(f"no Quest Pro, 3 or 3S on adb ({len(devs)} other device(s))")
-    d, name = quest[0]
+        model = adb("-s", dev, "shell", "getprop ro.product.model", check=False).stdout.strip()
+        found += [(dev, names[k], MODULE) for k in names if code.startswith(k)]
+        if model.startswith("A8110"):  # the PICO 4
+            found.append((dev, "PICO 4", PICO_MODULE))
+    if not found:
+        sys.exit(f"no Quest Pro, 3, 3S or PICO 4 on adb ({len(devs)} other device(s))")
+    d, name, module = found[0]
+    if not os.path.exists(module):
+        sys.exit(f"build the module first: python magisk\\build_module.py ({module} missing)")
     if "uid=0" not in adb("-s", d, "shell", "su -c id", check=False).stdout:
         sys.exit("su doesn't work on the headset (Magisk root needed; allow Shell in Magisk's superuser list)")
-    dst = "/sdcard/Download/QuestLHSync-quest-module.zip"
+    dst = "/sdcard/Download/QuestLHSync-module.zip"
     print(f"{name}: pushing the module")
-    adb("-s", d, "push", MODULE, dst)
+    adb("-s", d, "push", module, dst)
     r = adb("-s", d, "shell", f"su -c 'magisk --install-module {dst}'", check=False)
     print(r.stdout.strip())
     adb("-s", d, "shell", f"rm -f {dst}", check=False)

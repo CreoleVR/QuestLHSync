@@ -70,6 +70,15 @@ static std::string Now() {
 
 // ================================================================ optics
 void CamCal::Dist(double a, double b, double &u, double &v) const {
+  if (model != kFisheye62) {
+    // Mei: the ray onto the unit sphere, projected from xi behind its centre (xi 0: a pinhole); then OpenCV's
+    // radial-tangential distortion
+    double s = model == kMeiRadTan ? 1 / (1 + xi * std::sqrt(a * a + b * b + 1)) : 1.0;
+    double mx = a * s, my = b * s, r2 = mx * mx + my * my, rad = 1 + r2 * (k[0] + r2 * k[1]);
+    u = mx * rad + 2 * p[0] * mx * my + p[1] * (r2 + 2 * mx * mx);
+    v = my * rad + p[0] * (r2 + 2 * my * my) + 2 * p[1] * mx * my;
+    return;
+  }
   double r = std::hypot(a, b), th = std::atan(r), th2 = th * th;
   double thd = th * (1 + th2 * (k[0] + th2 * (k[1] + th2 * (k[2] + th2 * (k[3] + th2 * (k[4] + th2 * k[5]))))));
   double s = r > 1e-12 ? thd / r : 1.0;
@@ -81,6 +90,41 @@ void CamCal::Dist(double a, double b, double &u, double &v) const {
 // Newton on the forward model
 bool CamCal::Unproject(double px, double py, V3 &d) const {
   double tu = (px - cx) / f, tv = (py - cy) / fy;
+  if (model != kFisheye62) {
+    // the radial-tangential distortion undone by Newton where it acts (the small normalised plane, starting at the
+    // distorted point), then Mei's lift onto the unit sphere in closed form. Not through x/z: the PICO 4's cameras
+    // (xi ~3.5) see past 90 degrees off their axis, where x/z doesn't exist
+    double mx = tu, my = tv;
+    for (int i = 0; i < 20; i++) {
+      double r2 = mx * mx + my * my, rad = 1 + r2 * (k[0] + r2 * k[1]), drad = k[0] + 2 * k[1] * r2;
+      double u = mx * rad + 2 * p[0] * mx * my + p[1] * (r2 + 2 * mx * mx);
+      double v = my * rad + p[0] * (r2 + 2 * my * my) + 2 * p[1] * mx * my;
+      double J11 = rad + 2 * mx * mx * drad + 2 * p[0] * my + 6 * p[1] * mx;
+      double J12 = 2 * mx * my * drad + 2 * p[0] * mx + 2 * p[1] * my;
+      double J21 = 2 * mx * my * drad + 2 * p[0] * mx + 2 * p[1] * my;
+      double J22 = rad + 2 * my * my * drad + 6 * p[0] * my + 2 * p[1] * mx;
+      double det = J11 * J22 - J12 * J21, eu = u - tu, ev = v - tv;
+      if (!(std::fabs(det) > 1e-12)) return false;
+      mx -= (J22 * eu - J12 * ev) / det;
+      my -= (-J21 * eu + J11 * ev) / det;
+      if (eu * eu + ev * ev < 1e-24) break;
+    }
+    double r2 = mx * mx + my * my, rad = 1 + r2 * (k[0] + r2 * k[1]);
+    double u = mx * rad + 2 * p[0] * mx * my + p[1] * (r2 + 2 * mx * mx);
+    double v = my * rad + p[0] * (r2 + 2 * my * my) + 2 * p[1] * mx * my;
+    if (!(std::hypot(u - tu, v - tv) * f < 0.01)) return false;  // didn't converge: a pixel the model can't reach
+    V3 r{mx, my, 1};
+    if (model == kMeiRadTan) {
+      double q = 1 + (1 - xi * xi) * r2;
+      if (q < 0) return false;  // outside the image circle
+      double fac = (xi + std::sqrt(q)) / (1 + r2);
+      r = {fac * mx, fac * my, fac - xi};
+    }
+    double n = std::sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+    if (!std::isfinite(n) || n <= 0) return false;
+    d = {r.x / n, r.y / n, r.z / n};
+    return true;
+  }
   double rd = std::hypot(tu, tv), th = std::min(std::max(rd, 0.0), 1.5);
   double s = rd > 1e-12 ? std::tan(th) / rd : 1.0, a = tu * s, b = tv * s;
   const double h = 1e-6;
@@ -110,6 +154,9 @@ bool Optics::Load(const std::string &json, std::string *err) {
   // instead of silently interpreting [fx,fy,cx,cy] as Meta's [f,cx,cy].
   bool gxr_sensor = kind && kind->t == JVal::Str && kind->s == "galaxy_xr_sensor";
   bool gxr = gxr_sensor || (kind && kind->t == JVal::Str && kind->s == "galaxy_xr");
+  // the PICO 4's lhsyncd (magisk/src/pico.c) turns PICO's Kalibr-style calibration into this form, poses in the head
+  // frame, its frames stamped with their own times
+  bool pico = kind && kind->t == JVal::Str && kind->s == "pico4";
   const JVal *cams = root.get(gxr ? "GxrCameraCalibration" : "CameraCalibration");
   if (!cams || cams->t != JVal::Arr) { if (err) *err = "no CameraCalibration"; return false; }
   CamCal out[kMaxCam];
@@ -126,7 +173,11 @@ bool Optics::Load(const std::string &json, std::string *err) {
     auto sz = size->nums(), T = dfc->nums();
     auto pc = proj->get("Coefficients") ? proj->get("Coefficients")->nums() : std::vector<double>();
     auto dc = dist->get("Coefficients") ? dist->get("Coefficients")->nums() : std::vector<double>();
-    if (sz.size() < 2 || T.size() < 16 || pc.size() < 3 || dc.size() < 8) continue;
+    const JVal *dist_model = dist->get("Model");
+    std::string dm = dist_model && dist_model->t == JVal::Str ? dist_model->s : "Fisheye62";
+    CamCal::Model model = dm == "MeiRadTan" ? CamCal::kMeiRadTan : dm == "RadTan" ? CamCal::kRadTan : CamCal::kFisheye62;
+    size_t need = model == CamCal::kMeiRadTan ? 5 : model == CamCal::kRadTan ? 4 : 8;
+    if (sz.size() < 2 || T.size() < 16 || pc.size() < 3 || dc.size() < need) continue;
     CamCal &k = out[i];
     k.w = (int)sz[0]; k.h = (int)sz[1];
     for (int r = 0; r < 3; r++)
@@ -144,18 +195,36 @@ bool Optics::Load(const std::string &json, std::string *err) {
       }
       k.f = pc[0]; k.fy = pc[1]; k.cx = pc[2]; k.cy = pc[3];
     }
-    for (int j = 0; j < 6; j++) k.k[j] = dc[j];
-    k.p[0] = dc[6]; k.p[1] = dc[7];
+    k.model = model;
+    if (model == CamCal::kFisheye62) {
+      for (int j = 0; j < 6; j++) k.k[j] = dc[j];
+      k.p[0] = dc[6]; k.p[1] = dc[7];
+    } else {  // [xi,] k1, k2, p1, p2
+      size_t o = model == CamCal::kMeiRadTan ? 1 : 0;
+      k.xi = o ? dc[0] : 0;
+      k.k[0] = dc[o]; k.k[1] = dc[o + 1];
+      k.p[0] = dc[o + 2]; k.p[1] = dc[o + 3];
+      if (!std::isfinite(k.xi + k.k[0] + k.k[1] + k.p[0] + k.p[1]) || k.xi < 0 || k.xi > 10) {
+        k = CamCal();
+        continue;
+      }
+    }
     k.ir = sensor && sensor->t == JVal::Str && sensor->s == "OV7251" ? kIR : 1.0;
     k.valid = true;
     n++;
   }
   if (!n) { if (err) *err = "no tracking camera calibration"; return false; }
+  if (pico) {  // as the Frame's: the lower pair looks at the floor and the hands, the base stations hang above
+    int up = 0;
+    for (int i = 0; i < kMaxCam; i++) up += out[i].valid && out[i].R.m[1][2] > kUpward;
+    if (up)
+      for (int i = 0; i < kMaxCam; i++) out[i].use = out[i].valid && out[i].R.m[1][2] > kUpward;
+  }
   for (int i = 0; i < kMaxCam; i++) cams_[i] = out[i];
   const JVal *dev = root.get("Device"), *type = dev ? dev->get("DeviceType") : nullptr;
   device_ = type && type->t == JVal::Str ? type->s : "";
-  headset_ = gxr ? kGalaxyXR : kQuest;
-  exact_time_ = gxr_sensor;  // Backend converted QVR sensor BOOTTIME to daemon MONOTONIC.
+  headset_ = pico ? kPico : gxr ? kGalaxyXR : kQuest;
+  exact_time_ = gxr_sensor || pico;  // Backend converted QVR sensor BOOTTIME to daemon MONOTONIC; picosight likewise.
   return true;
 }
 
@@ -2218,7 +2287,7 @@ StepStat Solver::Step(double /*now*/) {
           l = std::max(l, r.T[n]);
           if (r.B[n] && !r.A.empty()) {
             double d = norm(P[kk] - r.O[n]);
-            if (r.A[n] * d * d <= kMaxSource) sz.push_back(r.A[n] * d);
+            if (r.A[n] * d * d <= g_max_source.load(std::memory_order_relaxed)) sz.push_back(r.A[n] * d);
             else big++;
           }
         }
@@ -2254,7 +2323,7 @@ StepStat Solver::Step(double /*now*/) {
     if (!(std::fabs(v / dot_said_ - 1) < 0.25)) {
       dot_said_ = v;
       log_(Fmt("base stations' dots: %.2e sr m (90%% of %d sightings); blobs over twice that, and %.0f cm^2, are lamps",
-               v, (int)sz.size(), kMaxSource * 1e4));
+               v, (int)sz.size(), g_max_source.load(std::memory_order_relaxed) * 1e4));
     }
     dot_ = v;
   }
@@ -2841,6 +2910,9 @@ bool Sync::SetCalibration(const std::string &json, std::string *err) {
   // a Quest's frame period is one of two, the other headsets' are learned from their frames
   grid_quest_ = optics_.headset() == Optics::kQuest && !cfg_.learn_grid;
   solver_.SetDimDots(optics_.headset() == Optics::kFrame);
+  g_max_source = optics_.bloom() ? kMaxSourceBloom : kMaxSource;
+  if (optics_.bloom()) log_("base stations bloom on this headset's cameras: blobs up to " + std::to_string(kMaxPxBloom) +
+                            " px count");
   grid_ = FrameGrid(grid_quest_);
   grid_logged_.clear();
   return true;
@@ -3018,7 +3090,7 @@ double Sync::BodyDist(const X4 &x) {
     M3 R;
     V3 h;
     if (!poses_.At(e.t, R, h)) continue;
-    V3 q = RyMul(c, s, C * e.p + tc) + V3{x[1], x[2], x[3]};
+    V3 q = RyMul(c, s, (C * e.p + tc) * scale_) + V3{x[1], x[2], x[3]};
     double d = std::hypot(q.x - h.x, q.z - h.z);
     auto it = nearest.emplace((long long)std::floor(e.t * 10), d).first;
     it->second = std::min(it->second, d);
@@ -3055,7 +3127,7 @@ double Sync::BodyMotion(const X4 &x, double &moved) {
       M3 R;
       V3 h0, h1;
       if (!poses_.At(v[i]->t, R, h0) || !poses_.At(v[j]->t, R, h1)) continue;
-      V3 dq = RyMul(c, s, C * (v[j]->p - v[i]->p)), dh = h1 - h0;
+      V3 dq = RyMul(c, s, C * (v[j]->p - v[i]->p) * scale_), dh = h1 - h0;
       num += dh.x * dq.x + dh.z * dq.z;
       nh += dh.x * dh.x + dh.z * dh.z;
       nd += dq.x * dq.x + dq.z * dq.z;
@@ -3179,7 +3251,7 @@ void Sync::Use(const Shot &f) {
   if (have_lag && w <= kWmax && optics_.Pose(cam, Rc, tc)) solver_.AddFrame(t, hg, cam, p + R * tc, R * Rc);
   for (const Spot &b : bl) {
     int x10 = b.x10, y10 = b.y10, npx = b.npx;
-    if (npx > kMaxPx) { spots_.big++; continue; }
+    if (npx > (optics_.bloom() ? kMaxPxBloom : kMaxPx)) { spots_.big++; continue; }
     V3 o, d, o1, d1, o2, d2;
     if (!optics_.Ray(cam, x10 / 10.0 - 0.5, y10 / 10.0 - 0.5, o, d)) { spots_.other++; continue; }
     double sr = 0;
@@ -3522,6 +3594,7 @@ Transform Sync::Tick(double now) {
     }
     frame_.Update(raw);
     LayoutStep(raw, now);
+    double scale = 1;
     if (sfile_.autogen) {  // two stations: the other where the cameras measured it, in SteamVR's direction from the anchor
       std::string other;
       bool two = TwoStations(raw, other);
@@ -3540,9 +3613,21 @@ Transform Sync::Tick(double now) {
         V3 v = pb - pa;
         double h = std::hypot(v.x, v.z);
         if (h < 1) solver_.DropFix(kv.first);
-        else solver_.SetFix(kv.first, pa + V3{v.x / h * pl.d, pl.h, v.z / h * pl.d});
+        else {
+          solver_.SetFix(kv.first, pa + V3{v.x / h * pl.d, pl.h, v.z / h * pl.d});
+          scale = pl.d / h;
+        }
       }
     }
+    // the scale: by the cameras' place of the other station, on a headset whose space may be off in size; else 1.
+    // Within 0.85-1.15 (a place that far off is a wrong one, not the space)
+    scale = optics_.scaled() && scale > 0.85 && scale < 1.15 ? scale : 1;
+    if (std::fabs(scale - scale_said_) > 0.002) {
+      log_(Fmt("lighthouse space scaled by %.4f: the cameras put the base stations %.1f%% %s than SteamVR does",
+               scale, std::fabs(scale - 1) * 100, scale < 1 ? "closer together" : "further apart"));
+      scale_said_ = scale;
+    }
+    scale_ = scale;
     std::map<std::string, V3> cs;
     for (auto &kv : raw) {
       V3 p; M3 R;
@@ -3719,7 +3804,8 @@ Transform Sync::Tick(double now) {
   M3 R = Ry(applied_[0]);
   out.active = true;
   out.q = ToQuat(R * C);
-  out.t = R * tc + V3{applied_[1], applied_[2], applied_[3]};
+  out.s = scale_;  // about the reference frame's origin, the anchor station: q (s p) + t = R (s (C p + tc)) + x
+  out.t = R * (tc * scale_) + V3{applied_[1], applied_[2], applied_[3]};
   return out;
 }
 
