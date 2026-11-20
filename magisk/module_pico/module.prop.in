@@ -1,0 +1,6 @@
+id=questlhsync
+name=QuestLHSync (PICO 4)
+version=@VERSION@
+versionCode=@CODE@
+author=CreoleVR
+description=Lets SteamVR keep lighthouse trackers, controllers and base stations aligned to the PICO 4's own tracking. Serves the tracking cameras' view of the 2.0 base stations' laser flashes on the local network (TCP 47280, discovery UDP 47281) to the QuestLHSync SteamVR driver. The camera frames are read inside pvrtrackingservice with Frida only while a PC is connected; nothing on disk is patched.
