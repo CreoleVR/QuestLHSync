@@ -493,6 +493,10 @@ class Sync {
   void OnBodyPose(int dev, double t, V3 raw);  // lighthouse controllers and trackers (raw lighthouse universe)
   void SetStationsRaw(const std::map<std::string, std::pair<V3, M3>> &raw);
   void SetChannels(const std::map<std::string, int> &ch);
+  // The stations come from openhouse's own room (openhouse_room.h) rather than the runtime's devices: while it settles,
+  // sightings are not used (they'd be measured against stations still moving); a new epoch (a station moved) drops
+  // the older sightings. Not ours: neither.
+  void SetRoomSource(bool ours, bool settled, uint64_t epoch) { room_ours_ = ours; room_settled_ = settled; room_epoch_ = epoch; }
   void SetStreamer(const std::string &system);
   // the headset this session talks to (its serial and model from its hello): state.json is kept per headset. Safe from
   // any thread; Tick takes it up
@@ -523,7 +527,7 @@ class Sync {
   };
   Status GetStatus(double now);
   // the cameras' bright spots so far, and what became of them
-  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0; };
+  struct Spots { long frames = 0, seen = 0, used = 0, still = 0, fast = 0, big = 0, other = 0, dim = 0, unsettled = 0; };
   Spots spots() { std::lock_guard<std::mutex> g(net_); return spots_; }
   static std::string Describe(const Spots &from, const Spots &to);
   void StationsForDump(std::vector<std::string> &keys, std::vector<V3> &S) const {  // tools
@@ -571,6 +575,10 @@ class Sync {
   bool has_last_st_ = false;
   std::atomic<long> nframes_{0};
   Spots spots_;  // under net_
+  std::atomic<bool> room_ours_{false}, room_settled_{true};
+  std::atomic<uint64_t> room_epoch_{0};
+  uint64_t room_epoch_seen_ = 0;  // Tick's
+  bool room_waiting_ = false;     // Tick's: logged that the room is settling
   std::map<int, std::vector<std::pair<double, double>>> prev_big_;  // under net_: each camera's last steady lights
   long img_moved_ = 0, img_still_ = 0;  // under net_: of those, while SteamVR's headset stands still
   // under net_: short frames waiting for their head pose (kPoseWait), in arrival order
