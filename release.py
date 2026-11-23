@@ -82,8 +82,17 @@ def main():
             sys.exit(f"{os.path.relpath(path, HERE)} is missing or older than its sources: run {how}")
     ver = VERSION.lstrip("v")
     dest = os.path.join(HERE, "out", f"release-{ver}")
-    shutil.rmtree(dest, ignore_errors=True)
+    # the old folder moves aside whole first: Windows refuses that while a file in it is in use (its installer open),
+    # where deleting file by file would leave the installer without its zip
+    old = dest + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.exists(dest):
+        try:
+            os.rename(dest, old)
+        except OSError:
+            sys.exit(f"{os.path.relpath(dest, HERE)} is in use (is its installer open?): close it and run release.py again")
     os.makedirs(dest)
+    shutil.rmtree(old, ignore_errors=True)
     shutil.copy2(INSTALLER, os.path.join(dest, "QuestLHSync-steamvr-installer.exe"))
     steamvr_zip(os.path.join(dest, f"QuestLHSync-steamvr-{ver}.zip"))
     module_zip(os.path.join(dest, f"QuestLHSync-quest-module-{ver}.zip"))

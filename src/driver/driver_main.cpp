@@ -218,8 +218,29 @@ using PoseFn = void (*)(void *, uint32_t, const vr::DriverPose_t &, uint32_t);
 static PoseFn g_orig[2];
 static void *g_target[2], *g_detour[2];
 
+// A base station's pose comes from its driver only now and then (it doesn't move), so the transform it went out with
+// stays on it: one that went out under an alignment since put right is drawn where that one had it, while the
+// controllers, hundreds of poses a second, are already where they belong. Each station's last pose is kept as its driver
+// sent it, and sent again under the transform whenever the transform moves (ResendStations).
+struct StationLast {
+  std::mutex m;
+  bool have = false;
+  vr::DriverPose_t pose;
+  void *self = nullptr;
+  int hook = 0;
+};
+static StationLast g_last[vr::k_unMaxTrackedDeviceCount];
+
 template <int I>
 static void Detour(void *self, uint32_t id, const vr::DriverPose_t &pose, uint32_t size) {
+  if (size == sizeof(vr::DriverPose_t) && id < vr::k_unMaxTrackedDeviceCount && pose.poseIsValid &&
+      g_kind[id].load(std::memory_order_relaxed) == kLighthouse && g_dev[id].cls == vr::TrackedDeviceClass_TrackingReference) {
+    std::lock_guard<std::mutex> g(g_last[id].m);
+    g_last[id].have = true;
+    g_last[id].pose = pose;
+    g_last[id].self = self;
+    g_last[id].hook = I;
+  }
   if (size == sizeof(vr::DriverPose_t)) {
     vr::DriverPose_t p = pose;
     if (Apply(id, p)) { g_orig[I](self, id, p, size); return; }
@@ -243,6 +264,24 @@ static void HookHost(const char *version, int i, void *detour) {
   Log(Fmt("hooked %s::TrackedDevicePoseUpdated", version));
 }
 
+// the base stations' last poses again, under the transform as it is now (StationLast)
+static void ResendStations() {
+  for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
+    vr::DriverPose_t p;
+    void *self;
+    int hook;
+    {
+      std::lock_guard<std::mutex> g(g_last[i].m);
+      if (!g_last[i].have) continue;
+      p = g_last[i].pose;
+      self = g_last[i].self;
+      hook = g_last[i].hook;
+    }
+    if (!g_orig[hook] || !Apply(i, p)) continue;
+    g_orig[hook](self, i, p, sizeof p);
+  }
+}
+
 // takes the pose hooks out, each only while its function still jumps straight to our detour (MinHook's jmp to a relay
 // holding the detour's address): one another driver has hooked over since stays, passing poses on untouched, as taking
 // it out would take theirs with it
@@ -254,6 +293,7 @@ static void UnhookHost() {
     if (relay && relay[0] == 0xFF && relay[1] == 0x25 && *(const int32_t *)(relay + 2) == 0 &&
         *(void *const *)(relay + 6) == g_detour[j]) {
       MH_DisableHook(g_target[j]);
+      g_target[j] = nullptr;  // out: Cleanup after StandDown leaves it be
       Log("pose hook taken out");
     } else {
       Log("another driver hooked SteamVR's pose updates after QuestLHSync: its hook stays, passing poses on untouched");
@@ -346,10 +386,11 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     if (worker_.joinable()) worker_.join();
     if (g_gravity) g_gravity->Stop();
     if (link_) link_->Stop();
-    for (int j = 0; j < 2; j++)
-      if (g_target[j]) MH_DisableHook(g_target[j]);
+    // the pose hooks come out only while nothing hooked over them (UnhookHost): disabling one under another driver's
+    // hook would write SteamVR's bytes over theirs. MinHook isn't uninitialized: that frees the trampolines a late pose
+    // update may still be running through (or another driver's hook still jumps to) while vrserver exits
+    UnhookHost();
     if (g_rel) { g_rel->Unhook(); g_rel->Flush(true); }
-    MH_Uninitialize();
     if (g_sync) g_sync->SetRecord(nullptr);
     Log("QuestLHSync driver stopped");
     // g_sync and the mappings stay: a late pose update on another thread may still touch them while vrserver exits
@@ -411,6 +452,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         if (!family.empty() || any) {
           link_->SetFamily(any ? "" : family);  // before g_hmd: the link searches from then on
           link_->SetStreamer(sys);
+          link_->SetHmdSerial(serial);  // Link names the headset by its own serial: that one is SteamVR's
           g_hmd = (int)i;
           g_kind[i] = kHmd;
           std::lock_guard<std::mutex> g(hmd_m_);
@@ -485,6 +527,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   int cmd_seen_ = 0;
   double started_ = 0, last_status_ = 0;
   Sync::Spots rec_spots_;  // when the recording started
+  Transform sent_;          // the transform the base stations' poses last went out with (ResendStations)
 
   void ReadSettings() {
     auto *s = vr::VRSettings();
@@ -506,12 +549,19 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     s->GetString(kSection, "headset", pref, sizeof pref, &e);
     if (e == vr::VRSettingsError_None) link_->SetPreferred(pref);
     bool grav = s->GetBool(kSection, "gravity", &e);  // levelling by resting devices' gravity (gravity.h); on unset
-    g_gravity->SetEnabled(e != vr::VRSettingsError_None || grav);
+    bool grav_on = e != vr::VRSettingsError_None || grav;
+    g_gravity->SetEnabled(grav_on);
     bool steady = s->GetBool(kSection, "steadyStations", &e);  // base station moves averaged (relations.h); on unset
     steady_ = e != vr::VRSettingsError_None || steady;
     g_rel->SetEnabled(steady_);
     bool rec = s->GetBool(kSection, "record", &e);
     SetRecording(e == vr::VRSettingsError_None && rec);
+    // what was read, so a setting that didn't take is plain to see in the log (steamvr.vrsettings is SteamVR's own:
+    // edits made while SteamVR runs are overwritten when it exits)
+    std::string hl;
+    for (auto &h : hv) hl += (hl.empty() ? "" : ",") + h;
+    Log(Fmt("settings: host=%s headset=%s anyHmd=%d gravity=%d steadyStations=%d record=%d", hl.empty() ? "-" : hl.c_str(),
+            pref[0] ? "set" : "-", (int)any_hmd_, (int)grav_on, (int)steady_, (int)recording_));
   }
 
   void SetRecording(bool on) {
@@ -605,6 +655,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       case QLHS_CMD_RECORD_ON: SetRecording(true); break;
       case QLHS_CMD_RECORD_OFF: SetRecording(false); break;
       case QLHS_CMD_RECALIBRATE: g_sync->ForceRecalibrate(); break;
+      case QLHS_CMD_NEXT_HEADSET: link_->NextHeadset(); break;
     }
   }
 
@@ -638,6 +689,8 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     Copy(t->headset, sizeof t->headset, link_->model());
     Copy(t->headset_addr, sizeof t->headset_addr, ls == HeadsetLink::kConnected ? link_->addr() : "");
     Copy(t->headset_fw, sizeof t->headset_fw, link_->fw());
+    Copy(t->headset_why, sizeof t->headset_why, ls == HeadsetLink::kConnected ? link_->why() : "");
+    t->nheadsets = link_->headsets();
     t->cam_fps = s.cam_fps;
     t->sight_rate = s.sight_rate;
     t->spot_rate = s.spot_rate;
@@ -703,6 +756,14 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       Commands();
       Transform xf = g_sync->Tick(now);
       WriteXf(xf);
+      if (xf.active) {  // the stations follow a transform that moved by 5 mm or 0.05 deg (StationLast)
+        double dt = norm(xf.t - sent_.t),
+               dq = std::fabs(xf.q.w * sent_.q.w + xf.q.x * sent_.q.x + xf.q.y * sent_.q.y + xf.q.z * sent_.q.z);
+        if (!sent_.active || dt > 0.005 || 2 * std::acos(std::min(1.0, dq)) * kDeg > 0.05) {
+          sent_ = xf;
+          ResendStations();
+        }
+      }
       g_hide.store(!xf.active && link_->state() == HeadsetLink::kConnected);
       if (xf.active) g_unplaced.store(0);
       if (now - last_gravity_ >= 1) {

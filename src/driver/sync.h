@@ -104,6 +104,16 @@ constexpr double kLevelJump = 0.6;
 // sightings name a rotor when they follow it by kNamed more than any other; and the alignment with the stations where
 // their rotors say is taken if it keeps kSwapFit of the support
 constexpr double kIdEvery = 10.0, kSwapGain = 0.10, kNamed = 0.05, kSwapFit = 0.7;
+// lights (Solver::SurveyLights): every kLightsEvery s, the places the bright sightings cross, from kLightRays sightings
+// or more, are scored against the base stations' rotors. One that follows none by kLightScore in kLightVotes surveys in
+// a row is a light (a security camera's IR lamp, an LED the size of a station's dot): its sightings, within kLightDeg,
+// are left out of everything. One room's 25-minute recording: lights 0.000-0.003 in every survey, stations 0.005-0.15
+// (a station half hidden at the low end), and no station under kLightScore three surveys running
+// ... and never within kLightGuard of where the fit puts a station, nor at a place that has followed a rotor in any
+// survey (a station mostly hidden, 30 cm off SteamVR's map, once scored under kLightScore three times running)
+// A place counts as following a rotor from kRotorScore: between the two (a lamp once scored 0.004, live), nothing changes
+constexpr double kLightsEvery = 30.0, kLightScore = 0.004, kRotorScore = 0.008, kLightDeg = 0.7, kLightGuard = 0.5;
+constexpr int kLightRays = 200, kLightVotes = 3;
 // layout check (Solver::CheckLayout), three or more stations: every kLayoutEvery s. A station the cameras see kMoved
 // or more off where SteamVR's map has it beside the others is logged
 constexpr double kLayoutEvery = 30.0;
@@ -123,6 +133,14 @@ constexpr double kHeightBin = 0.05, kHeightTol = 0.2, kHeightKeep = 120.0;  // m
 // across more, the floor may have been set anew while the poses stopped (the boundary redone), and the kept height is
 // forgotten
 constexpr double kBrkJumpGap = 0.2;  // s
+// the headset's space tipped against the base stations (Solver::FindTilt), looked at every kTiltEvery s: kTiltMin deg
+// or more is no lighthouse room's own tilt (SteamVR's is within 2-3 deg) but the headset space's (a horizon adjust
+// before SteamVR started), and is taken back. The stations' places must fit within kTiltFit (m) of SteamVR's map
+constexpr double kTiltEvery = 60.0, kTiltMin = 5.0, kTiltFit = 0.3;
+// the headset's accelerometer levels to within a few degrees only (0.7-3.2 deg off afterwards, with which way the head
+// looks: the IMU a little askew of the head frame), and 2-3 deg left over put one station 15-20 cm off at 4 m, so the fit
+// holds two at a time and wanders between pairs. After it acts, the stations' tilt (FindTilt) refines it from kTiltFine
+constexpr double kTiltFine = 1.0;
 
 double RotorPeriod(int channel);  // s, a 2.0 base station on channel 1..16, else 0
 constexpr double kUpward = 0.1;        // a camera whose axis climbs this much (of 1) looks up: the Frame's upper pair
@@ -154,12 +172,17 @@ class Optics {
   enum Headset { kQuest, kFrame, kGalaxyXR };
   Headset headset() const { return headset_; }     // whose calibration it is
   bool exact_time() const { return exact_time_; }  // frame times are the frames' own, no poll lag to take off
+  // the accelerometer's raw axes -> the device's (the head's): the calibration's DeviceFromImu and its rectification
+  // (Meta's ImuCalibration; G lines). False when the calibration has none
+  bool Imu(M3 &R) const { R = imu_; return has_imu_; }
 
  private:
   CamCal cams_[kMaxCam];
   std::string device_;
   Headset headset_ = kQuest;
   bool exact_time_ = false;
+  bool has_imu_ = false;
+  M3 imu_;
   bool LoadFrame(const JVal &root, std::string *err);
 };
 
@@ -215,6 +238,15 @@ class PoseHist {
   std::string brk_what() const { std::lock_guard<std::mutex> g(m_); return brk_what_; }
   // the last break's gap (s) and how far up the head jumped across it (m)
   void brk_jump(double &gap, double &dy) const { std::lock_guard<std::mutex> g(m_); gap = brk_gap_; dy = brk_dy_; }
+  // ... as a move of the headset space (the head itself stayed put from one pose to the next: a recenter, the Quest
+  // finding its tracking again): p_after = R(q) p_before + t. yaw (rad) and tilt (deg): its turn about the vertical, and
+  // how far it tips the vertical (Steam Link's recenter makes the head's whole orientation the new level, nod and all)
+  void brk_move(Quat &q, V3 &t, double &yaw, double &tilt) const {
+    std::lock_guard<std::mutex> g(m_);
+    q = brk_q_; t = brk_tr_; yaw = brk_yaw_; tilt = brk_tilt_;
+  }
+  // the poses from time t0 on, taken through (q, t): back into the space the earlier ones are in
+  void Remap(double t0, const Quat &q, V3 t);
   void Clear() { std::lock_guard<std::mutex> g(m_); i_ = 0; pend_ = 0; }
 
  private:
@@ -222,7 +254,9 @@ class PoseHist {
   uint64_t i_ = 0;
   mutable std::mutex m_;
   std::atomic<int> brk_id_{0};
-  double brk_t_ = 0, brk_gap_ = 0, brk_dy_ = 0;
+  double brk_t_ = 0, brk_gap_ = 0, brk_dy_ = 0, brk_yaw_ = 0, brk_tilt_ = 0;
+  Quat brk_q_;
+  V3 brk_tr_;
   std::string brk_what_;
   uint64_t pend_ = 0;  // a jump waiting for the poses after it: the index of the first pose past it
   bool Find(double t, uint64_t &i) const;  // newest index with time <= t (caller holds m_)
@@ -335,6 +369,7 @@ class Solver {
   void AddFrame(double t, double g, int cam, V3 o, const M3 &R);  // every short frame; camera pose in Quest space
   void SetInImage(std::function<bool(int cam, V3 d)> f) { in_image_ = std::move(f); }
   void PoseBreak(double t, double dy = 0);  // dy: how far up the headset space moved (m), NAN if unknown
+  void DropSince(double t);  // the sightings and frames from t on (seen through poses since taken back: Sync::space_)
   StepStat Step(double now);
   bool has_x() const { return has_x_; }
   void SetDimDots(bool on) { dim_dots_ = on; }  // see dim_dots_
@@ -393,6 +428,16 @@ class Solver {
   std::function<bool(int, V3)> in_image_;
   std::string id_said_;
   std::map<std::string, double> layout_said_;  // the layout check's stations logged, and how far off
+  std::vector<V3> lights_;  // lights in headset space (SurveyLights), until the space moves; under m_
+  std::vector<std::pair<V3, int>> light_votes_;  // places that followed no rotor, and how many surveys in a row
+  std::vector<V3> rotor_places_;  // places that followed a rotor in a survey: never lights
+  // CheckLayout: two or more stations in view where the fit puts them and never seen there. Two stations seen from one
+  // part of the room fit more than one alignment, and a fit that holds a pair can be off by half a metre with the other
+  // stations' places in plain view: the next acquisition may take over as a forced one does (no twice the support)
+  bool gone_forced_ = false;
+  std::map<std::string, std::pair<V3, int>> dark_;  // CheckIdentity: a station's place under the fit following no
+                                                    // rotor, and how many checks in a row
+  double last_lights_ = -1e18;
   LogFn log_;
   std::mt19937_64 rng_;
   StepStat stat_;
@@ -418,7 +463,7 @@ class Solver {
   double held_t_ = -1e18;         // the Step that last added to it
   bool KeptHeight(double &h) const;  // the most-held height, once held kHeightKeep s
 
-  Rays GetRays(double t0);
+  Rays GetRays(double t0, bool lights = true);  // lights: leave out the sightings of lights_
   void Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate, std::vector<int> &cnt) const;
   static int Score(const std::vector<int> &c);
   static void Cells(const Rays &r, const std::vector<char> &use, std::vector<int> &cnt);
@@ -444,6 +489,21 @@ class Solver {
                    double now);
   void CheckIdentity(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
   void CheckLayout(const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
+  void SurveyLights(double now, const std::vector<std::string> &keys, const std::vector<V3> &S, const std::vector<V3> &Z);
+  // where the bright sightings r cross (seen from kPar apart or more, by min_rays or more), and how each follows the
+  // rotor periods tu (SeenScores; empty when too few frames to tell)
+  struct Place { V3 q; int n = 0; double par = 0; std::vector<double> sc; };
+  std::vector<Place> Places(const Rays &r, const std::vector<CamFrame> &fr, const std::vector<double> &tu, double P,
+                            int min_rays, int max_places) const;
+
+ public:
+  // The headset's space against the lighthouse room, from the stations alone: each one's place where its sightings
+  // cross, named by its rotor; the turn taking SteamVR's places onto them (Horn), and how far it tips the vertical.
+  // False without three stations so named and agreeing within kTiltFit. T: the tip alone (no turn about the vertical)
+  bool FindTilt(double now, M3 &T, double &tilt, std::string &how);
+  void Rotate(const M3 &R);  // the stored sightings, frames and lights through R (a tipped space put right: Sync)
+
+ private:
 };
 
 // ---------------------------------------------------------------- timing
@@ -561,9 +621,13 @@ class Sync {
   std::map<std::string, int> channels_;
   std::map<std::string, V3> quest_;  // saved station positions in Quest space
   bool seeded_ = false, have_applied_ = false, paused_ = false, locked_ = false;
+  double last_tilt_ = 0;  // the last look at the headset space's tilt (Solver::FindTilt)
+  bool tilt_seen_ = false;  // ... measured once
   X4 applied_{};
   double last_step_ = 0, last_save_ = 0, last_s_ = 0, last_timing_ = 0, last_level_ = 0, lock_time_ = -1;
   double level_read_ = -1e9;  // the last reading LevelStep took
+  bool level_far_ = false;    // ... the last one was a move, waiting for the next to say the same
+  M3 level_far_tilt_;
   double split_said_ = -1e18;  // when a timing estimate too unsure to take was last logged
   int brk_seen_ = 0, resets_seen_ = 0;
   double last_prec_ = -1e18;
@@ -594,6 +658,26 @@ class Sync {
   std::map<std::string, double> saved_timings_;
   bool has_saved_ = false;
   std::mutex st_m_;
+  // The headset's space as SteamVR has it now, against the one the alignment lives in: p_now = R(space_q_) p + space_t_.
+  // A recenter moves the space under the head between two poses; the move goes in here, the poses come in through it
+  // (OnHmdPose), and the transform goes out through it (Tick), so for the alignment nothing moved at all. Steam Link's
+  // recenter tips the space as well (the head's nod becomes level), which a 4-DOF alignment couldn't follow otherwise.
+  std::mutex space_m_;
+  Quat space_q_;
+  V3 space_t_;
+  // the headset's accelerometer (G lines): samples as they come (net_), and the window being summed (GravityStep)
+  struct GravS { double t; V3 a; };
+  std::deque<GravS> grav_;
+  V3 gwin_;
+  int gwin_n_ = 0;
+  double gwin_t0_ = -1, grav_said_ = -1e9;
+  V3 gprev_;               // the last window's up, while it said the space is tipped (two running decide)
+  bool gprev_ok_ = false;
+  bool refine_tilt_ = false;  // the accelerometer tipped the space back: the stations' tilt refines it, once
+  void GravityStep(double now);
+  // the space found tipped by Tm (the turn taking the vertical onto where up is): into space_, the poses and the
+  // solver's sightings taken back through it, acquired again
+  void TipSpace(const M3 &Tm, double tilt, const std::string &by);
   struct BodyS { double t; int dev; V3 p; };  // raw lighthouse universe
   std::mutex body_m_;
   std::deque<BodyS> body_, body_new_;  // the last ACQ_WIN s; new ones, for the recording

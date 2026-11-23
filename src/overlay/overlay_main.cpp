@@ -1,7 +1,8 @@
 // QuestLHSync.exe: the SteamVR dashboard page. Started by the driver each session, exits with SteamVR.
 // Reads the driver's status from the shared memory (qlhs_status.h), draws it with GDI at 2x and downsamples
 // (anti-aliased shapes and text), and sends the buttons back as commands.
-//   QuestLHSync.exe --preview out.png [locked|acquiring|still|frozen|searching|nohmd]   renders a sample page, no VR
+//   QuestLHSync.exe --preview out.png [locked|acquiring|still|frozen|searching|nohmd|paused|two|unsure]   renders a
+//   sample page, no VR
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -223,6 +224,11 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
 
   // headset card
   p.Text(x1 + 22, top + 18, L"HEADSET", label, col::faint);
+  if (s.headset_why[0]) {  // why this one, when several could be SteamVR's (or the settings name one)
+    std::string why = s.headset_why;
+    uint32_t wc = why.rfind("can't", 0) == 0 || why.rfind("may be", 0) == 0 ? col::amber : col::dim;
+    p.Text(x1 + cw - 22, top + 19, Wide(s.headset_why), small, wc, 2, cw - 130);
+  }
   p.Text(x1 + 22, top + 44, s.headset[0] ? Wide(s.headset) : L"—", big, col::text, 0, cw - 44);
   row(x1, top + 100, L"Address", s.headset_addr[0] ? Wide(s.headset_addr) : L"—");
   row(x1, top + 134, L"Cameras", s.cam_fps > 0.5 ? F(L"%.0f frames/s", s.cam_fps) : L"—",
@@ -289,6 +295,8 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
   pg.buttons.push_back({304, by, 210, bh, s.recording ? QLHS_CMD_RECORD_OFF : QLHS_CMD_RECORD_ON,
                         s.recording ? L"Stop recording" : L"Record session", false});
   pg.buttons.push_back({530, by, 240, bh, QLHS_CMD_RECALIBRATE, L"Force recalibrate", false});
+  bool several = s.nheadsets > 1 && s.headset_addr[0];  // another headset could be SteamVR's: offer it
+  if (several) pg.buttons.push_back({786, by, 220, bh, QLHS_CMD_NEXT_HEADSET, L"Switch headset", false});
   for (size_t i = 0; i < pg.buttons.size(); i++) {
     auto &b = pg.buttons[i];
     bool hov = (int)i == pg.hover;
@@ -297,7 +305,8 @@ static void Draw(Canvas &cv, Page &pg, const QlhsStatus &s, bool stale) {
     if (b.cmd == QLHS_CMD_RECORD_OFF) p.Dot(b.x + 26, b.y + bh / 2, 6, col::red);
     p.Text(b.x + b.w / 2 + (b.cmd == QLHS_CMD_RECORD_OFF ? 10 : 0), b.y + 11, b.label, h2, col::text, 1);
   }
-  p.Text(W - 48, by + 14, L"Settings: steamvr.vrsettings → driver_questlhsync", small, col::faint, 2);
+  if (several) p.Text(W - 48, by + 14, F(L"%d headsets answer", s.nheadsets), small, col::faint, 2);
+  else p.Text(W - 48, by + 14, L"Settings: steamvr.vrsettings → driver_questlhsync", small, col::faint, 2);
 }
 
 // 2x2 box filter + BGRX -> RGBA (alpha 255)
@@ -433,6 +442,8 @@ static QlhsStatus Sample(const char *kind) {
   if (!strcmp(kind, "searching")) { s.state = QLHS_SEARCHING; s.headset_addr[0] = 0; s.cam_fps = 0; s.rtt_ms = 0; s.locked = 0; s.nfit = 0; s.med_deg = -1; s.yaw_deg = 0; s.locked_for = -1; }
   if (!strcmp(kind, "nohmd")) { s.state = QLHS_NO_HMD; strcpy(s.hmd, "PlayStation VR2"); }
   if (!strcmp(kind, "paused")) s.paused = 1;
+  if (!strcmp(kind, "two")) { s.nheadsets = 2; strcpy(s.headset_why, "streams with this PC"); }
+  if (!strcmp(kind, "unsure")) { s.nheadsets = 2; strcpy(s.headset_why, "can't tell which one is SteamVR's"); }
   return s;
 }
 

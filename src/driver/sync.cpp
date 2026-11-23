@@ -156,6 +156,22 @@ bool Optics::Load(const std::string &json, std::string *err) {
   device_ = type && type->t == JVal::Str ? type->s : "";
   headset_ = gxr ? kGalaxyXR : kQuest;
   exact_time_ = gxr_sensor;  // Backend converted QVR sensor BOOTTIME to daemon MONOTONIC.
+  has_imu_ = false;  // the accelerometer: device <- IMU (rotation), times its rectification
+  if (const JVal *imu = root.get("ImuCalibration")) {
+    const JVal *dfi = imu->get("DeviceFromImu"), *acc = imu->get("Accelerometer");
+    const JVal *rect = acc ? acc->get("RectificationMatrix") : nullptr;
+    std::vector<double> D = dfi ? dfi->nums() : std::vector<double>(), K = rect ? rect->nums() : std::vector<double>();
+    if (D.size() >= 16) {
+      M3 R, Kr;
+      for (int r = 0; r < 3; r++)
+        for (int q = 0; q < 3; q++) R.m[r][q] = D[r * 4 + q];
+      if (K.size() >= 9)
+        for (int r = 0; r < 3; r++)
+          for (int q = 0; q < 3; q++) Kr.m[r][q] = K[r * 3 + q];
+      imu_ = R * Kr;
+      has_imu_ = true;
+    }
+  }
   return true;
 }
 
@@ -464,7 +480,28 @@ void PoseHist::Break(const PoseS &a, const PoseS &b) {
   brk_what_ = Fmt("%.2f s, %.0f cm, %.1f deg", b.t - a.t, norm(b.p - a.p) * 100, QuatDeg(a.q, b.q));
   brk_gap_ = b.t - a.t;
   brk_dy_ = b.p.y - a.p.y;
+  // the head stayed put from a to b, so the space moved by what takes a's pose onto b's: q_b = q_m q_a, p_b = R_m p_a +
+  // t_m. Its heading (where it turns the z axis) is the yaw; how far it tips the vertical is the tilt
+  Quat m = b.q * Quat{a.q.w, -a.q.x, -a.q.y, -a.q.z};
+  double n = std::sqrt(m.w * m.w + m.x * m.x + m.y * m.y + m.z * m.z);
+  brk_q_ = {m.w / n, m.x / n, m.y / n, m.z / n};
+  M3 R = ToM3(brk_q_);
+  brk_yaw_ = std::atan2(R.m[0][2], R.m[2][2]);
+  brk_tilt_ = std::acos(std::max(-1.0, std::min(1.0, R.m[1][1]))) * kDeg;
+  brk_tr_ = b.p - R * a.p;
   brk_id_++;
+}
+
+void PoseHist::Remap(double t0, const Quat &q, V3 t) {
+  std::lock_guard<std::mutex> g(m_);
+  M3 R = ToM3(q);
+  uint64_t lo = i_ > (uint64_t)N ? i_ - N : 0;
+  for (uint64_t k = i_; k-- > lo;) {
+    PoseS &s = ring_[k % N];
+    if (s.t < t0) break;
+    s.q = q * s.q;
+    s.p = R * s.p + t;
+  }
 }
 
 // s back near the poses just before the pending jump, and well off where the jump went?
@@ -858,13 +895,18 @@ void Solver::Clear() {
   id_said_.clear();
   stat_ = StepStat();
   has_stat_ = false;
-  acq_forced_ = acq_dim_ = false;
+  acq_forced_ = acq_dim_ = gone_forced_ = false;
   starved_ = false;
   dot_ = dot_said_ = 0;
   amb_state_ = 0;
   kept_said_ = -1e18;
   held_h_.clear();  // another headset, or a reference frame pinned anew: the height held means nothing now
   held_t_ = -1e18;
+  lights_.clear();
+  light_votes_.clear();
+  rotor_places_.clear();
+  dark_.clear();
+  last_lights_ = -1e18;
 }
 
 void Solver::Add(double t, V3 o, V3 d, double gt, int cam, bool bright, double sr) {
@@ -913,7 +955,7 @@ void Solver::SetStation(const std::string &serial, V3 p, const M3 &R) {
   S_[serial] = {p, R};
 }
 
-Solver::Rays Solver::GetRays(double t0) {
+Solver::Rays Solver::GetRays(double t0, bool lights) {
   std::lock_guard<std::mutex> g(m_);
   if (!rt_.empty() && rt_.front() < rt_.back() - kKeep) {
     size_t j = std::lower_bound(rt_.begin(), rt_.end(), rt_.back() - kKeep) - rt_.begin();
@@ -927,13 +969,28 @@ Solver::Rays Solver::GetRays(double t0) {
   }
   Rays r;
   size_t j = std::lower_bound(rt_.begin(), rt_.end(), t0) - rt_.begin();
-  r.T.assign(rt_.begin() + j, rt_.end());
-  r.O.assign(ro_.begin() + j, ro_.end());
-  r.D.assign(rd_.begin() + j, rd_.end());
-  r.G.assign(rg_.begin() + j, rg_.end());
-  r.C.assign(rc_.begin() + j, rc_.end());
-  r.B.assign(rb_.begin() + j, rb_.end());
-  r.A.assign(ra_.begin() + j, ra_.end());
+  if (!lights || lights_.empty()) {
+    r.T.assign(rt_.begin() + j, rt_.end());
+    r.O.assign(ro_.begin() + j, ro_.end());
+    r.D.assign(rd_.begin() + j, rd_.end());
+    r.G.assign(rg_.begin() + j, rg_.end());
+    r.C.assign(rc_.begin() + j, rc_.end());
+    r.B.assign(rb_.begin() + j, rb_.end());
+    r.A.assign(ra_.begin() + j, ra_.end());
+    return r;
+  }
+  const double cmax = std::cos(kLightDeg / kDeg);
+  for (size_t n = j; n < rt_.size(); n++) {
+    bool lit = false;
+    for (const V3 &l : lights_) {
+      V3 w = l - ro_[n];
+      double d = norm(w);
+      if (d > 0.4 && dot(w, rd_[n]) > cmax * d) { lit = true; break; }
+    }
+    if (lit) continue;
+    r.T.push_back(rt_[n]); r.O.push_back(ro_[n]); r.D.push_back(rd_[n]); r.G.push_back(rg_[n]);
+    r.C.push_back(rc_[n]); r.B.push_back(rb_[n]); r.A.push_back(ra_[n]);
+  }
   return r;
 }
 
@@ -1650,10 +1707,25 @@ void Solver::CheckMirror(X4 &best, int &bs, const std::vector<V3> &S, const std:
 }
 
 // the HMD pose stream broke: the Quest's space may have changed under the older sightings (boundary reset)
+void Solver::DropSince(double t) {
+  std::lock_guard<std::mutex> g(m_);
+  size_t j = std::lower_bound(rt_.begin(), rt_.end(), t) - rt_.begin();
+  rt_.resize(j); ro_.resize(j); rd_.resize(j); rg_.resize(j); rc_.resize(j); rb_.resize(j); ra_.resize(j);
+  while (!frames_.empty() && frames_.back().t >= t) frames_.pop_back();
+}
+
 void Solver::PoseBreak(double t, double dy) {
   brk_ = since_ = std::max(since_, t);
   last_acq_ = -1e18;
   has_acq_x_ = false;
+  {  // the lights were found in the headset space as it was: found again in the new one
+    std::lock_guard<std::mutex> g(m_);
+    lights_.clear();
+  }
+  light_votes_.clear();
+  rotor_places_.clear();
+  dark_.clear();
+  last_lights_ = -1e18;
   // the headset space moved up dy (a floor set anew): the fit's height goes with it; by an unknown height (NAN), the
   // height held means nothing now
   if (std::isnan(dy)) {
@@ -1793,6 +1865,28 @@ static std::vector<int> Assign(const std::vector<std::vector<double>> &w) {
   return c;
 }
 
+// the point nearest the rays n (least squares), from q0; false when they don't pin one (all the same direction)
+template <class Rs>
+static bool Crossing(const Rs &r, const std::vector<size_t> &n, V3 q0, V3 &q) {
+  if (n.size() < 10) return false;
+  M3 A;
+  A.m[0][0] = A.m[1][1] = A.m[2][2] = 0;
+  double b[3] = {0, 0, 0};
+  for (size_t m : n) {
+    double dv[3] = {r.D[m].x, r.D[m].y, r.D[m].z}, ov[3] = {r.O[m].x, r.O[m].y, r.O[m].z};
+    for (int i = 0; i < 3; i++)
+      for (int j = 0; j < 3; j++) {
+        double p = (i == j ? 1 : 0) - dv[i] * dv[j];
+        A.m[i][j] += p;
+        b[i] += p * ov[j];
+      }
+  }
+  M3 Ai;
+  if (!Inv3(A, Ai)) return false;
+  q = Ai * V3{b[0], b[1], b[2]};
+  return norm(q - q0) < 1.0;  // near where the fit put it: depth from too little parallax is no crossing
+}
+
 // The sightings at each station's place are scored against every station's rotor period, and the stations given the
 // places whose sightings follow their rotors best (each station one place). Where that names other places than the
 // alignment's by kSwapGain in all, the stations are mixed up: two swapped, or four in a square turned by 90 deg, which
@@ -1877,6 +1971,45 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
     log_(s);
   };
   size_t N = cur.at.size();
+  // A station's place under the fit that follows no rotor at all, while another station's follows its own clearly:
+  // the fit has that station on a light (SurveyLights). Taken for one after kLightVotes checks running (30 s): the point
+  // its sightings there cross at, and they are left out from then on, so the fit loses what it held on them
+  {
+    bool clear = false;
+    for (size_t n = 0; n < N; n++) {
+      double other = 0;
+      for (size_t i = 0; i < u.size(); i++)
+        if (i != cur.at[n]) other = std::max(other, cur.sc[n][i]);
+      clear = clear || cur.sc[n][cur.at[n]] - other >= kNamed;
+    }
+    for (size_t n = 0; n < N; n++) {
+      size_t k = u[cur.at[n]];
+      double top = *std::max_element(cur.sc[n].begin(), cur.sc[n].end());
+      auto &d = dark_[keys[k]];
+      if (!clear || top >= kLightScore || norm(d.first - cur.Pq[k]) > 0.3) d = {cur.Pq[k], 0};
+      if (!clear || top >= kLightScore || ++d.second < kLightVotes) continue;
+      d.second = 0;
+      std::vector<size_t> near;  // its sightings there
+      for (size_t m = 0; m < r.size(); m++) {
+        int kk;
+        double a;
+        Nearest(cur.Pq, cur.Zq, r.O[m], r.D[m], kk, a);
+        if (kk == (int)k && a < 1.0) near.push_back(m);
+      }
+      V3 q;
+      if (!Crossing(r, near, cur.Pq[k], q)) continue;
+      bool known = false;
+      {
+        std::lock_guard<std::mutex> g(m_);
+        for (const V3 &l : lights_) known = known || norm(l - q) < 0.3;
+        if (!known) lights_.push_back(q);
+      }
+      if (!known)
+        log_(Fmt("channel check: where the fit puts %s, at [%.2f %.2f %.2f], its %d sightings follow no base station's "
+                 "rotor (best %.3f) while the others follow theirs: a light, or SteamVR's map has the station elsewhere; "
+                 "those sightings are left out", keys[k].c_str(), q.x, q.y, q.z, (int)near.size(), top));
+    }
+  }
   std::vector<size_t> moved;
   for (size_t n = 0; n < N; n++)
     if (cur.is[n] != (int)cur.at[n]) moved.push_back(n);
@@ -1945,8 +2078,16 @@ void Solver::CheckIdentity(double now, const std::vector<std::string> &keys, con
     double dc, ds;
     std::string how;
     Id nw;
-    if (BodyFavours(x_, xs, dc, ds, how) == 1) {
+    // and like an acquisition, it doesn't leave the height the fit has held without the worn devices for it: a relabelling
+    // read off a station's dim or partly hidden sightings can put the stations on lamps, as far off in height as in yaw
+    int fav = BodyFavours(x_, xs, dc, ds, how);
+    double hk = 0;
+    bool off = KeptHeight(hk) && std::fabs(xs[2] - hk) > kHeightTol && std::fabs(x_[2] - hk) <= kHeightTol;
+    if (fav == 1) {
       say("body " + who, "channel check: " + told("look") + ", but " + how + ": kept as it is");
+    } else if (off && fav != 2) {
+      say("height " + who, "channel check: " + told("look") + Fmt(", but that way the fit would sit %.2f m high, against "
+                                                                  "the %.2f m it has held: kept as it is", xs[2], hk));
     } else if (Apart(xs, x_, S) < 0.3) {
       say("same " + who, "channel check: " + told("look") + ", but the rays fit no alignment that way: kept as it is");
     } else if (!(sc > 0 && sw >= kSwapFit * sc)) {
@@ -2054,6 +2195,13 @@ void Solver::CheckLayout(const std::vector<std::string> &keys, const std::vector
     if ((int)v.size() >= kView && seen * 50 <= (int)v.size()) gone.push_back(i);
     else if (SeenScores(v, tu, P, sc) && named(sc) == (int)i) ok.push_back(i);
   }
+  if (gone.size() >= 2 && !gone_forced_) {
+    std::string who;
+    for (size_t i : gone) who += (who.empty() ? "" : ", ") + keys[u[i]];
+    log_("layout check: " + who + " in the cameras' view where the fit puts them, and never seen there: the fit is "
+         "likely wrong, the next acquisition may take over");
+  }
+  gone_forced_ = gone.size() >= 2;
   if (ok.size() < 2 || gone.empty()) return;
   std::vector<size_t> fn, vn;  // the sightings no place explains; one of them per (head, direction) cell votes
   {
@@ -2159,6 +2307,321 @@ void Solver::CheckLayout(const std::vector<std::string> &keys, const std::vector
   }
 }
 
+// Lights. A base station's dot comes and goes with its rotor: the cameras catch the sweep only in the short frames its
+// phase lands in, so seeing it follows the rotor period (SeenScores). A light the size of a dot (a security camera's IR
+// lamp, an LED on the ceiling) is seen in every frame it's in view of, and follows none. Next to a station, such a light
+// lines up with SteamVR's map about as well as the station itself, and a fit that takes it for the station gathers
+// support from every frame (a room with one station 30 cm from where SteamVR's map has it, and an IR lamp 70 cm from
+// it, held a fit on the lamp). So: where the bright sightings cross (each votes for the cells it passes 0.6-7 m out,
+// then the point nearest the rays about the best cell), seen from directions kPar apart or more by kLightRays
+// sightings, and following no rotor by kLightScore in kLightVotes surveys running, is a light, kept in headset space
+// until the space moves; its sightings are left out of every fit (GetRays). A station partly hidden follows its rotor
+// weakly (0.005 and up where lights stay under 0.003), so one survey decides nothing. Nothing is decided without two or
+// more rotors to score against.
+void Solver::SurveyLights(double now, const std::vector<std::string> &keys, const std::vector<V3> &S,
+                          const std::vector<V3> &Z) {
+  double P = frame_p_;
+  if (!(P > 0) || !in_image_) return;
+  std::vector<double> tu;  // the rotor periods of the stations SteamVR has, each once
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &k : keys) {
+      auto it = ch_.find(k);
+      double t = it != ch_.end() ? RotorPeriod(it->second) : 0;
+      if (t && std::find(tu.begin(), tu.end(), t) == tu.end()) tu.push_back(t);
+    }
+  }
+  if (tu.size() < 2) return;
+  Rays r = Bright(GetRays(std::max(now - WIN, since_), false));
+  std::vector<CamFrame> fr;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &f : frames_)
+      if (f.t >= std::max(now - WIN, since_)) fr.push_back(f);
+  }
+  std::vector<V3> Pq, Zq;  // where the fit puts the stations: no light is taken there (that's CheckIdentity's to tell)
+  if (has_x_) Predict(x_, S, Z, Pq, Zq);
+  for (const Place &pl : Places(r, fr, tu, P, kLightRays, 8)) {
+    if (pl.sc.empty()) continue;
+    const V3 &q = pl.q;
+    const std::vector<double> &sc = pl.sc;
+    double top = *std::max_element(sc.begin(), sc.end());
+    auto lv = light_votes_.end();
+    for (auto e = light_votes_.begin(); e != light_votes_.end(); ++e)
+      if (norm(e->first - q) < 0.3) lv = e;
+    bool rotor = false, station = false;
+    for (const V3 &p : rotor_places_) rotor = rotor || norm(p - q) < 0.3;
+    for (const V3 &p : Pq) station = station || norm(p - q) < kLightGuard;
+    if (top >= kRotorScore) {  // a rotor: a station, or its reflection
+      if (!rotor) rotor_places_.push_back(q);
+      if (lv != light_votes_.end()) light_votes_.erase(lv);
+      bool was = false;
+      {
+        std::lock_guard<std::mutex> g(m_);
+        for (auto l = lights_.begin(); l != lights_.end();)  // within its own few cm: a station 30 cm off SteamVR's map
+          if (norm(*l - q) < 0.15) { l = lights_.erase(l); was = true; }  // leaves the stray light at the map's place
+          else ++l;
+      }
+      if (was)
+        log_(Fmt("light at [%.2f %.2f %.2f]: its sightings follow a base station's rotor after all (%.3f): used again",
+                 q.x, q.y, q.z, top));
+      continue;
+    }
+    if (top >= kLightScore || rotor || station) {  // in between; or has followed a rotor before, or is where the fit
+                                                   // puts a station (CheckIdentity's to tell)
+      if (lv != light_votes_.end()) light_votes_.erase(lv);
+      continue;
+    }
+    if (lv == light_votes_.end()) {
+      light_votes_.push_back({q, 1});
+      continue;
+    }
+    lv->first = q;
+    if (++lv->second < kLightVotes) continue;
+    bool known = false;
+    {
+      std::lock_guard<std::mutex> g(m_);
+      for (const V3 &l : lights_) known = known || norm(l - q) < 0.3;
+      if (!known) lights_.push_back(q);
+    }
+    if (!known)
+      log_(Fmt("light at [%.2f %.2f %.2f]: %d sightings from %.0f deg apart follow no base station's rotor (best %.3f): "
+               "not a base station, its sightings are left out", q.x, q.y, q.z, pl.n, pl.par,
+               top));
+  }
+}
+// the turn taking the vertical onto u (unit), about the horizontal axis between them: a tip with no turn about the vertical
+static M3 Swing(V3 u) {
+  V3 ax = cross(V3{0, 1, 0}, u);
+  double s = norm(ax), a = std::atan2(s, u.y);
+  if (s < 1e-9) return M3();
+  ax = ax * (1 / s);
+  return ToM3(Quat{std::cos(a / 2), ax.x * std::sin(a / 2), ax.y * std::sin(a / 2), ax.z * std::sin(a / 2)});
+}
+
+// The turn taking the points a onto b about their centroids, least squares (Horn 1987): the eigenvector of the largest
+// eigenvalue of his 4x4 matrix, by power iteration on it shifted to make that eigenvalue the dominant one
+static Quat HornRotation(const std::vector<V3> &a, const std::vector<V3> &b) {
+  V3 ma, mb;
+  for (size_t i = 0; i < a.size(); i++) { ma += a[i]; mb += b[i]; }
+  ma = ma * (1.0 / a.size());
+  mb = mb * (1.0 / b.size());
+  double S[3][3] = {};
+  for (size_t i = 0; i < a.size(); i++) {
+    V3 p = a[i] - ma, q = b[i] - mb;
+    double pv[3] = {p.x, p.y, p.z}, qv[3] = {q.x, q.y, q.z};
+    for (int u = 0; u < 3; u++)
+      for (int w = 0; w < 3; w++) S[u][w] += pv[u] * qv[w];
+  }
+  double N[4][4] = {
+      {S[0][0] + S[1][1] + S[2][2], S[1][2] - S[2][1], S[2][0] - S[0][2], S[0][1] - S[1][0]},
+      {S[1][2] - S[2][1], S[0][0] - S[1][1] - S[2][2], S[0][1] + S[1][0], S[2][0] + S[0][2]},
+      {S[2][0] - S[0][2], S[0][1] + S[1][0], -S[0][0] + S[1][1] - S[2][2], S[1][2] + S[2][1]},
+      {S[0][1] - S[1][0], S[2][0] + S[0][2], S[1][2] + S[2][1], -S[0][0] - S[1][1] + S[2][2]}};
+  double shift = 0;
+  for (auto &row : N)
+    for (double e : row) shift += std::fabs(e);
+  for (int i = 0; i < 4; i++) N[i][i] += shift;
+  double v[4] = {1, 0.1, 0.1, 0.1};
+  for (int it = 0; it < 2000; it++) {
+    double w[4] = {}, n = 0;
+    for (int i = 0; i < 4; i++)
+      for (int j = 0; j < 4; j++) w[i] += N[i][j] * v[j];
+    for (double e : w) n += e * e;
+    n = std::sqrt(n);
+    if (!(n > 0)) break;
+    for (int i = 0; i < 4; i++) v[i] = w[i] / n;
+  }
+  return {v[0], v[1], v[2], v[3]};
+}
+
+bool Solver::FindTilt(double now, M3 &Tm, double &tilt, std::string &how) {
+  double P = frame_p_;
+  if (!(P > 0) || !in_image_) return false;
+  std::vector<std::string> keys;
+  std::vector<V3> S, Z;
+  Stations(keys, S, Z);
+  std::vector<double> tau(keys.size(), 0.0);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (size_t k = 0; k < keys.size(); k++) {
+      auto it = ch_.find(keys[k]);
+      if (it != ch_.end()) tau[k] = RotorPeriod(it->second);
+    }
+  }
+  std::vector<double> tu;  // the stations with a channel of their own, and their rotors
+  std::vector<size_t> own;
+  for (size_t k = 0; k < keys.size(); k++)
+    if (tau[k] && std::count(tau.begin(), tau.end(), tau[k]) == 1) { tu.push_back(tau[k]); own.push_back(k); }
+  if (tu.size() < 3) { how = "fewer than 3 channels"; return false; }
+  Rays r = Bright(GetRays(std::max(now - WIN, since_)));
+  std::vector<CamFrame> fr;
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (auto &f : frames_)
+      if (f.t >= std::max(now - WIN, since_)) fr.push_back(f);
+  }
+  std::vector<Place> pl = Places(r, fr, tu, P, 40, 10);
+  how = Fmt("%d places:", (int)pl.size());
+  for (auto &e : pl) {
+    how += Fmt(" [%.2f %.2f %.2f] n%d", e.q.x, e.q.y, e.q.z, e.n);
+    for (double x : e.sc) how += Fmt(" %.3f", x);
+  }
+  // each station at the place that follows its rotor best, clearly (kRotorScore, and twice any other rotor there: a
+  // station mostly hidden scores 0.01; a wrong naming wouldn't fit SteamVR's map within kTiltFit below)
+  std::vector<int> at(tu.size(), -1);
+  std::vector<double> got(tu.size(), 0.0);
+  for (size_t i = 0; i < pl.size(); i++) {
+    const auto &sc = pl[i].sc;
+    if (sc.empty()) continue;
+    size_t b = std::max_element(sc.begin(), sc.end()) - sc.begin();
+    double other = 0;
+    for (size_t j = 0; j < sc.size(); j++)
+      if (j != b) other = std::max(other, sc[j]);
+    if (sc[b] >= kRotorScore && sc[b] >= 2 * other && sc[b] > got[b]) { at[b] = (int)i; got[b] = sc[b]; }
+  }
+  std::vector<V3> A, B;
+  std::string who;
+  for (size_t j = 0; j < tu.size(); j++)
+    if (at[j] >= 0) {
+      A.push_back(S[own[j]]);
+      B.push_back(pl[at[j]].q);
+      who += (who.empty() ? "" : ", ") + keys[own[j]];
+    }
+  if (A.size() < 3) { how += " | named " + who; return false; }
+  double spread = 0;  // not all on one line: the largest triangle they make (m^2)
+  for (size_t i = 0; i < A.size(); i++)
+    for (size_t j = i + 1; j < A.size(); j++)
+      for (size_t k = j + 1; k < A.size(); k++) spread = std::max(spread, 0.5 * norm(cross(A[j] - A[i], A[k] - A[i])));
+  if (spread < 0.5) return false;
+  M3 R = ToM3(HornRotation(A, B));
+  V3 ma, mb;
+  for (size_t i = 0; i < A.size(); i++) { ma += A[i]; mb += B[i]; }
+  V3 t = mb * (1.0 / A.size()) - R * (ma * (1.0 / A.size()));
+  double worst = 0;
+  for (size_t i = 0; i < A.size(); i++) worst = std::max(worst, norm(R * A[i] + t - B[i]));
+  V3 up = R * V3{0, 1, 0};
+  tilt = std::atan2(std::hypot(up.x, up.z), up.y) * kDeg;
+  how = Fmt("%d stations (%s) within %.0f cm", (int)A.size(), who.c_str(), worst * 100);
+  if (worst > kTiltFit) return false;
+  Tm = Swing(up);  // the tip alone
+  return true;
+}
+
+void Solver::Rotate(const M3 &R) {
+  {
+    std::lock_guard<std::mutex> g(m_);
+    for (size_t n = 0; n < ro_.size(); n++) { ro_[n] = R * ro_[n]; rd_[n] = R * rd_[n]; }
+    for (auto &f : frames_) { f.o = R * f.o; f.R = R * f.R; }
+    for (V3 &l : lights_) l = R * l;
+  }
+  for (auto &v : light_votes_) v.first = R * v.first;
+  for (V3 &p : rotor_places_) p = R * p;
+  dark_.clear();
+  has_x_ = has_acq_x_ = false;  // a 4-DOF fit in a tipped space means nothing: acquired again, level
+  held_h_.clear();
+  held_t_ = -1e18;
+  last_acq_ = -1e18;
+}
+
+std::vector<Solver::Place> Solver::Places(const Rays &r, const std::vector<CamFrame> &fr, const std::vector<double> &tu,
+                                          double P, int min_rays, int max_places) const {
+  constexpr double kVox = 0.10, kNear = 1.0, kPar = 10.0;
+  std::vector<Place> out;
+  std::vector<size_t> fn, vn;  // the sightings with a frame time; one of them per (head, direction) cell votes
+  {
+    std::unordered_map<CellKey, int, CellHash> cells;
+    for (size_t n = 0; n < r.size(); n++)
+      if (std::isfinite(r.G[n])) {
+        fn.push_back(n);
+        if (cells.emplace(KeyOf(r.O[n], r.D[n]), 0).second) vn.push_back(n);
+      }
+  }
+  if ((int)fn.size() < min_rays) return out;
+  auto off = [&](V3 q, size_t n) {  // deg
+    V3 w = q - r.O[n];
+    double d = norm(w);
+    return d > 0.4 ? std::acos(std::max(-1.0, std::min(1.0, dot(w, r.D[n]) / d))) * kDeg : kInf;
+  };
+  const int64_t kO = 1 << 20;
+  std::vector<char> left(r.size(), 0);
+  for (size_t n : fn) left[n] = 1;
+  for (int it = 0; it < max_places; it++) {
+    std::unordered_map<int64_t, int> vote;
+    for (size_t n : vn) {
+      if (!left[n]) continue;
+      int64_t last = -1;
+      for (double d = 0.6; d < 7.0; d += kVox / 2) {
+        V3 p = r.O[n] + r.D[n] * d;
+        int64_t c = ((int64_t)std::floor(p.x / kVox) + kO) << 42 | ((int64_t)std::floor(p.y / kVox) + kO) << 21 |
+                    ((int64_t)std::floor(p.z / kVox) + kO);
+        if (c != last) vote[c]++;
+        last = c;
+      }
+    }
+    int64_t best = -1;
+    int bv = 0;
+    for (auto &kv : vote)
+      if (kv.second > bv || (kv.second == bv && kv.first < best)) { best = kv.first; bv = kv.second; }
+    if (bv < 10) break;
+    V3 q{((best >> 42) - kO + 0.5) * kVox, (((best >> 21) & 0x1FFFFF) - kO + 0.5) * kVox, ((best & 0x1FFFFF) - kO + 0.5) * kVox};
+    std::vector<size_t> near;
+    for (int rep = 0; rep < 6; rep++) {
+      near.clear();
+      for (size_t n : fn)
+        if (left[n] && off(q, n) < (rep < 3 ? 2.0 : 0.7)) near.push_back(n);
+      if (near.size() < 10) break;
+      M3 A;
+      A.m[0][0] = A.m[1][1] = A.m[2][2] = 0;
+      double bq[3] = {0, 0, 0};
+      for (size_t n : near) {
+        double dv[3] = {r.D[n].x, r.D[n].y, r.D[n].z}, ov[3] = {r.O[n].x, r.O[n].y, r.O[n].z};
+        for (int i = 0; i < 3; i++)
+          for (int j = 0; j < 3; j++) {
+            double pij = (i == j ? 1 : 0) - dv[i] * dv[j];
+            A.m[i][j] += pij;
+            bq[i] += pij * ov[j];
+          }
+      }
+      M3 Ai;
+      if (!Inv3(A, Ai)) { near.clear(); break; }
+      q = Ai * V3{bq[0], bq[1], bq[2]};
+    }
+    for (size_t n : fn)
+      if (left[n] && off(q, n) < 2.0) left[n] = 0;
+    if ((int)near.size() < min_rays) continue;
+    V3 m{};
+    std::vector<V3> w;
+    for (size_t n : near) {
+      V3 e = r.O[n] - q;
+      w.push_back(e * (1 / norm(e)));
+      m += w.back();
+    }
+    m = m * (1 / norm(m));
+    std::vector<double> pa;
+    for (auto &e : w) pa.push_back(std::acos(std::max(-1.0, std::min(1.0, dot(e, m)))) * kDeg);
+    std::sort(pa.begin(), pa.end());
+    double par = pa[pa.size() * 9 / 10];
+    if (par < kPar) continue;  // its depth isn't known
+    std::set<std::pair<int, double>> saw;
+    for (size_t n : fn)
+      if (off(q, n) < kNear) saw.insert({r.C[n], r.G[n]});
+    std::vector<InView> v;
+    for (auto &f : fr) {
+      V3 U = q - f.o;
+      double d = norm(U);
+      if (d < 0.4 || !in_image_(f.cam, T(f.R) * (U * (1 / d)))) continue;
+      v.push_back({f.cam, f.g, saw.count({f.cam, f.g}) > 0});
+    }
+    std::sort(v.begin(), v.end(), [](const InView &a, const InView &b) { return a.cam != b.cam ? a.cam < b.cam : a.g < b.g; });
+    Place pl{q, (int)near.size(), par, {}};
+    if (!SeenScores(v, tu, P, pl.sc)) pl.sc.clear();
+    out.push_back(pl);
+  }
+  return out;
+}
+
+
 // call ~1 Hz. The solver's clock is the newest sighting: with nothing new seen nothing ages out or is refitted
 StepStat Solver::Step(double /*now*/) {
   std::vector<std::string> keys;
@@ -2233,6 +2696,10 @@ StepStat Solver::Step(double /*now*/) {
     last_id_ = now;
     CheckIdentity(now, keys, S, Z);
   }
+  if (now - last_lights_ >= kLightsEvery) {
+    last_lights_ = now;
+    SurveyLights(now, keys, S, Z);
+  }
   if (has_x_ && now - last_layout_ >= kLayoutEvery) {
     last_layout_ = now;
     CheckLayout(keys, S, Z);
@@ -2275,7 +2742,8 @@ StepStat Solver::Step(double /*now*/) {
       int k = acq_dim_ ? 2 : 1;  // dim rays: other lights line up with a wrong alignment more easily
       double dn, dc;
       std::string how;
-      bool far = has_x_ && !acq_forced_ && Apart(xa, x_, S) > 1.0;
+      bool forced = acq_forced_ || gone_forced_;
+      bool far = has_x_ && !forced && Apart(xa, x_, S) > 1.0;
       int fav = far ? BodyFavours(xa, x_, dn, dc, how) : 0;
       int need = far && !fav ? 2 * ACQ : ACQ;
       bool enough = sa >= k * need || tight >= k * TIGHT_N || (acq_forced_ && sa >= k * ACQ / 2);
@@ -2287,7 +2755,7 @@ StepStat Solver::Step(double /*now*/) {
       bool off_a = kept && std::fabs(xa[2] - hk) > kHeightTol, off_c = kept && has_x_ && std::fabs(x_[2] - hk) > kHeightTol;
       bool back = off_c && !off_a;
       bool wins = back ? (sa >= k * ACQ || tight >= k * TIGHT_N) && sa > 2 * cur + 5
-                       : enough && (sa > 2 * cur + 5 || acq_forced_);
+                       : enough && (sa > 2 * cur + 5 || forced);
       if (!wins) {
       } else if (on_lamp) {
         if (now - kept_said_ > 60) {
@@ -2314,6 +2782,7 @@ StepStat Solver::Step(double /*now*/) {
                  cur_lamp ? (", the old fit had " + lamp_c + " on a lamp").c_str() : ""));
         Reset(xa);
         since_ = brk_;
+        gone_forced_ = false;
       }
     }
   }
@@ -2982,7 +3451,11 @@ void Sync::ForceRecalibrate() {
 }
 
 void Sync::OnHmdPose(double t, const Quat &q, V3 p) {
-  poses_.Add(t, q, p);
+  {  // into the space the alignment lives in (space_): the move a recenter made, taken back
+    std::lock_guard<std::mutex> g(space_m_);
+    Quat ci{space_q_.w, -space_q_.x, -space_q_.y, -space_q_.z};
+    poses_.Add(t, ci * q, ToM3(ci) * (p - space_t_));
+  }
   if (recording_ && t - last_prec_ >= 0.004) {  // recordings: the HMD at ~250 Hz like the old poller, 3x4 row-major
     last_prec_ = t;
     M3 R = ToM3(q);
@@ -3091,6 +3564,22 @@ FILE *g_ray_dump = nullptr;
 
 // one lhsight line: "F cam k t_us mean nblobs [x y npx peak]..." (x, y in pixels * 10)
 void Sync::OnLine(double pc, const char *line) {
+  if (line[0] == 'G' && line[1] == ' ') {  // the headset's accelerometer (lhsyncd.c), for GravityStep
+    Rec(pc, "%s", line);
+    long long tus;
+    double a[3];
+    int n;
+    if (sscanf(line, "G %lld %lf %lf %lf %d", &tus, &a[0], &a[1], &a[2], &n) != 5) return;
+    std::lock_guard<std::mutex> g(net_);
+    double t;
+    if (!have_optics_) return;
+    // on the head poses' time, as a camera frame's; a headset time that maps far from when the line came (a clock the
+    // module got wrong) gives way to the arrival: up hardly moves in 50 ms
+    if (!clock_.Map(tus / 1e6, t) || !(std::fabs(t - pc) < 1.0)) t = pc - 0.025;
+    grav_.push_back({t - expo_, V3{a[0], a[1], a[2]}});
+    while (grav_.size() > 4000) grav_.pop_front();
+    return;
+  }
   if (line[0] != 'F' || line[1] != ' ') return;
   Rec(pc, "%s", line);
   int cam, nb;
@@ -3269,6 +3758,15 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
   double step = RotDeg(lv.tilt);
   if (RotDeg(lv.tilt * sfile_.level) > kMaxRot) return;  // past what a level can be
   bool moved = sfile_.level_n > 0 && step > kLevelJump;
+  // a move is taken only when the next reading says the same (within half of kLevelJump): one reading off by a degree
+  // (another set of stations in view, a station SteamVR just re-placed) tipped the frame by itself, 5 cm at the feet
+  if (moved && (!level_far_ || RotDeg(lv.tilt * T(level_far_tilt_)) > kLevelJump / 2)) {
+    level_far_ = true;
+    level_far_tilt_ = lv.tilt;
+    Rec(now, "I level3far %.4f %d %.4f", step, lv.stations, lv.med);
+    return;
+  }
+  level_far_ = false;
   if (!moved && sfile_.level_n > 0 && now - level_read_ < kLevelEvery) return;  // a move is followed at once
   level_read_ = now;
   int n = moved ? 0 : std::min(sfile_.level_n, kLevelMemory - 1);
@@ -3474,6 +3972,71 @@ static bool TwoFit(bool has_x, const StepStat &st) {
   return c.size() >= 2 && c[c.size() - 2] >= 10;
 }
 
+// The headset's accelerometer against the head poses: which way is up in the space the alignment lives in (space_).
+// SteamVR's space tipped by a horizon adjust shows as up away from the vertical, with any number of base stations. Each
+// G sample (50 ms of readings) turned through the IMU's calibration and the head's orientation then; samples with the
+// head speeding up or slowing down (not 1 g within 1.5 m/s^2) left out; summed over 5 s. Measured and logged only
+// (I imugrav in recordings) until a session has shown the readings' sign
+void Sync::GravityStep(double now) {
+  std::deque<GravS> got;
+  M3 Rimu;
+  {
+    std::lock_guard<std::mutex> g(net_);
+    got.swap(grav_);
+    if (!have_optics_ || !optics_.Imu(Rimu)) return;
+  }
+  for (const GravS &s : got) {
+    double m = norm(s.a);
+    if (m < 8.3 || m > 11.3) continue;
+    Quat q;
+    V3 p;
+    if (!poses_.AtQ(s.t, q, p)) continue;
+    if (gwin_t0_ < 0) gwin_t0_ = s.t;
+    gwin_ += ToM3(q) * (Rimu * (s.a * (1 / m)));
+    gwin_n_++;
+  }
+  if (gwin_t0_ < 0 || now - gwin_t0_ < 5 || gwin_n_ < 20) return;
+  V3 u = gwin_ * (1.0 / norm(gwin_));
+  double tilt = std::atan2(std::hypot(u.x, u.z), u.y) * kDeg;
+  Rec(now, "I imugrav %.4f %.4f %.4f %d %.2f", u.x, u.y, u.z, gwin_n_, tilt);
+  if (now - grav_said_ >= 60) {
+    grav_said_ = now;
+    log_(Fmt("headset accelerometer: up is %.1f deg from the vertical of the alignment's space (%d samples over 5 s)",
+             tilt, gwin_n_));
+  }
+  int n = gwin_n_;
+  gwin_ = V3{};
+  gwin_n_ = 0;
+  gwin_t0_ = -1;
+  // two windows running that agree within 1 deg on kTiltMin or more: the space is tipped (a recording of one: 41.7 deg
+  // here, 41.9 by the base stations, 0.3 deg window to window)
+  bool far = tilt >= kTiltMin;
+  if (far && gprev_ok_ && std::acos(std::max(-1.0, std::min(1.0, dot(u, gprev_)))) * kDeg < 1.0) {
+    TipSpace(Swing(u), tilt, Fmt("the headset's accelerometer, %d samples", n));
+    refine_tilt_ = true;  // to within a few degrees: the base stations finish it (kTiltFine)
+    tilt_seen_ = false;   // and are looked at every kTiltEvery / 4 till then
+    return;
+  }
+  gprev_ = u;
+  gprev_ok_ = far;
+}
+
+void Sync::TipSpace(const M3 &Tm, double tilt, const std::string &by) {
+  Quat qt = ToQuat(Tm);
+  {
+    std::lock_guard<std::mutex> g(space_m_);
+    space_q_ = space_q_ * qt;
+    poses_.Remap(-1e18, Quat{qt.w, -qt.x, -qt.y, -qt.z}, V3{});
+  }
+  solver_.Rotate(T(Tm));
+  locked_ = false;
+  gwin_ = V3{};  // what was summed against the poses before
+  gwin_n_ = 0;
+  gwin_t0_ = -1;
+  gprev_ok_ = false;
+  log_(Fmt("the headset's space is tipped %.1f deg (%s): taken back, acquiring", tilt, by.c_str()));
+}
+
 Transform Sync::Tick(double now) {
   ApplyHeadset();
   if (now - last_step_ >= 1.0) {
@@ -3486,10 +4049,29 @@ Transform Sync::Tick(double now) {
       // a jump from one pose to the next is the headset space moving, up by the head's jump; after a gap the head
       // may have moved itself (stood up) and the floor may have been set anew (the boundary redone while the poses
       // stopped): how far the headset space moved up is unknown
-      double gap, dy;
+      double gap, dy, yaw, tilt;
+      Quat qm;
+      V3 tm;
       poses_.brk_jump(gap, dy);
-      solver_.PoseBreak(poses_.brk_t(), gap < kBrkJumpGap ? dy : NAN);
-      log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
+      poses_.brk_move(qm, tm, yaw, tilt);
+      if (gap < kBrkJumpGap) {
+        // from one pose to the next the head stays put: the jump is the space itself moving (a recenter, the Quest
+        // finding its tracking again). The move goes into space_, the poses since it are taken back through it, and the
+        // few sightings seen through them meanwhile go: for the alignment nothing moved
+        {
+          std::lock_guard<std::mutex> g(space_m_);
+          space_t_ = ToM3(space_q_) * tm + space_t_;
+          space_q_ = space_q_ * qm;
+          Quat qi{qm.w, -qm.x, -qm.y, -qm.z};
+          poses_.Remap(poses_.brk_t(), qi, ToM3(qi) * (tm * -1.0));
+        }
+        solver_.DropSince(poses_.brk_t());
+        log_(Fmt("HMD pose break (%s): the headset space turned %+.1f deg, tipped %.1f deg and moved %.0f cm (a "
+                 "recenter?): the alignment goes with it", poses_.brk_what().c_str(), yaw * kDeg, tilt, norm(tm) * 100));
+      } else {
+        solver_.PoseBreak(poses_.brk_t(), NAN);
+        log_("HMD pose break (" + poses_.brk_what() + "): older sightings dropped, acquiring");
+      }
     }
     std::map<std::string, std::pair<V3, M3>> raw;
     std::map<std::string, int> chans;
@@ -3598,6 +4180,26 @@ Transform Sync::Tick(double now) {
       for (auto &kv : st.per) best = std::max(best, kv.second);
       locked_ = TwoFit(solver_.has_x(), st) ||
                 (locked_ && !broke && !reset && !st.jump && solver_.has_x() && st.has_per && best >= 10);
+    }
+    GravityStep(now);
+    // a headset space tipped against the base stations (a horizon adjust before SteamVR started, which no pose break
+    // showed): the tip goes into space_ as a recenter's would, and the alignment is acquired again, level
+    // every kTiltEvery / 4 until it's been measured once (a 4-DOF fit in a tipped space can look locked), then
+    // every kTiltEvery
+    if (now - last_tilt_ >= (tilt_seen_ ? kTiltEvery : kTiltEvery / 4)) {
+      last_tilt_ = now;
+      M3 Tm;
+      double tilt = NAN;
+      std::string how;
+      bool found = solver_.FindTilt(now, Tm, tilt, how);
+      Rec(now, "I tiltlook %d %.2f %s", (int)found, tilt, how.c_str());  // what it saw, for recordings
+      if (found) {
+        tilt_seen_ = true;
+        bool fine = refine_tilt_;  // after the accelerometer: the stations' tilt is the level the fit needs
+        refine_tilt_ = false;
+        if (tilt >= (fine ? kTiltFine : kTiltMin))
+          TipSpace(Tm, tilt, (fine ? "left after the accelerometer, by the base stations: " : "the base stations: ") + how);
+      }
     }
     {
       std::lock_guard<std::mutex> g(st_m_);
@@ -3718,8 +4320,10 @@ Transform Sync::Tick(double now) {
   frame_.Rotation(C, tc);
   M3 R = Ry(applied_[0]);
   out.active = true;
-  out.q = ToQuat(R * C);
-  out.t = R * tc + V3{applied_[1], applied_[2], applied_[3]};
+  std::lock_guard<std::mutex> g(space_m_);  // and into the headset's space as it is now (space_)
+  M3 S = ToM3(space_q_);
+  out.q = ToQuat(S * R * C);
+  out.t = S * (R * tc + V3{applied_[1], applied_[2], applied_[3]}) + space_t_;
   return out;
 }
 

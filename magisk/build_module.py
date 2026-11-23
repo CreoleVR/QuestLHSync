@@ -66,7 +66,7 @@ def main():
     daemon = os.path.join(HERE, "build", "lhsyncd")
     subprocess.run([clang(), "--target=aarch64-linux-android29", "-O2", "-Wall", "-Wno-unused-result", "-fPIE", "-pie",
                     f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}", os.path.join(HEADSET, "lhsyncd.c"),
-                    os.path.join(HERE, "src", "quest.c"), "-llog", "-s", "-o", daemon],
+                    os.path.join(HERE, "src", "quest.c"), "-llog", "-landroid", "-lm", "-s", "-o", daemon],
                    check=True)
     js = open(os.path.join(HERE, "src", "lhsight.js"), encoding="utf-8").read()
     c = open(os.path.join(HERE, "src", "lhsight.c"), encoding="utf-8").read()
