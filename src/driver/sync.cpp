@@ -842,6 +842,7 @@ Solver::Solver(LogFn log, uint64_t seed, std::map<std::string, V3> fix)
 
 void Solver::Reset(const X4 &x) {
   x_ = x; has_x_ = true;
+  fit_since_ = seen_;
   resets_++;
   anchor_ = x; has_anchor_ = true;
   id_said_.clear();
@@ -863,6 +864,9 @@ void Solver::Clear() {
   dot_ = dot_said_ = 0;
   amb_state_ = 0;
   kept_said_ = -1e18;
+  far_.clear();
+  far_seen_ = learn_t_ = -1e18;
+  fit_since_ = 1e18;
   held_h_.clear();  // another headset, or a reference frame pinned anew: the height held means nothing now
   held_t_ = -1e18;
 }
@@ -1046,26 +1050,158 @@ bool Solver::Triangulate(std::map<std::string, Seen> &out) {
   return !out.empty();
 }
 
+// The lights that aren't stations (SetLights), shared by every Predict: it's static, as the Timing uses it too
+static std::shared_ptr<const std::vector<V3>> g_lights = std::make_shared<std::vector<V3>>();
+static std::mutex g_lights_m;
+
+std::shared_ptr<const std::vector<V3>> Solver::Lights() {
+  std::lock_guard<std::mutex> g(g_lights_m);
+  return g_lights;
+}
+
+void Solver::SetLights(const std::vector<V3> &raw) {
+  std::lock_guard<std::mutex> g(g_lights_m);
+  const auto &cur = *g_lights;
+  bool same = cur.size() == raw.size();
+  for (size_t i = 0; same && i < raw.size(); i++) same = norm(cur[i] - raw[i]) < 1e-9;
+  if (same) return;
+  g_lights = std::make_shared<std::vector<V3>>(raw);
+}
+
+std::vector<V3> Solver::TakeLearnedLights() {
+  std::lock_guard<std::mutex> g(m_);
+  std::vector<V3> out;
+  out.swap(learned_);
+  return out;
+}
+
+// the stations' places for alignment x, then the lights' (each with a zero Zq: Nearest knows them by it)
 void Solver::Predict(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, std::vector<V3> &P, std::vector<V3> &Zq) {
   double c = std::cos(x[0]), s = std::sin(x[0]);
   V3 t{x[1], x[2], x[3]};
   P.resize(S.size()); Zq.resize(S.size());
   for (size_t k = 0; k < S.size(); k++) { P[k] = RyMul(c, s, S[k]) + t; Zq[k] = RyMul(c, s, Z[k]); }
+  auto lights = Lights();
+  for (const V3 &l : *lights) { P.push_back(RyMul(c, s, l) + t); Zq.push_back(V3{0, 0, 0}); }
 }
 
-// nearest station to a ray by angle (deg); inf where the head is behind every station
+// nearest station to a ray by angle (deg); inf where the head is behind every station, or where a light that isn't
+// a station is nearer (within kLightGate) than every station
 void Solver::Nearest(const std::vector<V3> &P, const std::vector<V3> &Zq, V3 o, V3 d, int &k, double &a) {
   k = 0; a = kInf;
+  double light = kInf;
   for (size_t j = 0; j < P.size(); j++) {
     V3 U = P[j] - o;
     double n = norm(U);
-    double ang = kInf;
-    if (dot(U, Zq[j]) >= 0.2 * n) {
-      double c = dot(U, d) / n;
-      ang = std::acos(c < -1 ? -1 : c > 1 ? 1 : c) * kDeg;
-    }
-    if (ang < a) { a = ang; k = (int)j; }
+    const bool is_light = Zq[j].x == 0 && Zq[j].y == 0 && Zq[j].z == 0;
+    if (!is_light && dot(U, Zq[j]) < 0.2 * n) continue;
+    double c = dot(U, d) / n;
+    double ang = std::acos(c < -1 ? -1 : c > 1 ? 1 : c) * kDeg;
+    if (is_light) light = std::min(light, ang);
+    else if (ang < a) { a = ang; k = (int)j; }
   }
+  if (light < kLightGate && light < a) { k = 0; a = kInf; }
+}
+
+// Lights that aren't stations: while the alignment is sure of itself, the bright sightings far from every station
+// (and from the lights known) are kept, in SteamVR's raw frame; every few seconds the place most of them meet at, if
+// enough of them do from places far enough apart, is taken for a light (a lamp, a station's reflection)
+void Solver::LearnLights(const Rays &r, const std::vector<V3> &S, double now) {
+  constexpr size_t kKeepFar = 6000;
+  constexpr double kKeepFarFor = 600, kEvery = 10, kMinT = 0.5, kMinAlong = 0.3, kMinBase = 0.3, kNearStation = 0.6,
+                   kMergeLight = 0.3;
+  constexpr int kMinRays = 60, kTries = 400;
+  const double c = std::cos(x_[0]), s = std::sin(x_[0]);
+  const V3 t{x_[1], x_[2], x_[3]};
+  auto lights = Lights();
+  auto angle = [](V3 o, V3 d, V3 p) {
+    V3 U = p - o;
+    double cs = dot(U, d) / norm(U);
+    return std::acos(cs < -1 ? -1 : cs > 1 ? 1 : cs) * kDeg;
+  };
+  for (size_t n = 0; n < r.size(); n++) {
+    if (r.T[n] <= far_seen_ || !r.B[n]) continue;
+    V3 o = RyMul(c, -s, r.O[n] - t), d = RyMul(c, -s, r.D[n]);  // raw frame
+    bool far = true;
+    for (const V3 &p : S) if (angle(o, d, p) < kFarFromStation) { far = false; break; }
+    for (const V3 &p : *lights) if (far && angle(o, d, p) < kLightGate) far = false;
+    if (far) far_.push_back({r.T[n], o, d});
+  }
+  if (r.size()) far_seen_ = std::max(far_seen_, r.T.back());
+  while (!far_.empty() && (far_.size() > kKeepFar || far_.front().t < now - kKeepFarFor)) far_.pop_front();
+  if (now - learn_t_ < kEvery || far_.size() < (size_t)kMinRays * 2) return;
+  learn_t_ = now;
+  std::uniform_int_distribution<size_t> pick(0, far_.size() - 1);
+  V3 best{};
+  int bn = 0;
+  for (int it = 0; it < kTries; it++) {
+    const FarRay &a = far_[pick(rng_)], &b = far_[pick(rng_)];
+    if (std::fabs(a.t - b.t) < kMinT) continue;
+    // the closest points of the two rays, both ahead of their cameras
+    V3 w = a.o - b.o;
+    double A = dot(a.d, a.d), B = dot(a.d, b.d), C = dot(b.d, b.d), D = dot(a.d, w), E = dot(b.d, w);
+    double den = A * C - B * B;
+    if (std::fabs(den) < 1e-6) continue;
+    double sa = (B * E - C * D) / den, sb = (A * E - B * D) / den;
+    if (sa < kMinAlong || sb < kMinAlong) continue;
+    V3 p = (a.o + a.d * sa + b.o + b.d * sb) * 0.5;
+    int cnt = 0;
+    for (const FarRay &f : far_) cnt += angle(f.o, f.d, p) < kLightGate;
+    if (cnt > bn) { bn = cnt; best = p; }
+  }
+  if (bn < kMinRays) return;
+  // refined: the point nearest all its rays (least squares), seen from far enough apart
+  double M[3][3] = {}, v[3] = {};
+  V3 lo{1e9, 1e9, 1e9}, hi{-1e9, -1e9, -1e9};
+  std::vector<char> in(far_.size());
+  for (size_t n = 0; n < far_.size(); n++) {
+    const FarRay &f = far_[n];
+    if (angle(f.o, f.d, best) >= kLightGate) continue;
+    in[n] = 1;
+    const double dd[3] = {f.d.x, f.d.y, f.d.z}, oo[3] = {f.o.x, f.o.y, f.o.z};
+    for (int i = 0; i < 3; i++)
+      for (int j = 0; j < 3; j++) {
+        double m = (i == j) - dd[i] * dd[j];
+        M[i][j] += m;
+        v[i] += m * oo[j];
+      }
+    lo = {std::min(lo.x, f.o.x), std::min(lo.y, f.o.y), std::min(lo.z, f.o.z)};
+    hi = {std::max(hi.x, f.o.x), std::max(hi.y, f.o.y), std::max(hi.z, f.o.z)};
+  }
+  if (norm(hi - lo) < kMinBase) return;  // seen from one place: where along the rays is anyone's guess
+  M3 Mm;
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) Mm.m[i][j] = M[i][j];
+  M3 Mi;
+  V3 l = best;
+  if (Inv3(Mm, Mi)) l = Mi * V3{v[0], v[1], v[2]};
+  std::deque<FarRay> rest;  // its sightings are done with, whatever comes of it: the next look finds the next light
+  for (size_t n = 0; n < far_.size(); n++)
+    if (!in[n]) rest.push_back(far_[n]);
+  far_.swap(rest);
+  double near_st = kInf;
+  for (const V3 &p : S) near_st = std::min(near_st, norm(l - p));
+  if (near_st < kNearStation) return;  // a station's own dots, a little off: not a light
+  // A light known near it: the same one, placed better now (the alignment it was learned with is better now, or its
+  // sightings more): it takes this place
+  std::vector<V3> all(*lights);
+  size_t same = all.size();
+  for (size_t i = 0; i < all.size(); i++)
+    if (norm(all[i] - l) < kMergeLight && (same == all.size() || norm(all[i] - l) < norm(all[same] - l))) same = i;
+  const double moved = same < all.size() ? norm(all[same] - l) : 0;
+  if (same < all.size()) all[same] = l;
+  else all.push_back(l);
+  SetLights(all);
+  {
+    std::lock_guard<std::mutex> g(m_);
+    learned_.push_back(l);
+  }
+  if (same == all.size() - 1 && moved == 0)
+    log_(Fmt("a light that isn't a base station at [%.2f %.2f %.2f] (%d bright sightings, %.0f cm from the nearest "
+             "station): its sightings are skipped from now on", l.x, l.y, l.z, bn, near_st * 100));
+  else if (moved > 0.02)
+    log_(Fmt("the light at [%.2f %.2f %.2f] placed again, %.0f cm off (%d bright sightings)", l.x, l.y, l.z,
+             moved * 100, bn));
 }
 
 void Solver::Support(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, const Rays &r, double gate,
@@ -1523,8 +1659,14 @@ bool Solver::OnLamp(const X4 &x, const Rays &r, std::string &which) const {
     Nearest(P, Zq, r.O[n], r.D[n], k, a);
     if (a < INLIER) (FromStation(r.A[n], P[k], r.O[n], dot_) ? fit : big)[k]++;
   }
+  // A 1.0 station's sync flash (its bank of LEDs) is a big blob right where its dots are: 350-1000 px*m^2 against its
+  // dots' 70, and never in the same frame. In a recording of four 1.0 stations 3-4 m away, the bright sightings here
+  // had down to one dot for 5 flashes (one dot for 24, a moment only flashes came), and "twice as many big blobs as
+  // dots" took the right fit for a lamp again and again: each time another one, all but the same, took over. A
+  // station put on a lamp has about none of its own: a lamp only where the dots are few next to many big blobs (a
+  // bulb as big as a dot passes anyway: the lights learned, LearnLights, have it)
   for (size_t k = 0; k < S.size(); k++)
-    if (big[k] > 2 * fit[k] + 5) { which = keys[k]; return true; }
+    if (big[k] > 10 * fit[k] + 30) { which = keys[k]; return true; }
   return false;
 }
 
@@ -2227,6 +2369,14 @@ StepStat Solver::Step(double /*now*/) {
       st.has_per = true;
       for (size_t kk = 0; kk < keys.size(); kk++) st.per[keys[kk]] = cnt[kk];
       if (!in.empty()) { st.has_med = true; st.med = Median(in); }
+      // lights that aren't stations, learned while the alignment is sure of itself: steady, tight, and two or more
+      // stations well seen
+      // Learned from a wrong fit, a station's own dots look like a light beside it, and then it hides that station:
+      // only from a fit that has held for kLightFitAge, three stations well seen, and lights far from every station
+      int good = 0;
+      for (int c : cnt) good += c >= 50;
+      if (f.ok && f.cond && st.has_med && st.med < 0.2 && good >= 3 && now - fit_since_ >= kLightFitAge)
+        LearnLights(r, S, now);
     }
   }
   if (has_x_ && now - last_id_ >= kIdEvery) {
@@ -2752,6 +2902,83 @@ Sync::Sync(SyncConfig cfg, LogFn log)
     p.sd_h = std::hypot(p.sd_h, kPlaceAge);
     place_prior_[kv.first] = p;
   }
+  LoadLights();
+}
+
+void Sync::LoadLights() {
+  lights_.clear();
+  std::string text;
+  JVal d;
+  if (!ReadFile(Join(cfg_.dir, "lights.json"), text) || !JParse(text, d)) return;
+  if (const JVal *l = d.get("lights"))
+    for (const JVal &e : l->a) {
+      std::map<std::string, V3> rel;
+      for (auto &kv : e.o) {
+        auto v = kv.second.nums();
+        if (v.size() >= 3) rel[kv.first] = {v[0], v[1], v[2]};
+      }
+      if (!rel.empty()) lights_.push_back(rel);
+    }
+  if (!lights_.empty()) log_(Fmt("%d light(s) that aren't base stations, from lights.json: their sightings are skipped", (int)lights_.size()));
+}
+
+void Sync::SaveLights() const {
+  std::string j = "{\n  \"lights\": [";
+  for (size_t i = 0; i < lights_.size(); i++) {
+    j += i ? ",\n    {" : "\n    {";
+    bool first = true;
+    for (auto &kv : lights_[i]) {
+      j += Fmt("%s\"%s\": [%.4f, %.4f, %.4f]", first ? "" : ", ", kv.first.c_str(), kv.second.x, kv.second.y, kv.second.z);
+      first = false;
+    }
+    j += "}";
+  }
+  j += "\n  ]\n}\n";
+  WriteFileAtomic(Join(cfg_.dir, "lights.json"), j);
+}
+
+// The lights to the solver, placed from the stations as they are now (the anchor's frame first: the steadiest), and
+// the ones it learned, kept. One that would sit on a station now is left out: the station may have moved there.
+void Sync::LightsStep(const std::map<std::string, std::pair<V3, M3>> &raw) {
+  constexpr double kOnStation = 0.6, kSame = 0.3;  // m: a light this near a station is likely its own light
+  auto place = [&](const std::map<std::string, V3> &rel, V3 &out) {
+    auto from = [&](const std::string &k) {
+      auto r = rel.find(k);
+      auto s = raw.find(k);
+      if (r == rel.end() || s == raw.end()) return false;
+      out = s->second.second * r->second + s->second.first;
+      return true;
+    };
+    if (from(sfile_.anchor)) return true;
+    for (auto &kv : rel)
+      if (from(kv.first)) return true;
+    return false;
+  };
+  bool changed = false;
+  for (const V3 &l : solver_.TakeLearnedLights()) {
+    std::map<std::string, V3> rel;
+    for (auto &kv : raw) rel[kv.first] = T(kv.second.second) * (l - kv.second.first);
+    if (rel.empty()) continue;
+    size_t same = lights_.size();
+    double best = kSame;
+    for (size_t i = 0; i < lights_.size(); i++) {
+      V3 p;
+      if (place(lights_[i], p) && norm(p - l) < best) { best = norm(p - l); same = i; }
+    }
+    if (same < lights_.size()) lights_[same] = rel;
+    else lights_.push_back(rel);
+    changed = true;
+  }
+  if (changed) SaveLights();
+  std::vector<V3> now;
+  for (auto &rel : lights_) {
+    V3 p;
+    if (!place(rel, p)) continue;
+    bool on = false;
+    for (auto &kv : raw) on = on || norm(p - kv.second.first) < kOnStation;
+    if (!on) now.push_back(p);
+  }
+  solver_.SetLights(now);
 }
 
 Sync::~Sync() {}
@@ -3269,7 +3496,10 @@ void Sync::LevelStep(const std::map<std::string, std::pair<V3, M3>> &raw, double
   Solver::LevelR lv;
   if (!solver_.Level(sfile_.anchor_p, lv)) return;
   double step = RotDeg(lv.tilt);
-  if (RotDeg(lv.tilt * sfile_.level) > kMaxRot) return;  // past what a level can be
+  // past what a level can be. SteamVR's own lighthouse frame is within a degree or two of level, but another driver's
+  // need not be: openhouse, its room built anew, had it 6 deg off, and with the level held to 3 deg the cameras could
+  // fit two of its three stations at a time, never the third
+  if (RotDeg(lv.tilt * sfile_.level) > kMaxLevel) return;
   bool moved = sfile_.level_n > 0 && step > kLevelJump;
   if (!moved && sfile_.level_n > 0 && now - level_read_ < kLevelEvery) return;  // a move is followed at once
   level_read_ = now;
@@ -3315,8 +3545,11 @@ void Sync::LayoutStep(const std::map<std::string, std::pair<V3, M3>> &raw, doubl
   if (!was && raw.size() < 3) return;
   if (!was || frame_.miss() <= kMoved) bad_since_ = -1;
   else if (bad_since_ < 0) bad_since_ = now;
-  double tilt = TiltDeg(frame_.Anchored());
-  if (!was || tilt <= kMaxRot) tilt_since_ = -1;
+  // the stations' fit tilting the frame (SteamVR re-solved them) over kMaxRot, or that and the level over kMaxLevel. The
+  // level alone is no reason: it's meant to turn the frame, as far as kMaxLevel (another driver's frame need not be level)
+  double tilt = TiltDeg(frame_.LayoutTurn()), all = TiltDeg(frame_.Anchored());
+  if (all > kMaxLevel) tilt = all;
+  if (!was || (tilt <= kMaxRot && all <= kMaxLevel)) tilt_since_ = -1;
   else if (tilt_since_ < 0) tilt_since_ = now;
   std::string left = frame_.left();
   if (left != left_seen_) { left_seen_ = left; left_since_ = now; }
@@ -3518,6 +3751,7 @@ Transform Sync::Tick(double now) {
       chans = channels_;
     }
     for (auto &kv : chans) solver_.SetChannel(kv.first, kv.second);
+    LightsStep(raw);
     if (!sfile_.loaded && !raw.empty()) {  // first run: pin the reference frame to the station at SteamVR's origin
       auto best = raw.begin();
       for (auto it = raw.begin(); it != raw.end(); ++it)

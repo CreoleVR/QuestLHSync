@@ -19,6 +19,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <random>
 #include <set>
 #include <string>
@@ -70,6 +71,7 @@ constexpr double kFrozen = 10.0;        // s: SteamVR's headset this still while
 constexpr double kKeep = 600.0;         // s of rays kept
 constexpr double kMoved = 0.25;         // m: SteamVR has a measured station this far off: it was moved
 constexpr double kMaxRot = 3.0;         // deg: the anchor turned this much against the reference
+constexpr double kMaxLevel = 10.0;      // deg: the most a level (Sync::LevelStep) turns the lighthouse frame
 // an automatic frame's layout fit: a station kMoved off against the others, no fit within kMoved, or the frame tilted
 // kMaxRot off level, for kLayoutMoved s, starts the frame over; stations within kLine of one line pin no tilt
 constexpr double kLayoutMoved = 30.0, kLine = 0.3;  // s, m
@@ -268,6 +270,7 @@ class Frame {
   void SetGravity(bool on, const M3 &tilt) { grav_ = on; G_ = tilt; }
   const M3 &gravity() const { return GC_; }  // the tilt in C_ (none: identity)
   M3 Anchored() const { return f_.level * Cs_; }  // SteamVR's frame -> the reference frame, before gravity's tilt
+  M3 LayoutTurn() const { return Cs_; }  // the stations' fit alone, without the level
   int ok() const { return ok_; }
   double deg() const { return deg_; }
   void Reset();  // forgets the last update: the reference frame is new (Sync::ForceRecalibrate)
@@ -331,6 +334,12 @@ class Solver {
                const std::vector<float> &A);  // rays >= from
   void SetStation(const std::string &serial, V3 p, const M3 &R);
   void SetChannel(const std::string &serial, int channel);
+  // Lights that aren't base stations (a lamp, a station's reflection), in SteamVR's raw frame: a sighting closest to
+  // one of them is no station's, in every step (Predict hands them out after the stations, Nearest skips them). Size
+  // can't tell them apart: a bulb's blob can be as big as a dot. They're learned while the alignment is sure of
+  // itself: bright sightings far from every station that meet at one place (LearnLights).
+  void SetLights(const std::vector<V3> &raw);
+  std::vector<V3> TakeLearnedLights();  // learned since the last call, raw frame
   void SetFramePeriod(double p) { frame_p_ = p; }  // s between short frames
   void AddFrame(double t, double g, int cam, V3 o, const M3 &R);  // every short frame; camera pose in Quest space
   void SetInImage(std::function<bool(int cam, V3 d)> f) { in_image_ = std::move(f); }
@@ -362,6 +371,8 @@ class Solver {
   // geometry, also used by Timing
   static void Predict(const X4 &x, const std::vector<V3> &S, const std::vector<V3> &Z, std::vector<V3> &P, std::vector<V3> &Zq);
   static void Nearest(const std::vector<V3> &P, const std::vector<V3> &Zq, V3 o, V3 d, int &k, double &a);
+  static constexpr double kLightGate = 1.5;    // deg: a sighting this close to a light is the light's
+  static constexpr double kFarFromStation = 3.0;  // deg: a sighting this far from every station may be a light's
 
  private:
   struct Rays {
@@ -395,6 +406,14 @@ class Solver {
   std::map<std::string, double> layout_said_;  // the layout check's stations logged, and how far off
   LogFn log_;
   std::mt19937_64 rng_;
+  void LearnLights(const Rays &r, const std::vector<V3> &S, double now);
+  static std::shared_ptr<const std::vector<V3>> Lights();
+  struct FarRay { double t; V3 o, d; };  // raw frame
+  std::deque<FarRay> far_;
+  double far_seen_ = -1e18, learn_t_ = -1e18;
+  double fit_since_ = 1e18;  // when the alignment was last (re)acquired (Reset): lights are learned from an old one only
+  static constexpr double kLightFitAge = 120;  // s
+  std::vector<V3> learned_;  // under m_
   StepStat stat_;
   bool has_stat_ = false;
   int resets_ = 0;
@@ -554,6 +573,13 @@ class Sync {
   StationsFile sfile_;
   Frame frame_;
   Solver solver_;
+  // the lights that aren't stations (Solver::SetLights), kept in lights.json: each as seen from every station there was
+  // when it was learned (that station's frame), so it's placed again from whichever of them is there, wherever the
+  // lighthouse frame's origin is now (openhouse starts a new room at another origin, say)
+  std::vector<std::map<std::string, V3>> lights_;
+  void LoadLights();
+  void SaveLights() const;
+  void LightsStep(const std::map<std::string, std::pair<V3, M3>> &raw);
   Timing timing_;
   std::atomic<double> expo_{kExpoDefault};
   std::atomic<bool> timing_learned_{false};
