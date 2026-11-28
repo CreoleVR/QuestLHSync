@@ -7,7 +7,7 @@
 #define QLHS_SHM_NAME L"Local\\QuestLHSync"
 #define QLHS_OVERLAY_MUTEX L"Local\\QuestLHSyncOverlay"
 #define QLHS_MAGIC 0x53484C51u  // "QLHS"
-#define QLHS_VERSION 2
+#define QLHS_VERSION 3
 #define QLHS_RELEASE "1.28"  // magisk/build_module.py reads it
 
 enum QlhsState : int32_t {
@@ -75,5 +75,9 @@ struct QlhsStatus {
   char log[8][120];
   volatile int32_t cmd_seq;  // overlay -> driver
   int32_t cmd;
+  volatile int32_t haptic_seq;  // driver -> overlay: pulse the real controller
+  int32_t haptic_us;
+  int32_t haptic_device;
+  int32_t haptic_hand;
 };
 #pragma pack(pop)

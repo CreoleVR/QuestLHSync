@@ -324,18 +324,39 @@ bool HeadsetLink::Discover(std::vector<Found> &out) {
   return !out.empty();
 }
 
-static bool SendAll(SOCKET s, const std::string &d) {
+enum class SendResult { Ok, Partial, Failed };
+
+static SendResult SendAll(SOCKET s, const std::string &d) {
   size_t o = 0;
   while (o < d.size()) {
     int n = send(s, d.data() + o, (int)(d.size() - o), 0);
-    if (n <= 0) return false;
+    if (n <= 0) return o == 0 ? SendResult::Failed : SendResult::Partial;
     o += n;
   }
-  return true;
+  return SendResult::Ok;
+}
+
+void HeadsetLink::SubmitInput(const std::string &line) {
+  if (!cap_input_.load() || line.empty()) return;
+  std::lock_guard<std::mutex> g(input_m_);
+  if (input_queue_.size() >= 64) {
+    for (auto it = input_queue_.begin(); it != input_queue_.end(); ++it)
+      if (!it->second.empty() && it->second[0] == 'X') {
+        input_queue_.erase(it);
+        break;
+      }
+    if (input_queue_.size() >= 64) input_queue_.pop_front();
+  }
+  input_queue_.emplace_back(QpcNow(), line);
 }
 
 bool HeadsetLink::Session(const Found &f) {
   state_ = kConnecting;
+  cap_input_.store(false);
+  {
+    std::lock_guard<std::mutex> g(input_m_);
+    input_queue_.clear();
+  }
   addrinfo hint{}, *res = nullptr;
   hint.ai_family = AF_INET;
   hint.ai_socktype = SOCK_STREAM;
@@ -363,6 +384,8 @@ bool HeadsetLink::Session(const Found &f) {
   BOOL on = TRUE;
   setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof on);
   setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof on);
+  DWORD snd_timeout = 100;  // keep a blocked input write from delaying camera reads
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&snd_timeout, sizeof snd_timeout);
   {
     std::lock_guard<std::mutex> g(m_);
     addr_ = f.ip + ":" + port;
@@ -411,13 +434,33 @@ bool HeadsetLink::Session(const Found &f) {
       next_ping = now + 0.25;
       char p[64];
       snprintf(p, sizeof p, "P %u %lld\n", ++seq, (long long)(QpcNow() * 1e9));
-      if (!SendAll(s, p)) break;
+      const SendResult pr = SendAll(s, p);
+      if (pr == SendResult::Partial) break;  // never continue after a partial line
+      // A zero-byte ping failure leaves the stream clean; last_rx catches a dead link.
+    }
+    if (cap_input_.load()) {
+      std::deque<std::pair<double, std::string>> pending;
+      {
+        std::lock_guard<std::mutex> g(input_m_);
+        pending.swap(input_queue_);
+      }
+      bool input_failed = false;
+      for (auto &input : pending) {
+        if (!input.second.empty() && input.second[0] == 'X' &&
+            QpcNow() - input.first > 0.05)
+          continue;  // late pose; D releases are still sent
+        if (SendAll(s, input.second) != SendResult::Ok) {
+          input_failed = true;
+          break;
+        }
+      }
+      if (input_failed) break;  // never continue after a partial TCP line
     }
     if (now - last_rx > 10) { log_("headset: nothing received for 10 s, reconnecting"); break; }
     fd_set rf;
     FD_ZERO(&rf);
     FD_SET(s, &rf);
-    timeval t2{0, 50000};
+    timeval t2{0, cap_input_.load() ? 8000 : 50000};
     int r = select(0, &rf, nullptr, nullptr, &t2);
     if (r < 0) break;
     if (r == 0) continue;
@@ -461,6 +504,13 @@ bool HeadsetLink::Session(const Found &f) {
           }
           if (have_calib) sync_->OnLine(rx, line.c_str());
           break;
+        case 'V': {
+          int hand = 0;
+          int us = 0;
+          if (sscanf(line.c_str(), "V %d %d", &hand, &us) == 2 && haptic_)
+            haptic_(hand, us);
+          break;
+        }
         case 'Q': {
           unsigned sq;
           long long send_ns, mono_ns;
@@ -491,9 +541,11 @@ bool HeadsetLink::Session(const Found &f) {
             fam = family_;
             fits = Fits(fam, model_);
             remembered = fits && h.rfind("H QuestLHSync ", 0) == 0;
+            cap_input_ = h.find(" cap=input1") != std::string::npos;
             if (remembered) Remember({f.ip, HeadsetId(serial_), model_, ""});
           }
-          log_(model() + ": firmware " + fw() + ", module " + field("module"));
+          log_(model() + ": firmware " + fw() + ", module " + field("module") +
+               (cap_input_ ? ", controller input" : ", no controller input"));
           if (!fits) {  // reached straight over TCP (no discovery): the address of another headset
             if (skipped_ != serial()) log_(model() + " at " + f.ip + " isn't SteamVR's headset (a " + fam + "): not used");
             skipped_ = serial();

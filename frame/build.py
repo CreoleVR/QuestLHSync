@@ -44,11 +44,11 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     daemon = os.path.join(BUILD, "lhsyncd")
     driver = os.path.join(BUILD, "driver_questlhsync_frame.so")
-    subprocess.run([*cc, "-O2", "-Wall", f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}",
+    subprocess.run([*cc, "-O2", "-Wall", "-DQLHS_FRAME", f'-DMODULE_VERSION="{VERSION}"', f"-I{HEADSET}",
                     os.path.join(HEADSET, "lhsyncd.c"), os.path.join(HERE, "src", "frame.c"),
                     os.path.join(HERE, "src", "lhsight.c"), "-s", "-o", daemon], check=True)
     subprocess.run([*cxx, "-std=c++17", "-O2", "-Wall", "-fPIC", "-shared", "-fvisibility=hidden",
-                    f"-I{os.path.join(ROOT, 'third_party', 'openvr', 'headers')}", os.path.join(HERE, "driver", "xrfds.cpp"),
+                    f"-I{os.path.join(ROOT, 'third_party', 'openvr', 'headers')}", os.path.join(HERE, "driver", "xrfds.cpp"), os.path.join(HERE, "driver", "frame_input.cpp"),
                     "-pthread", "-s", "-o", driver], check=True)
     with tarfile.open(PACKAGE, "w:gz") as t:
         def add(name, path, mode):
@@ -61,6 +61,12 @@ def main():
         add("lhsyncd", daemon, 0o755)
         add("questlhsync_frame/driver.vrdrivermanifest", os.path.join(HERE, "driver", "driver.vrdrivermanifest"), 0o644)
         add("questlhsync_frame/bin/linuxarm64/driver_questlhsync_frame.so", driver, 0o755)
+        res = os.path.join(HERE, "driver", "resources")
+        for root, _, files in os.walk(res):
+            for f in files:
+                path = os.path.join(root, f)
+                rel = os.path.relpath(path, os.path.join(HERE, "driver")).replace(os.sep, "/")
+                add("questlhsync_frame/" + rel, path, 0o644)
         for f, mode in (("install.sh", 0o755), ("uninstall.sh", 0o755), ("questlhsync.service", 0o644)):
             add(f, os.path.join(HERE, "package", f), mode)
     print(f"built {PACKAGE} ({os.path.getsize(PACKAGE) / 1e3:.0f} KB)")
