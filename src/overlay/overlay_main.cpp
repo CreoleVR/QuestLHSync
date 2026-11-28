@@ -681,6 +681,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   g_pg = &pg;
   QlhsStatus st{}, prev{};
   ReadStatus(st);
+  int last_haptic_seq = st.haptic_seq;
   Draw(big, pg, st, false);
   HWND win = MakeWindow(inst);
   Dash dash;
@@ -742,9 +743,30 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
       }
       if (quit) break;
     }
+    if (vr_up && st.haptic_seq != last_haptic_seq) {
+      last_haptic_seq = st.haptic_seq;
+      const auto role = vr::VRSystem()->GetTrackedDeviceIndexForControllerRole(
+          st.haptic_hand == 0 ? vr::TrackedControllerRole_LeftHand
+                              : vr::TrackedControllerRole_RightHand);
+      const auto idx = (st.haptic_device > 0 &&
+                        st.haptic_device < (int32_t)vr::k_unMaxTrackedDeviceCount)
+                           ? (vr::TrackedDeviceIndex_t)st.haptic_device
+                           : role;
+      if (st.haptic_us > 0 && idx != vr::k_unTrackedDeviceIndexInvalid) {
+        const uint16_t us = st.haptic_us > 65535 ? 65535 : (uint16_t)st.haptic_us;
+        vr::VRSystem()->TriggerHapticPulse(idx, 0, us);
+      }
+    }
     if (st.updated != last_upd) { last_upd = st.updated; last_change = now; }
     bool stale = !have || now - last_change > 3000;
-    if (memcmp(&st, &prev, sizeof st)) { prev = st; g_dirty = true; }
+    QlhsStatus redraw = st;
+    redraw.seq = prev.seq;
+    redraw.haptic_seq = prev.haptic_seq;
+    redraw.haptic_us = prev.haptic_us;
+    redraw.haptic_device = prev.haptic_device;
+    redraw.haptic_hand = prev.haptic_hand;
+    if (memcmp(&redraw, &prev, sizeof st)) g_dirty = true;
+    prev = st;
     bool win_vis = win && IsWindowVisible(win) && !IsIconic(win);
     bool dash_vis = vr_up && vr::VROverlay()->IsOverlayVisible(dash.main);
     if ((win_vis || dash_vis) && (g_ui || ((g_dirty || now - last_draw > 1000) && now - last_draw >= 200))) {

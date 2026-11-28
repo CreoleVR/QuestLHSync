@@ -10,6 +10,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <shlobj.h>
+#include <timeapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +31,7 @@
 #include "../common/qlhs_status.h"
 #include "MinHook.h"
 #include "gravity.h"
+#include "lighthouse_input.h"
 #include "net.h"
 #include "openvr_driver.h"
 #include "relations.h"
@@ -38,10 +41,12 @@ static const char *kSection = "driver_questlhsync";
 
 // ---------------------------------------------------------------- logging
 static std::mutex g_log_m;
+static std::mutex g_st_m;
 static FILE *g_logf;
 static QlhsStatus *g_st;
 static std::unique_ptr<Sync> g_sync;
 static std::unique_ptr<Gravity> g_gravity;
+static std::unique_ptr<LighthouseInput> g_lh;
 static std::unique_ptr<Relations> g_rel;
 
 static void PushStatusLog(const std::string &s);
@@ -120,12 +125,71 @@ struct StationPose {
   char serial[32];
   int cls;
   std::atomic<int> channel;  // 0 unknown
+  std::atomic<int> role;     // TrackedControllerRole (1 left, 2 right)
   std::atomic<uint32_t> seq;
   double p[3];
   double q[4];
 };
 static StationPose g_dev[vr::k_unMaxTrackedDeviceCount];
+static std::atomic<bool> g_connected[vr::k_unMaxTrackedDeviceCount];
+static std::atomic<float> g_battery[vr::k_unMaxTrackedDeviceCount];
+static std::atomic<bool> g_charging[vr::k_unMaxTrackedDeviceCount];
 static std::atomic<long long> g_hooked{0}, g_moved{0};
+
+static void OnHaptic(int hand, int us) {
+  if (!g_st) return;
+  int device = -1;
+  const int want = hand == 0 ? vr::TrackedControllerRole_LeftHand
+                             : vr::TrackedControllerRole_RightHand;
+  for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) {
+    if (g_dev[i].cls == vr::TrackedDeviceClass_Controller && g_dev[i].role.load() == want) {
+      device = (int)i;
+      break;
+    }
+  }
+  std::lock_guard<std::mutex> g(g_st_m);
+  InterlockedIncrement((volatile LONG *)&g_st->seq);
+  MemoryBarrier();
+  g_st->haptic_device = device;
+  g_st->haptic_hand = hand;
+  g_st->haptic_us = us;
+  MemoryBarrier();
+  InterlockedIncrement((volatile LONG *)&g_st->haptic_seq);
+  InterlockedIncrement((volatile LONG *)&g_st->seq);
+}
+
+// last corrected lighthouse pose and last HMD pose, for the input sender
+struct PoseSnap {
+  std::atomic<uint32_t> seq{0};
+  double t = 0;
+  double p[3]{};
+  double q[4]{1, 0, 0, 0};
+};
+static PoseSnap g_pose[vr::k_unMaxTrackedDeviceCount];
+static PoseSnap g_hmd_pose;
+
+static void StorePose(PoseSnap &s, double t, const double p[3], const vr::HmdQuaternion_t &q) {
+  s.seq.fetch_add(1, std::memory_order_acq_rel);
+  std::atomic_thread_fence(std::memory_order_release);
+  s.t = t;
+  memcpy(s.p, p, sizeof s.p);
+  s.q[0] = q.w; s.q[1] = q.x; s.q[2] = q.y; s.q[3] = q.z;
+  std::atomic_thread_fence(std::memory_order_release);
+  s.seq.fetch_add(1, std::memory_order_acq_rel);
+}
+
+static bool LoadPose(PoseSnap &s, double p[3], double q[4], double &t) {
+  for (int i = 0; i < 8; i++) {
+    const uint32_t a = s.seq.load(std::memory_order_acquire);
+    if (a & 1) continue;
+    p[0] = s.p[0]; p[1] = s.p[1]; p[2] = s.p[2];
+    q[0] = s.q[0]; q[1] = s.q[1]; q[2] = s.q[2]; q[3] = s.q[3];
+    t = s.t;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (s.seq.load(std::memory_order_acquire) == a) return true;
+  }
+  return false;
+}
 
 static vr::HmdQuaternion_t Mul(const vr::HmdQuaternion_t &a, const vr::HmdQuaternion_t &b) {
   return {a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z, a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
@@ -161,6 +225,7 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
       vr::HmdQuaternion_t q;
       RawPose(p, pos, q);
       g_sync->OnHmdPose(QpcNow() + p.poseTimeOffset, Quat{q.w, q.x, q.y, q.z}, V3{pos[0], pos[1], pos[2]});
+      StorePose(g_hmd_pose, QpcNow() + p.poseTimeOffset, pos, q);
     }
     return false;
   }
@@ -210,6 +275,12 @@ static bool Apply(uint32_t id, vr::DriverPose_t &p) {
   Rotate(xq, p.vecWorldFromDriverTranslation, wt);
   p.qWorldFromDriverRotation = Mul(xq, p.qWorldFromDriverRotation);
   for (int i = 0; i < 3; i++) p.vecWorldFromDriverTranslation[i] = wt[i] + x.t[i];
+  if (p.poseIsValid && p.result == vr::TrackingResult_Running_OK) {
+    double pos[3];
+    vr::HmdQuaternion_t q;
+    RawPose(p, pos, q);
+    StorePose(g_pose[id], QpcNow() + p.poseTimeOffset, pos, q);
+  }
   g_moved.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
@@ -266,6 +337,10 @@ static std::mutex g_stlog_m;
 static std::vector<std::string> g_pending_log;
 
 static void PushStatusLog(const std::string &s) {
+  // Keep the dashboard window quiet; detailed input traces stay in questlhsync.log.
+  if (s.rfind("input ", 0) == 0 || s.rfind("lighthouse input", 0) == 0 ||
+      s.rfind("haptic", 0) == 0)
+    return;
   std::lock_guard<std::mutex> g(g_stlog_m);
   time_t t = time(nullptr);
   struct tm tm;
@@ -303,6 +378,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
  public:
   vr::EVRInitError Init(vr::IVRDriverContext *ctx) override {
     VR_INIT_SERVER_DRIVER_CONTEXT(ctx);
+    timeBeginPeriod(1);  // the input sender sleeps 8 ms; the default timer rounds that to 15.6 ms
     dir_ = DataDir();
     {
       std::lock_guard<std::mutex> g(g_log_m);
@@ -318,6 +394,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
       g_st->version = QLHS_VERSION;
       g_st->magic = QLHS_MAGIC;
     }
+    for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i) g_battery[i].store(-1.f);
     Log("QuestLHSync " QLHS_RELEASE " driver starting, data in %LOCALAPPDATA%\\QuestLHSync");
     SyncConfig cfg;
     cfg.dir = dir_;
@@ -329,29 +406,39 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     link_ = std::make_unique<HeadsetLink>(
         g_sync.get(), [](const std::string &s) { Log(s); },
         [](double t, const std::string &s) { if (g_sync) g_sync->Rec(t, "%s", s.c_str()); });
+    link_->SetHapticHandler([](int hand, int us) { OnHaptic(hand, us); });
     link_->SetMemory(dir_ + "\\headset.txt");
     ReadSettings();
     if (MH_Initialize() != MH_OK) { Log("MH_Initialize failed"); return vr::VRInitError_None; }
     HookHost("IVRServerDriverHost_006", 0, (void *)&Detour<0>);
     HookHost("IVRServerDriverHost_005", 1, (void *)&Detour<1>);
+    g_lh = std::make_unique<LighthouseInput>(ctx, [](const std::string &s) { Log(s); });
+    g_lh->Poll();  // hook the context before lighthouse can cache its IVRDriverInput
     rel_done_ = !steady_ || g_rel->Hook();  // the lighthouse driver loads first; if not, the worker retries
     link_->Start();
     run_ = true;
+    input_thread_ = std::thread(&Provider::InputWorker, this);
     worker_ = std::thread(&Provider::Worker, this);
     return vr::VRInitError_None;
   }
 
   void Cleanup() override {
     run_ = false;
+    if (input_thread_.joinable()) input_thread_.join();
     if (worker_.joinable()) worker_.join();
     if (g_gravity) g_gravity->Stop();
     if (link_) link_->Stop();
+    if (g_lh) {
+      g_lh->Stop();
+      g_lh.reset();
+    }
     for (int j = 0; j < 2; j++)
       if (g_target[j]) MH_DisableHook(g_target[j]);
     if (g_rel) { g_rel->Unhook(); g_rel->Flush(true); }
     MH_Uninitialize();
     if (g_sync) g_sync->SetRecord(nullptr);
     Log("QuestLHSync driver stopped");
+    timeEndPeriod(1);
     // g_sync and the mappings stay: a late pose update on another thread may still touch them while vrserver exits
     VR_CLEANUP_SERVER_DRIVER_CONTEXT();
   }
@@ -359,7 +446,12 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   const char *const *GetInterfaceVersions() override { return vr::k_InterfaceVersions; }
 
   void RunFrame() override {
-    if (wired_ || ++tick_ % 45) return;  // classify devices about twice a second
+    if (wired_) return;
+    vr::TrackedDevicePose_t raw[vr::k_unMaxTrackedDeviceCount]{};
+    vr::VRServerDriverHost()->GetRawTrackedDevicePoses(0.f, raw, vr::k_unMaxTrackedDeviceCount);
+    for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; ++i)
+      g_connected[i].store(raw[i].bDeviceIsConnected);
+    if (++tick_ % 45) return;  // classify devices about twice a second
     auto *props = vr::VRProperties();
     for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++) {
       int kind = g_kind[i].load();
@@ -458,6 +550,18 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   void ReadReceiver(uint32_t i) {
     auto c = vr::VRProperties()->TrackedDeviceToPropertyContainer(i);
     if (c == vr::k_ulInvalidPropertyContainer) return;
+    // The role hint can arrive after the dongle string (and wired controllers have no dongle
+    // string at all), so read it before the receiver early-out.
+    vr::ETrackedPropertyError re = vr::TrackedProp_Success;
+    const int32_t role = vr::VRProperties()->GetInt32Property(c, vr::Prop_ControllerRoleHint_Int32, &re);
+    if (re == vr::TrackedProp_Success) g_dev[i].role.store(role);
+    auto *props = vr::VRProperties();
+    vr::ETrackedPropertyError be = vr::TrackedProp_Success;
+    g_battery[i].store(props->GetFloatProperty(c, vr::Prop_DeviceBatteryPercentage_Float, &be));
+    if (be != vr::TrackedProp_Success) g_battery[i].store(-1.f);
+    be = vr::TrackedProp_Success;
+    const bool charging = props->GetBoolProperty(c, vr::Prop_DeviceIsCharging_Bool, &be);
+    g_charging[i].store(be == vr::TrackedProp_Success && charging);
     std::string r = GetStr(c, vr::Prop_ConnectedWirelessDongle_String);
     if (r == receiver_[i]) return;
     receiver_[i] = r;
@@ -474,7 +578,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
   std::string dir_;
   std::unique_ptr<HeadsetLink> link_;
   std::atomic<bool> run_{false};
-  std::thread worker_;
+  std::thread worker_, input_thread_;
   std::mutex hmd_m_;
   std::string hmd_model_, hmd_system_;
   std::string receiver_[vr::k_unMaxTrackedDeviceCount];
@@ -610,6 +714,7 @@ class Provider : public vr::IServerTrackedDeviceProvider {
 
   void Publish(double now) {
     if (!g_st) return;
+    std::lock_guard<std::mutex> g(g_st_m);
     Sync::Status s = g_sync->GetStatus(now);
     int hmd = g_hmd.load();
     std::string model, system;
@@ -687,6 +792,159 @@ class Provider : public vr::IServerTrackedDeviceProvider {
     UnhookHost();
   }
 
+  void InputWorker() {
+    uint32_t seq = 0;
+    bool last_sys[2] = {}, last_a[2] = {}, last_b[2] = {}, last_sc[2] = {}, last_pc[2] = {};
+    bool last_tc[2] = {};
+    bool last_pad_touch[2] = {};
+    bool first[2] = {true, true};
+    bool was_connected[2] = {false, false};
+    double release_until[2] = {0, 0};
+    double release_last[2] = {0, 0};
+    double invalid_since[2] = {0, 0};
+    double bad_pose_since[2] = {0, 0};
+    bool invalid_logged[2] = {false, false};
+    double hmd_bad_since = 0;
+    bool hmd_bad_logged = false;
+    auto release_hand = [&](int hand) {
+      if (!was_connected[hand]) return;
+      char d[24];
+      snprintf(d, sizeof d, "D %d\n", hand);
+      link_->SubmitInput(d);
+      was_connected[hand] = false;
+      first[hand] = true;
+    };
+    std::set<uint32_t> logged_bad_role;
+    while (run_) {
+      if (!link_ || !link_->CapInput() || !g_gravity) {
+        Sleep(20);
+        continue;
+      }
+      double hp[3] = {0, 0, 0}, hq[4] = {1, 0, 0, 0}, ht = 0;
+      const bool have_hmd = LoadPose(g_hmd_pose, hp, hq, ht);
+      const vr::HmdQuaternion_t inv{hq[0], -hq[1], -hq[2], -hq[3]};
+      const double hpos[3] = {hp[0], hp[1], hp[2]};
+      const double now = QpcNow();
+      const bool hmd_ok = have_hmd && now - ht < 0.1 && std::isfinite(hp[0] + hp[1] + hp[2]) &&
+                          std::isfinite(hq[0] + hq[1] + hq[2] + hq[3]);
+      if (!hmd_ok) {
+        if (hmd_bad_since == 0) hmd_bad_since = now;
+        if (!hmd_bad_logged && now - hmd_bad_since > 2.0) {
+          Log("input relay paused: no valid, fresh host HMD pose");
+          hmd_bad_logged = true;
+        }
+      } else {
+        hmd_bad_since = 0;
+        hmd_bad_logged = false;
+      }
+      uint32_t hand_dev[2] = {vr::k_unTrackedDeviceIndexInvalid, vr::k_unTrackedDeviceIndexInvalid};
+      for (uint32_t id = 0; id < vr::k_unMaxTrackedDeviceCount; id++) {
+        if (g_kind[id].load() != kLighthouse || g_dev[id].cls != vr::TrackedDeviceClass_Controller)
+          continue;
+        const int role = g_dev[id].role.load();
+        if (role != vr::TrackedControllerRole_LeftHand && role != vr::TrackedControllerRole_RightHand) {
+          if (logged_bad_role.insert(id).second)
+            Log(Fmt("input skip: device %u has no hand role (hint %d)", id, role));
+          continue;
+        }
+        const int hand = role == vr::TrackedControllerRole_RightHand ? 1 : 0;
+        if (hand_dev[hand] != vr::k_unTrackedDeviceIndexInvalid && hand_dev[hand] != id)
+          continue;  // two devices claim the same hand; first wins this frame
+        hand_dev[hand] = id;
+        if (!g_connected[id].load()) {
+          if (was_connected[hand]) {
+            was_connected[hand] = false;
+            first[hand] = true;
+            release_until[hand] = now + 1.0;
+            release_last[hand] = 0;
+          }
+          bad_pose_since[hand] = 0;
+          if (now < release_until[hand] && now - release_last[hand] >= 0.1) {
+            char d[24];
+            snprintf(d, sizeof d, "D %d\n", hand);
+            link_->SubmitInput(d);
+            release_last[hand] = now;
+          }
+          continue;
+        }
+        LighthouseInput::State in;
+        if (g_lh) in = g_lh->GetState(id);
+        if (!in.valid) {
+          if (invalid_since[hand] == 0) invalid_since[hand] = now;
+          if (!invalid_logged[hand] && now - invalid_since[hand] > 2.0) {
+            Log(Fmt("input capture invalid for hand %d for 2 s; releasing", hand));
+            invalid_logged[hand] = true;
+          }
+          release_hand(hand);
+          bad_pose_since[hand] = 0;
+          continue;
+        }
+        invalid_since[hand] = 0;
+        invalid_logged[hand] = false;
+        double p[3], q[4], t = 0;
+        const bool pose_ok = LoadPose(g_pose[id], p, q, t) && now - t < 0.1 &&
+                             std::isfinite(p[0] + p[1] + p[2]);
+        if (!hmd_ok || !pose_ok) {
+          if (bad_pose_since[hand] == 0) bad_pose_since[hand] = now;
+          if (now - bad_pose_since[hand] >= 0.4) release_hand(hand);
+          continue;
+        }
+        bad_pose_since[hand] = 0;
+        was_connected[hand] = true;
+        release_until[hand] = 0;
+        double rel[3] = {0, 0, -0.45};
+        vr::HmdQuaternion_t rq{1, 0, 0, 0};
+        {
+          const double diff[3] = {p[0] - hpos[0], p[1] - hpos[1], p[2] - hpos[2]};
+          Rotate(inv, diff, rel);
+          rq = Mul(inv, vr::HmdQuaternion_t{q[0], q[1], q[2], q[3]});
+        }
+        uint32_t buttons = 0;
+        if (first[hand]) {
+          last_sys[hand] = in.system;
+          last_a[hand] = in.a; last_b[hand] = in.b;
+          last_sc[hand] = in.stick_click; last_pc[hand] = in.pad_click;
+          last_tc[hand] = in.trigger_click;
+          last_pad_touch[hand] = false;
+          first[hand] = false;
+        } else {
+          if (in.system && !last_sys[hand]) buttons |= 1;
+          if (in.a && !last_a[hand]) buttons |= 2;
+          if (in.b && !last_b[hand]) buttons |= 4;
+          if (in.stick_click && !last_sc[hand]) buttons |= 8;
+          if (in.pad_click && !last_pc[hand]) buttons |= 16;
+          if (in.trigger_click && !last_tc[hand]) buttons |= 32;
+          last_sys[hand] = in.system;
+          last_a[hand] = in.a; last_b[hand] = in.b;
+          last_sc[hand] = in.stick_click; last_pc[hand] = in.pad_click;
+          last_tc[hand] = in.trigger_click;
+        }
+
+        if ((buttons & 16) || (in.pad_touch && !last_pad_touch[hand]))
+          OnHaptic(hand, 1500);
+        last_pad_touch[hand] = in.pad_touch;
+        const uint32_t levels = (in.system ? 1u : 0u) | (in.a ? 2u : 0u) |
+                                (in.b ? 4u : 0u) | (in.stick_click ? 8u : 0u) |
+                                (in.pad_click ? 16u : 0u) | (in.trigger_click ? 32u : 0u);
+        char line[512];
+        snprintf(line, sizeof line,
+                 "X %d %u %lld %u %.3f %.3f %.3f %.3f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.3f %.3f %d %.3f %d"
+                 " %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f %d %d %u\n",
+                 hand, seq++, (long long)(QpcNow() * 1e9), buttons, in.trigger, in.grip, in.stick_x,
+                 in.stick_y, rq.w, rq.x, rq.y, rq.z, rel[0], rel[1], rel[2], in.pad_x, in.pad_y,
+                 in.pad_touch ? 1 : 0, g_battery[id].load(),
+                 g_charging[id].load() ? 1 : 0,
+                 p[0], p[1], p[2], q[0], q[1], q[2], q[3],
+                 hpos[0], hpos[1], hpos[2], hq[0], hq[1], hq[2], hq[3], hmd_ok ? 1 : 0,
+                 pose_ok ? 1 : 0, levels);
+        link_->SubmitInput(line);
+      }
+      for (int hand = 0; hand < 2; ++hand)
+        if (hand_dev[hand] == vr::k_unTrackedDeviceIndexInvalid) release_hand(hand);
+      Sleep(8);
+    }
+  }
+
   void Worker() {
     started_ = QpcNow();
     while (run_) {
@@ -698,9 +956,14 @@ class Provider : public vr::IServerTrackedDeviceProvider {
         Sleep(50);
         continue;
       }
-      link_->SetWanted(g_hmd.load() >= 0);
+      bool has_controller = false;
+      for (uint32_t i = 0; i < vr::k_unMaxTrackedDeviceCount; i++)
+        if (g_kind[i].load() == kLighthouse && g_dev[i].cls == vr::TrackedDeviceClass_Controller)
+          has_controller = true;
+      link_->SetWanted(g_hmd.load() >= 0 || has_controller);
       Stations();
       Commands();
+      if (g_lh) g_lh->Poll();
       Transform xf = g_sync->Tick(now);
       WriteXf(xf);
       g_hide.store(!xf.active && link_->state() == HeadsetLink::kConnected);

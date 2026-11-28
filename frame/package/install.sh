@@ -18,6 +18,10 @@ put() { cp "$HERE/$1" "$DEST/$1.new" && chmod "$2" "$DEST/$1.new" && mv -f "$DES
 put lhsyncd 755
 put questlhsync_frame/driver.vrdrivermanifest 644
 put questlhsync_frame/bin/linuxarm64/driver_questlhsync_frame.so 755
+rm -rf "$DEST/questlhsync_frame/resources.new"
+cp -R "$HERE/questlhsync_frame/resources" "$DEST/questlhsync_frame/resources.new"
+rm -rf "$DEST/questlhsync_frame/resources"
+mv "$DEST/questlhsync_frame/resources.new" "$DEST/questlhsync_frame/resources"
 cp "$HERE/questlhsync.service" "$UNIT"
 
 "$VRPATHREG" adddriver "$DEST/questlhsync_frame" >/dev/null 2>&1 || { echo "vrpathreg adddriver failed" >&2; exit 1; }

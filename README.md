@@ -114,6 +114,38 @@ other's alignment or pose timing. The `state.json` of earlier versions moves to
 the first headset that connects. `stations.json`, the reference frame of your
 base stations, is shared by all headsets.
 
+### Steam Frame controller input
+
+On a Steam Frame, QuestLHSync can relay the PC's lighthouse-tracked hand
+controllers into the headset's own SteamVR. This lets the knuckles drive the
+Frame dashboard, Steam menus, and the desktop view even though the host
+dashboard is closed.
+
+- Both hands are mirrored as `QLHS-KNUCKLES-L` and `QLHS-KNUCKLES-R`, with the
+  Index render models, trigger/grip/stick, trackpad position and touch, and
+  system/A/B controls.
+- The trigger is the dashboard left click; the trackpad is right click and
+  scroll. `A` switches the active laser hand. Both controllers can type on the
+  Frame's virtual keyboard.
+- Dashboard haptic events are relayed back to the real controller. Trackpad
+  touch/right-click also produces a short pulse. Only the pulse duration is
+  applied; the event frequency and amplitude are not used.
+- Battery percentage and charging state are mirrored from the host controller.
+- Controller placement uses an absolute host-to-Frame alignment, so the PC's
+  SteamVR HMD must be the same physical Steam Frame and must supply a valid,
+  fresh HMD pose. Without one, the hands are released rather than aligned to a
+  guessed reference; controller-only/no-HMD bootstrap is not supported. Hold
+  the headset still for a moment after SteamVR starts or reconnects so the
+  host-to-Frame alignment can initialize.
+- The relay owns the hand while its input and pose are valid. A valid relayed
+  knuckle intentionally has priority over the Frame's own Roy controller at all
+  times, including outside the Frame dashboard; turn the knuckle off or lose
+  its input/link to release the role back to Roy.
+- Games running on the PC already see the native knuckles; this relay is for
+  the Frame's local UI and streamed desktop view. Finger tracking, left/right
+  controller games on the Frame, and Frame-side controller power management are
+  not part of the relay.
+
 ## Settings
 
 Optional, in `steamvr.vrsettings` under `"driver_questlhsync"`:

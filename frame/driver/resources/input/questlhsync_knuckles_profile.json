@@ -1,0 +1,70 @@
+{
+  "jsonid": "input_profile",
+  "controller_type": "questlhsync_knuckles",
+  "device_class": "TrackedDeviceClass_Controller",
+  "resource_root": "questlhsync_frame",
+  "driver_name": "questlhsync_frame",
+  "input_bindingui_mode": "controller_handed",
+  "should_show_binding_errors": true,
+  "input_source": {
+    "/input/system": {
+      "type": "button",
+      "click": true,
+      "touch": true,
+      "order": 1
+    },
+    "/input/a": {
+      "type": "button",
+      "click": true,
+      "touch": true,
+      "order": 2
+    },
+    "/input/b": {
+      "type": "button",
+      "click": true,
+      "touch": true,
+      "order": 3
+    },
+    "/input/trigger": {
+      "type": "trigger",
+      "value": true,
+      "click": true,
+      "touch": true,
+      "order": 4
+    },
+    "/input/grip": {
+      "type": "trigger",
+      "value": true,
+      "click": true,
+      "touch": true,
+      "order": 5
+    },
+    "/input/thumbstick": {
+      "type": "joystick",
+      "click": true,
+      "touch": true,
+      "order": 6
+    },
+    "/input/trackpad": {
+      "type": "trackpad",
+      "click": true,
+      "touch": true,
+      "order": 7
+    },
+    "/pose/raw": {
+      "type": "pose"
+    },
+    "/pose/aim": {
+      "type": "pose"
+    },
+    "/output/haptic": {
+      "type": "vibration"
+    }
+  },
+  "default_bindings": [
+    {
+      "app_key": "openvr.component.vrcompositor",
+      "binding_url": "vrcompositor_bindings_questlhsync.json"
+    }
+  ]
+}

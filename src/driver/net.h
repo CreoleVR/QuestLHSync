@@ -2,14 +2,18 @@
 // stream per session.
 //   discovery  UDP 47281: "QLHS?" (broadcast + configured hosts) -> "QLHS 1 <serial> <tcp port> <model>"
 //   stream     TCP 47280: "H ..." hello, "C <len> <name>" + the camera calibration, then lhsight's lines
-//              (F frames, T heartbeats, I/W/E messages); "P <seq> <pc_ns>" -> "Q <seq> <pc_ns> <mono_ns>" round trips
+//              (F frames, T heartbeats, I/W/E messages); "P <seq> <pc_ns>" -> "Q <seq> <pc_ns> <mono_ns>" round trips.
+//              Input: "X ..." lines PC->Frame and "D <hand>" when a controller disconnects. Haptics:
+//              "V <hand> <us>" Frame->PC.
 #pragma once
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 class Sync;
@@ -21,11 +25,13 @@ class HeadsetLink {
                                                           // HeadsetId of its serial
   using LogFn = std::function<void(const std::string &)>;
   using RecFn = std::function<void(double, const std::string &)>;
+  using HapticFn = std::function<void(int, int)>;
 
   HeadsetLink(Sync *sync, LogFn log, RecFn rec) : sync_(sync), log_(std::move(log)), rec_(std::move(rec)) {}
   ~HeadsetLink() { Stop(); }
   void Start();
   void Stop();
+  void SetHapticHandler(HapticFn h) { haptic_ = std::move(h); }
   void SetWanted(bool w) { wanted_ = w; }             // an eligible HMD is in SteamVR
   void SetHosts(const std::vector<std::string> &h);   // manual addresses (settings): asked and tried over TCP too
   void SetPreferred(const std::string &serial);       // pick this headset when several answer
@@ -35,6 +41,8 @@ class HeadsetLink {
   void SetMemory(const std::string &path);            // the headsets' addresses, kept there: tried over TCP when
                                                       // nothing answers discovery (networks that drop broadcasts)
   State state() const { return state_; }
+  bool CapInput() const { return cap_input_; }
+  void SubmitInput(const std::string &line);  // queue an X line; the session loop sends the newest valid ones
   std::string serial() const { std::lock_guard<std::mutex> g(m_); return serial_; }
   std::string model() const { std::lock_guard<std::mutex> g(m_); return model_; }  // "Quest Pro": what the page shows
   std::string addr() const { std::lock_guard<std::mutex> g(m_); return addr_; }
@@ -47,11 +55,15 @@ class HeadsetLink {
   Sync *sync_;
   LogFn log_;
   RecFn rec_;
+  HapticFn haptic_;
   std::thread th_;
   std::atomic<bool> run_{false}, wanted_{false};
   std::atomic<State> state_{kIdle};
   std::atomic<double> last_frame_{0}, connected_at_{0};
   mutable std::mutex m_;
+  std::mutex input_m_;
+  std::deque<std::pair<double, std::string>> input_queue_;
+  std::atomic<bool> cap_input_{false};
   std::vector<std::string> hosts_;
   std::string preferred_, serial_, model_, addr_, fw_, mem_path_, failed_ip_, family_, streamer_, skipped_;
   std::vector<Known> known_;
